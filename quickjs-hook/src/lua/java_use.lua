@@ -1,5 +1,9 @@
 -- Java.use() — Frida-compatible metatable 实现
 -- 依赖 C 底层: Java._call, Java._staticCall, Java._new, Java._methods
+-- 验证: 如果 Java._methods 不存在，打印警告但不阻断
+if type(Java._methods) ~= "function" then
+    print("[java_use.lua] WARNING: Java._methods not available")
+end
 
 local _methods_cache = {}
 

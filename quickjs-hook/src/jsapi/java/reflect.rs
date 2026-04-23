@@ -787,6 +787,10 @@ unsafe fn bypass_hidden_api_restrictions(env: JniEnv) {
 
 /// Cache reflection method IDs. Must be called from a safe thread (not a hook callback)
 /// because it uses FindClass which triggers ART stack walking.
+pub(crate) unsafe fn ensure_reflect_ids(env: JniEnv) {
+    cache_reflect_ids(env);
+}
+
 pub(super) unsafe fn cache_reflect_ids(env: JniEnv) {
     REFLECT_IDS.get_or_init(|| {
         // 初始化 JNI ID 解码器 (对标 Frida unwrapGenericId)

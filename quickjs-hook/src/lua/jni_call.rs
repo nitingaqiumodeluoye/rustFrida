@@ -227,37 +227,45 @@ pub(crate) unsafe extern "C" fn lua_jni_new(L: *mut ffi::lua_State) -> std::os::
 
 /// Java._methods(className) → {{name=, sig=, isStatic=}, ...}
 pub(crate) unsafe extern "C" fn lua_jni_methods(L: *mut ffi::lua_State) -> std::os::raw::c_int {
+    let nargs = ffi::lua_gettop(L);
+    let tp = ffi::lua_type(L, 1);
+    crate::jsapi::console::output_message(&format!("[lua] _methods ENTRY nargs={} type1={}", nargs, tp));
     let cls_c = ffi::lua_tostring_ex(L, 1);
-    if cls_c.is_null() { ffi::lua_pushnil(L); return 1; }
+    if cls_c.is_null() {
+        crate::jsapi::console::output_message("[lua] _methods: arg is null");
+        ffi::lua_pushnil(L); return 1;
+    }
     let cls_name = std::ffi::CStr::from_ptr(cls_c).to_string_lossy();
 
-    // 通过 JS 引擎调用 (安全的 JNI 反射路径)
-    let js_cmd = format!(
-        "(function(){{var ms=Java.__luaMethods(\"{cls}\");\
-        if(!ms)return'';\
-        var r='{{';for(var i=0;i<ms.length;i++){{\
-        if(i>0)r+=',';\
-        r+='{{name=\"'+ms[i].name+'\",sig=\"'+ms[i].sig+'\",isStatic='+ms[i].isStatic+'}}';}}\
-        return r+'}}';}})()",
-        cls = cls_name.replace('"', "\\\"").replace('/', ".")
-    );
-    let lua_src = match crate::load_script(&js_cmd) {
-        Ok(s) => s,
+    // 直接调 Rust JNI 反射 (不经过 JS 引擎, 避免死锁)
+    let env = get_env(L);
+    if env.is_null() { ffi::lua_pushnil(L); return 1; }
+
+    // 确保 reflect IDs 已初始化
+    crate::jsapi::java::reflect::ensure_reflect_ids(env);
+
+    let methods = match crate::jsapi::java::reflect::enumerate_methods(env, &cls_name) {
+        Ok(ms) => ms,
         Err(e) => {
-            crate::jsapi::console::output_message(&format!("[lua] _methods error: {}", e));
+            crate::jsapi::console::output_message(&format!("[lua] _methods({}) error: {}", cls_name, e));
             ffi::lua_pushnil(L);
             return 1;
         }
     };
-    if lua_src.is_empty() || lua_src == "undefined" {
-        ffi::lua_pushnil(L);
-        return 1;
+
+    ffi::lua_createtable(L, methods.len() as i32, 0);
+    for (i, m) in methods.iter().enumerate() {
+        ffi::lua_createtable(L, 0, 3);
+        let name_cs = std::ffi::CString::new(m.name.as_str()).unwrap_or_default();
+        ffi::lua_pushstring(L, name_cs.as_ptr());
+        ffi::lua_setfield(L, -2, c"name".as_ptr());
+        let sig_cs = std::ffi::CString::new(m.sig.as_str()).unwrap_or_default();
+        ffi::lua_pushstring(L, sig_cs.as_ptr());
+        ffi::lua_setfield(L, -2, c"sig".as_ptr());
+        ffi::lua_pushboolean(L, if m.is_static { 1 } else { 0 });
+        ffi::lua_setfield(L, -2, c"isStatic".as_ptr());
+        ffi::lua_rawseti(L, -2, (i + 1) as ffi::lua_Integer);
     }
-    let wrapper = format!("return {}", lua_src);
-    let cs = std::ffi::CString::new(wrapper).unwrap_or_default();
-    let ret = ffi::luaL_loadbufferx(L, cs.as_ptr(), cs.as_bytes().len(), c"<methods>".as_ptr(), std::ptr::null());
-    if ret != ffi::LUA_OK as i32 { ffi::lua_pop(L, 1); ffi::lua_pushnil(L); return 1; }
-    if ffi::lua_pcall(L, 0, 1, 0) != ffi::LUA_OK as i32 { ffi::lua_pop(L, 1); ffi::lua_pushnil(L); return 1; }
     1
 }
 

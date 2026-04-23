@@ -7,8 +7,10 @@ static MASTER_STATE: Mutex<Option<LuaState>> = Mutex::new(None);
 fn get_or_init_master() -> Result<(), String> {
     let mut guard = MASTER_STATE.lock().unwrap_or_else(|e| e.into_inner());
     if guard.is_some() {
+        eprintln!("[lua] master state already exists, reusing");
         return Ok(());
     }
+    eprintln!("[lua] creating new master state");
     let state = LuaState::new().ok_or("failed to create master Lua state")?;
     unsafe {
         super::api::register_lua_apis(&state);
@@ -32,6 +34,7 @@ pub fn load_lua_script(code: &str, filename: &str) -> Result<String, String> {
 unsafe fn register_all_apis(state: &LuaState) {
     let L = state.as_ptr();
 
+    crate::jsapi::console::output_message("[lua-init] registering APIs...");
     // ---- Java ----
     ffi::lua_createtable(L, 0, 8);
     set_cfn(L, c"hook", lua_java_hook);
@@ -45,8 +48,13 @@ unsafe fn register_all_apis(state: &LuaState) {
 
     // ---- Java.use() 纯 Lua 实现 (metatable) ----
     let lua_use_code = include_str!("java_use.lua");
-    if let Err(e) = state.dostring(lua_use_code) {
-        crate::jsapi::console::output_message(&format!("[lua] Java.use init error: {}", e));
+    match state.dostring(lua_use_code) {
+        Ok(()) => {}
+        Err(e) => {
+            // 强制输出到 stderr (console callback 可能未初始化)
+            eprintln!("[lua] Java.use init error: {}", e);
+            crate::jsapi::console::output_message(&format!("[lua] Java.use init error: {}", e));
+        }
     }
 
     // ---- Module ----

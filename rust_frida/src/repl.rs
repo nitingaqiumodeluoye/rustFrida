@@ -283,6 +283,9 @@ pub(crate) fn load_script_file(session: &Session, script_path: &str, reset: bool
 
     session.eval_state.clear();
     let is_lua = script_path.ends_with(".lua");
+    if is_lua {
+        log_info!("检测到 .lua 脚本，使用 Lua 引擎加载");
+    }
     let cmd = if is_lua {
         build_loadlua_cmd(&script, Some(script_path))
     } else {
