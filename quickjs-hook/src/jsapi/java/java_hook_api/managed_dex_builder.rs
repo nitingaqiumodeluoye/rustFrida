@@ -1579,7 +1579,9 @@ const REG_TMP1: u8 = 4;
 
 struct HelperParamLayout {
     this_reg: Option<u8>,
+    this_descriptor: Option<String>,
     arg_regs: Vec<u8>,
+    arg_descriptors: Vec<String>,
     local_regs: BTreeMap<String, LocalSlot>,
 }
 
@@ -1640,6 +1642,11 @@ fn helper_param_layout(
         next += descriptor_word_count(target_type);
         Some(reg)
     };
+    let this_descriptor = if is_static {
+        None
+    } else {
+        Some(target_type.to_string())
+    };
     let mut arg_regs = Vec::with_capacity(target_params.len());
     for param in target_params {
         let reg = checked_reg(next, "argument register")?;
@@ -1648,7 +1655,9 @@ fn helper_param_layout(
     }
     Ok(HelperParamLayout {
         this_reg,
+        this_descriptor,
         arg_regs,
+        arg_descriptors: target_params.to_vec(),
         local_regs: local_slots,
     })
 }
@@ -1768,12 +1777,12 @@ fn emit_call_value(
     layout: &HelperParamLayout,
     dsl_ctx: &mut DslBuildContext,
 ) -> Result<u8, String> {
-    let class_type = java_class_to_descriptor(&stmt.class_name)?;
+    let class_type = resolve_member_class_type(stmt.class_name.as_deref(), stmt.target.as_ref(), layout)?;
     let (params, return_type) = parse_method_signature(&stmt.sig)?;
     if return_type == "V" {
         return Err(format!(
             "{}.{}{} returns void and cannot be used as a value",
-            stmt.class_name, stmt.method_name, stmt.sig
+            stmt.class_label(), stmt.method_name, stmt.sig
         ));
     }
     if !value_descriptor_assignable_to(&return_type, expected_type) {
@@ -1785,7 +1794,7 @@ fn emit_call_value(
     if params.len() != stmt.args.len() {
         return Err(format!(
             "{}.{}{} expects {} explicit args, got {}",
-            stmt.class_name,
+            stmt.class_label(),
             stmt.method_name,
             stmt.sig,
             params.len(),
@@ -1820,7 +1829,7 @@ fn emit_field_get_value(
     dst: u8,
     layout: &HelperParamLayout,
 ) -> Result<u8, String> {
-    let class_type = java_class_to_descriptor(&stmt.class_name)?;
+    let class_type = resolve_member_class_type(stmt.class_name.as_deref(), stmt.target.as_ref(), layout)?;
     let field_type = java_class_to_descriptor_or_primitive(&stmt.type_name)?;
     if !value_descriptor_assignable_to(&field_type, expected_type) {
         return Err(format!(
@@ -2003,13 +2012,56 @@ fn resolve_target_reg(target: &DslTarget, layout: &HelperParamLayout) -> Result<
     }
 }
 
+fn resolve_target_descriptor(target: &DslTarget, layout: &HelperParamLayout) -> Result<String, String> {
+    match target {
+        DslTarget::This => layout
+            .this_descriptor
+            .clone()
+            .ok_or_else(|| "static target has no this descriptor".to_string()),
+        DslTarget::Arg(index) => layout
+            .arg_descriptors
+            .get(*index)
+            .cloned()
+            .ok_or_else(|| format!("argument {} does not exist", index)),
+        DslTarget::Local(name) => layout
+            .local_regs
+            .get(name)
+            .map(|slot| slot.descriptor.clone())
+            .ok_or_else(|| format!("local '{}' is not declared", name)),
+        DslTarget::Last | DslTarget::Result => Err(
+            "target class cannot be inferred for last/result; pass the class name explicitly".to_string(),
+        ),
+    }
+}
+
+fn resolve_member_class_type(
+    explicit_class_name: Option<&str>,
+    target: Option<&DslTarget>,
+    layout: &HelperParamLayout,
+) -> Result<String, String> {
+    if let Some(class_name) = explicit_class_name {
+        return java_class_to_descriptor(class_name);
+    }
+    let Some(target) = target else {
+        return Err("static member access requires an explicit class name".to_string());
+    };
+    let desc = resolve_target_descriptor(target, layout)?;
+    if !desc.starts_with('L') || !desc.ends_with(';') {
+        return Err(format!(
+            "target class can only be inferred from object locals/args, got {}",
+            desc
+        ));
+    }
+    Ok(desc)
+}
+
 fn emit_field_read(
     ir: &mut DexIrBuilder,
     stmt: &DslFieldStmt,
     layout: &HelperParamLayout,
     is_static: bool,
 ) -> Result<(), String> {
-    let class_type = java_class_to_descriptor(&stmt.class_name)?;
+    let class_type = resolve_member_class_type(stmt.class_name.as_deref(), stmt.target.as_ref(), layout)?;
     let field_type = java_class_to_descriptor_or_primitive(&stmt.type_name)?;
     let field = FieldRef::new(class_type, field_type.clone(), stmt.field_name.clone());
     let kind = value_kind_from_descriptor(&field_type)?;
@@ -2037,7 +2089,7 @@ fn emit_field_write(
     is_static: bool,
     dsl_ctx: &mut DslBuildContext,
 ) -> Result<(), String> {
-    let class_type = java_class_to_descriptor(&stmt.class_name)?;
+    let class_type = resolve_member_class_type(stmt.class_name.as_deref(), stmt.target.as_ref(), layout)?;
     let field_type = java_class_to_descriptor_or_primitive(&stmt.type_name)?;
     let field = FieldRef::new(class_type, field_type.clone(), stmt.field_name.clone());
     let kind = value_kind_from_descriptor(&field_type)?;
@@ -2405,12 +2457,12 @@ fn emit_call(
     layout: &HelperParamLayout,
     dsl_ctx: &mut DslBuildContext,
 ) -> Result<MethodRef, String> {
-    let class_type = java_class_to_descriptor(&stmt.class_name)?;
+    let class_type = resolve_member_class_type(stmt.class_name.as_deref(), stmt.target.as_ref(), layout)?;
     let (params, return_type) = parse_method_signature(&stmt.sig)?;
     if params.len() != stmt.args.len() {
         return Err(format!(
             "{}.{}{} expects {} explicit args, got {}",
-            stmt.class_name,
+            stmt.class_label(),
             stmt.method_name,
             stmt.sig,
             params.len(),
@@ -3052,10 +3104,16 @@ enum DslStmt {
 struct DslCallStmt {
     kind: DslCallKind,
     target: Option<DslTarget>,
-    class_name: String,
+    class_name: Option<String>,
     method_name: String,
     sig: String,
     args: Vec<DslValue>,
+}
+
+impl DslCallStmt {
+    fn class_label(&self) -> &str {
+        self.class_name.as_deref().unwrap_or("<inferred>")
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -3067,7 +3125,7 @@ enum DslCallKind {
 
 struct DslFieldStmt {
     target: Option<DslTarget>,
-    class_name: String,
+    class_name: Option<String>,
     field_name: String,
     type_name: String,
     value: Option<DslValue>,
@@ -3610,9 +3668,13 @@ impl<'a> DslParser<'a> {
 
         if parts.len() == 2 && parse_target_name(&parts[0]).is_some() {
             let target = parse_target_name(&parts[0]).unwrap();
-            let class_name = self.parse_string_arg()?;
-            self.expect_char(',')?;
-            let sig_or_type = self.parse_string_arg()?;
+            let first_arg = self.parse_string_arg()?;
+            let (class_name, sig_or_type) = if first_arg.starts_with('(') || self.peek() != Some(',') {
+                (None, first_arg)
+            } else {
+                self.expect_char(',')?;
+                (Some(first_arg), self.parse_string_arg()?)
+            };
             let args = self.parse_optional_value_args()?;
             self.expect_char(')')?;
             if sig_or_type.starts_with('(') {
@@ -3649,7 +3711,7 @@ impl<'a> DslParser<'a> {
                 Ok(DslValue::Call(DslCallStmt {
                     kind: DslCallKind::Static,
                     target: None,
-                    class_name,
+                    class_name: Some(class_name),
                     method_name: member_name,
                     sig: sig_or_type,
                     args,
@@ -3661,7 +3723,7 @@ impl<'a> DslParser<'a> {
                 Ok(DslValue::FieldGet {
                     stmt: Box::new(DslFieldStmt {
                         target: None,
-                        class_name,
+                        class_name: Some(class_name),
                         field_name: member_name,
                         type_name: sig_or_type,
                         value: None,
