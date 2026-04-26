@@ -3032,6 +3032,19 @@ enum DslValue {
     },
 }
 
+impl DslValue {
+    fn into_statement(self) -> Option<DslStmt> {
+        match self {
+            DslValue::Call(stmt) => Some(DslStmt::Call(stmt)),
+            DslValue::FieldGet { stmt, is_static } => Some(DslStmt::FieldRead {
+                stmt: *stmt,
+                is_static,
+            }),
+            _ => None,
+        }
+    }
+}
+
 enum DslTarget {
     This,
     Arg(usize),
@@ -3102,6 +3115,23 @@ impl<'a> DslParser<'a> {
 
         let name = self.parse_ident()?;
         self.skip_ws();
+        if name == "let" && self.peek() != Some('(') {
+            return self.parse_js_let_statement();
+        }
+        if name == "new" && self.peek() != Some('(') {
+            let stmt = self.parse_js_new_statement()?;
+            self.skip_ws();
+            self.expect_char(';')?;
+            return Ok(stmt);
+        }
+        if self.peek() == Some('.') {
+            let value = self.parse_js_member_value(name)?;
+            self.skip_ws();
+            self.expect_char(';')?;
+            return value.into_statement().ok_or_else(|| {
+                self.err("only method calls and field reads can be used as expression statements")
+            });
+        }
         self.expect_char('(')?;
         let stmt = match name.as_str() {
             "let" => {
@@ -3399,6 +3429,45 @@ impl<'a> DslParser<'a> {
         self.expect_char(';')?;
         Ok(stmt)
     }
+
+    fn parse_js_let_statement(&mut self) -> Result<DslStmt, String> {
+        self.skip_ws();
+        let local_name = self.parse_ident()?;
+        self.skip_ws();
+        self.expect_char(':')?;
+        let type_name = self.parse_type_name()?;
+        self.skip_ws();
+        self.expect_char('=')?;
+        let value = self.parse_value_arg()?;
+        self.skip_ws();
+        self.expect_char(';')?;
+        Ok(DslStmt::Let {
+            name: local_name,
+            type_name,
+            value,
+        })
+    }
+
+    fn parse_js_new_statement(&mut self) -> Result<DslStmt, String> {
+        self.skip_ws();
+        let class_name = self.parse_type_name()?;
+        self.skip_ws();
+        self.expect_char('(')?;
+        self.skip_ws();
+        let (ctor_sig, args) = if self.peek() == Some(')') {
+            (None, Vec::new())
+        } else {
+            let sig = self.parse_string_arg()?;
+            let args = self.parse_optional_value_args()?;
+            (Some(sig), args)
+        };
+        self.expect_char(')')?;
+        Ok(DslStmt::New {
+            class_name,
+            ctor_sig,
+            args,
+        })
+    }
 }
 
 struct DslParser<'a> {
@@ -3517,6 +3586,33 @@ impl<'a> DslParser<'a> {
         }
     }
 
+    fn parse_type_name(&mut self) -> Result<String, String> {
+        self.skip_ws();
+        if self.peek() == Some('"') {
+            return self.parse_string_arg();
+        }
+        let mut name = self.parse_ident()?;
+        loop {
+            self.skip_ws();
+            match self.peek() {
+                Some('.') => {
+                    self.expect_char('.')?;
+                    let part = self.parse_ident()?;
+                    name.push('.');
+                    name.push_str(&part);
+                }
+                Some('[') => {
+                    self.expect_char('[')?;
+                    self.expect_char(']')?;
+                    name.push_str("[]");
+                }
+                _ => break,
+            }
+        }
+        self.skip_ws();
+        Ok(name)
+    }
+
     fn parse_u16(&mut self) -> Result<u16, String> {
         let start = self.pos;
         while let Some(ch) = self.peek() {
@@ -3595,7 +3691,10 @@ impl<'a> DslParser<'a> {
             DslValue::Int(self.parse_i16()?)
         } else {
             let ident = self.parse_ident()?;
-            if ident == "null" {
+            self.skip_ws();
+            if self.peek() == Some('.') {
+                self.parse_js_member_value(ident)?
+            } else if ident == "null" {
                 DslValue::Null
             } else if ident == "add" || ident == "sub" {
                 self.skip_ws();
@@ -3732,6 +3831,83 @@ impl<'a> DslParser<'a> {
         };
         self.skip_ws();
         Ok(value)
+    }
+
+    fn parse_js_member_value(&mut self, first: String) -> Result<DslValue, String> {
+        let mut parts = vec![first];
+        while self.peek() == Some('.') {
+            self.expect_char('.')?;
+            parts.push(self.parse_ident()?);
+            self.skip_ws();
+        }
+        if parts.len() < 2 {
+            return Err(self.err("expected member access"));
+        }
+        self.expect_char('(')?;
+        self.skip_ws();
+
+        if parts.len() == 2 && parse_target_name(&parts[0]).is_some() {
+            let target = parse_target_name(&parts[0]).unwrap();
+            let class_name = self.parse_string_arg()?;
+            self.expect_char(',')?;
+            let sig_or_type = self.parse_string_arg()?;
+            let args = self.parse_optional_value_args()?;
+            self.expect_char(')')?;
+            if sig_or_type.starts_with('(') {
+                Ok(DslValue::Call(DslCallStmt {
+                    kind: DslCallKind::Virtual,
+                    target: Some(target),
+                    class_name,
+                    method_name: parts[1].clone(),
+                    sig: sig_or_type,
+                    args,
+                }))
+            } else {
+                if !args.is_empty() {
+                    return Err(self.err("field access does not accept value arguments"));
+                }
+                Ok(DslValue::FieldGet {
+                    stmt: Box::new(DslFieldStmt {
+                        target: Some(target),
+                        class_name,
+                        field_name: parts[1].clone(),
+                        type_name: sig_or_type,
+                        value: None,
+                    }),
+                    is_static: false,
+                })
+            }
+        } else {
+            let member_name = parts.pop().unwrap();
+            let class_name = parts.join(".");
+            let sig_or_type = self.parse_string_arg()?;
+            let args = self.parse_optional_value_args()?;
+            self.expect_char(')')?;
+            if sig_or_type.starts_with('(') {
+                Ok(DslValue::Call(DslCallStmt {
+                    kind: DslCallKind::Static,
+                    target: None,
+                    class_name,
+                    method_name: member_name,
+                    sig: sig_or_type,
+                    args,
+                }))
+            } else {
+                if !args.is_empty() {
+                    return Err(self.err("field access does not accept value arguments"));
+                }
+                Ok(DslValue::FieldGet {
+                    stmt: Box::new(DslFieldStmt {
+                        target: None,
+                        class_name,
+                        field_name: member_name,
+                        type_name: sig_or_type,
+                        value: None,
+                    }),
+                    is_static: true,
+                })
+            }
+        }
     }
 
     fn parse_optional_value_args(&mut self) -> Result<Vec<DslValue>, String> {
