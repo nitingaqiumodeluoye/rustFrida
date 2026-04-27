@@ -92,8 +92,8 @@ pub(super) struct GeneratedStringLiteral {
 
 mod descriptor;
 use descriptor::{
-    array_component_descriptor, build_method_sig, build_params_sig, descriptor_list_word_count,
-    descriptor_to_java_class_name, descriptor_word_count, java_class_to_descriptor,
+    array_component_descriptor, build_method_sig, build_params_sig, common_value_descriptor,
+    descriptor_list_word_count, descriptor_to_java_class_name, descriptor_word_count, java_class_to_descriptor,
     java_class_to_descriptor_or_primitive, parse_call_params, parse_method_params_signature, parse_method_signature,
     return_is_object,
 };

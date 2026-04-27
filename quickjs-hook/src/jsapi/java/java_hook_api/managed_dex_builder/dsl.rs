@@ -105,6 +105,7 @@ pub(super) struct DslCallStmt {
     pub(super) kind: DslCallKind,
     pub(super) target: Option<DslTarget>,
     pub(super) receiver: Option<Box<DslValue>>,
+    pub(super) null_safe: bool,
     pub(super) class_name: Option<String>,
     pub(super) method_name: String,
     pub(super) sig: String,
@@ -150,6 +151,11 @@ pub(super) enum DslValue {
         left: Box<DslValue>,
         right: Box<DslValue>,
     },
+    Ternary {
+        condition: Box<DslCondition>,
+        then_value: Box<DslValue>,
+        else_value: Box<DslValue>,
+    },
     Call(DslCallStmt),
     NewObject {
         class_name: String,
@@ -194,7 +200,8 @@ pub(super) enum DslIntBinOp {
     Ushr,
 }
 
-enum DslCondition {
+#[derive(Clone)]
+pub(super) enum DslCondition {
     Null {
         value: DslValue,
         invert: bool,
@@ -285,7 +292,26 @@ fn condition_not(condition: DslCondition) -> DslCondition {
     }
 }
 
+fn fold_ternary(condition: DslCondition, then_value: DslValue, else_value: DslValue) -> DslValue {
+    match condition {
+        DslCondition::Const(true) => then_value,
+        DslCondition::Const(false) => else_value,
+        condition => DslValue::Ternary {
+            condition: Box::new(condition),
+            then_value: Box::new(then_value),
+            else_value: Box::new(else_value),
+        },
+    }
+}
+
 impl DslValue {
+    fn into_bool_condition(self) -> DslCondition {
+        match self {
+            DslValue::Bool(value) => DslCondition::Const(value),
+            value => DslCondition::Bool { value },
+        }
+    }
+
     fn into_statement(self) -> Option<DslStmt> {
         match self {
             DslValue::Call(stmt) => Some(DslStmt::Call(stmt)),
@@ -603,7 +629,7 @@ impl<'a> DslParser<'a> {
         self.expect_ident("if")?;
         self.skip_ws();
         self.expect_char('(')?;
-        let condition = self.parse_js_condition()?;
+        let condition = self.parse_js_if_condition()?;
         self.expect_char(')')?;
         let then_stmts = self.parse_block()?;
         self.skip_ws();
@@ -791,6 +817,8 @@ fn dsl_lex(input: &str) -> Result<Vec<DslToken>, String> {
             Some("&&")
         } else if rest.starts_with("||") {
             Some("||")
+        } else if rest.starts_with("?.") {
+            Some("?.")
         } else {
             None
         };
@@ -802,7 +830,7 @@ fn dsl_lex(input: &str) -> Result<Vec<DslToken>, String> {
             });
             continue;
         }
-        if "{}()[];:,.+-=<>!*/%&|^~".contains(ch) {
+        if "{}()[];:,.?+-=<>!*/%&|^~".contains(ch) {
             pos += ch.len_utf8();
             tokens.push(DslToken {
                 kind: DslTokenKind::Symbol(ch),
@@ -938,6 +966,26 @@ impl<'a> DslParser<'a> {
     }
 
     fn parse_value_arg(&mut self) -> Result<DslValue, String> {
+        self.parse_ternary_expr()
+    }
+
+    fn parse_non_ternary_value_arg(&mut self) -> Result<DslValue, String> {
+        self.parse_int_binary_expr(0)
+    }
+
+    fn parse_ternary_expr(&mut self) -> Result<DslValue, String> {
+        let checkpoint = self.pos;
+        if let Ok(condition) = self.parse_js_condition() {
+            self.skip_ws();
+            if self.peek() == Some('?') {
+                self.expect_char('?')?;
+                let then_value = self.parse_value_arg()?;
+                self.expect_char(':')?;
+                let else_value = self.parse_value_arg()?;
+                return Ok(fold_ternary(condition, then_value, else_value));
+            }
+        }
+        self.pos = checkpoint;
         self.parse_int_binary_expr(0)
     }
 
@@ -1086,16 +1134,22 @@ impl<'a> DslParser<'a> {
                     index: Box::new(index),
                     type_name,
                 };
+            } else if self.peek_op("?.") {
+                value = self.parse_postfix_member_value(value, true)?;
             } else if self.peek() == Some('.') {
-                value = self.parse_postfix_member_value(value)?;
+                value = self.parse_postfix_member_value(value, false)?;
             } else {
                 return Ok(value);
             }
         }
     }
 
-    fn parse_postfix_member_value(&mut self, receiver: DslValue) -> Result<DslValue, String> {
-        self.expect_char('.')?;
+    fn parse_postfix_member_value(&mut self, receiver: DslValue, null_safe: bool) -> Result<DslValue, String> {
+        if null_safe {
+            self.expect_op("?.")?;
+        } else {
+            self.expect_char('.')?;
+        }
         let member_name = self.parse_ident()?;
         self.skip_ws();
 
@@ -1124,7 +1178,7 @@ impl<'a> DslParser<'a> {
         if self.peek() == Some('.') {
             self.expect_char('.')?;
             self.expect_ident("overload")?;
-            return self.parse_postfix_overload_call(receiver, member_name, call_kind);
+            return self.parse_postfix_overload_call(receiver, member_name, call_kind, null_safe);
         }
 
         self.expect_char('(')?;
@@ -1136,6 +1190,7 @@ impl<'a> DslParser<'a> {
                 kind: call_kind,
                 target: None,
                 receiver: Some(Box::new(receiver)),
+                null_safe,
                 class_name: None,
                 method_name: member_name,
                 sig: sig_or_type,
@@ -1167,6 +1222,7 @@ impl<'a> DslParser<'a> {
         receiver: DslValue,
         method_name: String,
         call_kind: DslCallKind,
+        null_safe: bool,
     ) -> Result<DslValue, String> {
         self.expect_char('(')?;
         self.skip_ws();
@@ -1223,6 +1279,7 @@ impl<'a> DslParser<'a> {
             kind: call_kind,
             target: None,
             receiver: Some(Box::new(receiver)),
+            null_safe,
             class_name,
             method_name,
             sig: params,
@@ -1269,6 +1326,7 @@ impl<'a> DslParser<'a> {
                     kind: DslCallKind::Virtual,
                     target: Some(target),
                     receiver: None,
+                    null_safe: false,
                     class_name,
                     method_name: parts[1].clone(),
                     sig: sig_or_type,
@@ -1301,6 +1359,7 @@ impl<'a> DslParser<'a> {
                     kind: DslCallKind::Static,
                     target: None,
                     receiver: None,
+                    null_safe: false,
                     class_name: Some(class_name),
                     method_name: member_name,
                     sig: sig_or_type,
@@ -1417,6 +1476,7 @@ impl<'a> DslParser<'a> {
                 kind: call_kind,
                 target: Some(target),
                 receiver: None,
+                null_safe: false,
                 class_name,
                 method_name: member_name,
                 sig: params,
@@ -1442,6 +1502,7 @@ impl<'a> DslParser<'a> {
                 kind: DslCallKind::Static,
                 target: None,
                 receiver: None,
+                null_safe: false,
                 class_name: Some(parts.join(".")),
                 method_name: member_name,
                 sig: params,
@@ -1452,6 +1513,28 @@ impl<'a> DslParser<'a> {
 
     fn parse_js_condition(&mut self) -> Result<DslCondition, String> {
         self.parse_js_or_condition()
+    }
+
+    fn parse_js_if_condition(&mut self) -> Result<DslCondition, String> {
+        let checkpoint = self.pos;
+        if let Ok(value) = self.parse_value_arg() {
+            self.skip_ws();
+            if self.peek() == Some(')') {
+                return Ok(value.into_bool_condition());
+            }
+        }
+        self.pos = checkpoint;
+
+        let condition = self.parse_js_condition()?;
+        self.skip_ws();
+        if self.peek() == Some('?') {
+            self.expect_char('?')?;
+            let then_value = self.parse_value_arg()?;
+            self.expect_char(':')?;
+            let else_value = self.parse_value_arg()?;
+            return Ok(fold_ternary(condition, then_value, else_value).into_bool_condition());
+        }
+        Ok(condition)
     }
 
     fn parse_js_or_condition(&mut self) -> Result<DslCondition, String> {
@@ -1498,7 +1581,7 @@ impl<'a> DslParser<'a> {
     }
 
     fn parse_js_condition_leaf(&mut self) -> Result<DslCondition, String> {
-        let left = self.parse_value_arg()?;
+        let left = self.parse_non_ternary_value_arg()?;
         self.skip_ws();
         if self.peek_ident("instanceof") {
             self.expect_ident("instanceof")?;
@@ -1515,7 +1598,7 @@ impl<'a> DslParser<'a> {
             return Ok(DslCondition::Bool { value: left });
         }
         let op = self.parse_js_cmp_op()?;
-        let right = self.parse_value_arg()?;
+        let right = self.parse_non_ternary_value_arg()?;
         let left_is_null = matches!(left, DslValue::Null);
         let right_is_null = matches!(right, DslValue::Null);
         if right_is_null {

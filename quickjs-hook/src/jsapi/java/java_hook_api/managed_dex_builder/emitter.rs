@@ -1,14 +1,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use super::dex_ir::DexLabel;
 use super::dsl::{
-    DslCallKind, DslCallStmt, DslFieldStmt, DslIntBinOp, DslOrigArgs, DslProgram, DslStmt, DslTarget, DslUnaryOp,
-    DslValue,
+    DslCallKind, DslCallStmt, DslCondition, DslFieldStmt, DslIntBinOp, DslOrigArgs, DslProgram, DslStmt, DslTarget,
+    DslUnaryOp, DslValue,
 };
 use super::{
-    array_component_descriptor, descriptor_list_word_count, descriptor_word_count, emit_return_from_orig,
-    java_class_to_descriptor, java_class_to_descriptor_or_primitive, parse_call_params, parse_method_signature,
-    resolve_call_proto, return_is_object, value_kind_from_descriptor, DexIntBinOp, DexIntLit16Op, DexIntLit8Op,
-    DexIrBuilder, FieldRef, GeneratedStringLiteral, IfCmpOp, MethodRef, ValueKind,
+    array_component_descriptor, common_value_descriptor, descriptor_list_word_count, descriptor_word_count,
+    emit_return_from_orig, java_class_to_descriptor, java_class_to_descriptor_or_primitive, parse_call_params,
+    parse_method_signature, resolve_call_proto, return_is_object, value_kind_from_descriptor, DexIntBinOp,
+    DexIntLit16Op, DexIntLit8Op, DexIrBuilder, FieldRef, GeneratedStringLiteral, IfCmpOp, MethodRef, ValueKind,
 };
 use crate::jsapi::java::jni_core::JniEnv;
 
@@ -331,8 +332,77 @@ fn emit_call_value(
         DslCallKind::Interface => ManagedInvokeKind::Interface,
         DslCallKind::Static => ManagedInvokeKind::Static,
     };
+    if stmt.null_safe {
+        return emit_null_safe_call_value(
+            ir,
+            invoke_kind,
+            method,
+            receiver,
+            &params,
+            &stmt.args,
+            &return_type,
+            dst,
+            layout,
+            dsl_ctx,
+        );
+    }
     emit_invoke_with_values(ir, invoke_kind, method, receiver, &params, &stmt.args, layout, dsl_ctx)?;
     emit_move_result_value(ir, &return_type, dst)
+}
+
+fn emit_null_safe_default(ir: &mut DexIrBuilder, return_type: &str, dst: u8) -> Result<(), String> {
+    match return_type {
+        "V" => Err("void null-safe call cannot be used as a value".to_string()),
+        "J" | "D" => Err("wide null-safe call result is not supported yet".to_string()),
+        ret if return_is_object(ret) => {
+            ir.const4(dst, 0);
+            Ok(())
+        }
+        "Z" | "B" | "C" | "S" | "I" | "F" => {
+            ir.const4(dst, 0);
+            Ok(())
+        }
+        other => Err(format!("unsupported null-safe call return type '{}'", other)),
+    }
+}
+
+fn emit_null_safe_call_value(
+    ir: &mut DexIrBuilder,
+    invoke_kind: ManagedInvokeKind,
+    method: MethodRef,
+    receiver: Option<(u8, &str)>,
+    params: &[String],
+    args: &[DslValue],
+    return_type: &str,
+    dst: u8,
+    layout: &HelperParamLayout,
+    dsl_ctx: &mut DslBuildContext,
+) -> Result<u8, String> {
+    let Some((receiver_reg, receiver_desc)) = receiver else {
+        return Err("null-safe call requires a receiver".to_string());
+    };
+    if matches!(invoke_kind, ManagedInvokeKind::Static) {
+        return Err("null-safe call is only valid for instance/interface methods".to_string());
+    }
+    let null_label = ir.new_label();
+    let done_label = ir.new_label();
+    ir.if_eqz(receiver_reg, null_label);
+    emit_invoke_with_values(
+        ir,
+        invoke_kind,
+        method,
+        Some((receiver_reg, receiver_desc)),
+        params,
+        args,
+        layout,
+        dsl_ctx,
+    )?;
+    emit_move_result_value(ir, return_type, dst)?;
+    ir.goto16(done_label);
+    ir.bind(null_label)?;
+    emit_null_safe_default(ir, return_type, dst)?;
+    ir.bind(done_label)?;
+    Ok(dst)
 }
 
 fn emit_field_get_value(
@@ -437,6 +507,20 @@ fn emit_load_value(
             }
             emit_int_binop_value(ir, *op, left, right, temp_reg, layout, dsl_ctx)
         }
+        DslValue::Ternary {
+            condition,
+            then_value,
+            else_value,
+        } => emit_ternary_value(
+            ir,
+            condition,
+            then_value,
+            else_value,
+            expected_type,
+            temp_reg,
+            layout,
+            dsl_ctx,
+        ),
         DslValue::Call(stmt) => emit_call_value(ir, stmt, expected_type, temp_reg, layout, dsl_ctx),
         DslValue::NewObject {
             class_name,
@@ -483,6 +567,108 @@ fn emit_load_value(
 
 fn value_descriptor_assignable_to(src: &str, dst: &str) -> bool {
     src == dst || (return_is_object(src) && return_is_object(dst))
+}
+
+fn emit_ternary_value(
+    ir: &mut DexIrBuilder,
+    condition: &DslCondition,
+    then_value: &DslValue,
+    else_value: &DslValue,
+    expected_type: &str,
+    dst: u8,
+    layout: &HelperParamLayout,
+    dsl_ctx: &mut DslBuildContext,
+) -> Result<u8, String> {
+    if matches!(expected_type, "J" | "D") {
+        return Err("wide ternary result is not supported yet".to_string());
+    }
+    if expected_type == "V" {
+        return Err("void ternary result is not supported".to_string());
+    }
+    let then_label = ir.new_label();
+    let else_label = ir.new_label();
+    let done_label = ir.new_label();
+    emit_condition_branch(ir, condition, then_label, else_label, layout, dsl_ctx)?;
+    ir.bind(then_label)?;
+    let then_reg = emit_load_value(ir, then_value, expected_type, dst, layout, dsl_ctx)?;
+    emit_copy_value(ir, dst, then_reg, expected_type)?;
+    ir.goto16(done_label);
+    ir.bind(else_label)?;
+    let else_reg = emit_load_value(ir, else_value, expected_type, dst, layout, dsl_ctx)?;
+    emit_copy_value(ir, dst, else_reg, expected_type)?;
+    ir.bind(done_label)?;
+    Ok(dst)
+}
+
+fn emit_condition_branch(
+    ir: &mut DexIrBuilder,
+    condition: &DslCondition,
+    true_label: DexLabel,
+    false_label: DexLabel,
+    layout: &HelperParamLayout,
+    dsl_ctx: &mut DslBuildContext,
+) -> Result<(), String> {
+    match condition {
+        DslCondition::Const(true) => ir.goto16(true_label),
+        DslCondition::Const(false) => ir.goto16(false_label),
+        DslCondition::Bool { value } => {
+            let reg = emit_load_cmp_value(ir, value, "Z", REG_TMP0, layout, dsl_ctx)?;
+            ir.if_eqz(reg, false_label);
+            ir.goto16(true_label);
+        }
+        DslCondition::Null { value, invert } => {
+            let reg = emit_load_value(ir, value, "Ljava/lang/Object;", REG_TMP1, layout, dsl_ctx)?;
+            let obj = emit_copy_object_if_needed(ir, reg, REG_TMP1);
+            if *invert {
+                ir.if_eqz(obj, false_label);
+                ir.goto16(true_label);
+            } else {
+                ir.if_eqz(obj, true_label);
+                ir.goto16(false_label);
+            }
+        }
+        DslCondition::Cmp { op, left, right } => {
+            let expected_type = if infer_cmp_descriptor(left, layout) == Some("Z")
+                || infer_cmp_descriptor(right, layout) == Some("Z")
+            {
+                "Z"
+            } else if infer_cmp_descriptor(left, layout) == Some("I")
+                || infer_cmp_descriptor(right, layout) == Some("I")
+            {
+                "I"
+            } else {
+                "Ljava/lang/Object;"
+            };
+            let left_reg = emit_load_cmp_value(ir, left, expected_type, REG_TMP0, layout, dsl_ctx)?;
+            let right_reg = emit_load_cmp_value(ir, right, expected_type, REG_TMP1, layout, dsl_ctx)?;
+            ir.if_cmp(*op, left_reg, right_reg, true_label);
+            ir.goto16(false_label);
+        }
+        DslCondition::InstanceOf { value, class_name } => {
+            let ty = java_class_to_descriptor(class_name)?;
+            let src = emit_load_value(ir, value, "Ljava/lang/Object;", REG_TMP1, layout, dsl_ctx)?;
+            let obj = emit_copy_object_if_needed(ir, src, REG_TMP1);
+            ir.instance_of(REG_TMP0, obj, ty);
+            ir.if_eqz(REG_TMP0, false_label);
+            ir.goto16(true_label);
+        }
+        DslCondition::And(left, right) => {
+            let right_label = ir.new_label();
+            emit_condition_branch(ir, left, right_label, false_label, layout, dsl_ctx)?;
+            ir.bind(right_label)?;
+            emit_condition_branch(ir, right, true_label, false_label, layout, dsl_ctx)?;
+        }
+        DslCondition::Or(left, right) => {
+            let right_label = ir.new_label();
+            emit_condition_branch(ir, left, true_label, right_label, layout, dsl_ctx)?;
+            ir.bind(right_label)?;
+            emit_condition_branch(ir, right, true_label, false_label, layout, dsl_ctx)?;
+        }
+        DslCondition::Not(condition) => {
+            emit_condition_branch(ir, condition, false_label, true_label, layout, dsl_ctx)?;
+        }
+    }
+    Ok(())
 }
 
 fn dex_int_binop(op: DslIntBinOp) -> DexIntBinOp {
@@ -744,6 +930,13 @@ fn infer_value_descriptor(value: &DslValue, layout: &HelperParamLayout, env: Jni
             DslUnaryOp::BoolNot => Ok(Some("Z".to_string())),
         },
         DslValue::Bool(_) => Ok(Some("Z".to_string())),
+        DslValue::Ternary {
+            then_value, else_value, ..
+        } => {
+            let then_desc = infer_value_descriptor(then_value, layout, env)?;
+            let else_desc = infer_value_descriptor(else_value, layout, env)?;
+            common_value_descriptor(then_desc, else_desc)
+        }
         DslValue::Null => Ok(None),
         DslValue::Call(stmt) => {
             if let Ok((_, return_type)) = parse_method_signature(&stmt.sig) {
@@ -1446,6 +1639,15 @@ fn value_contains_invoke(value: &DslValue) -> bool {
         DslValue::UnaryOp { value, .. } => value_contains_invoke(value),
         DslValue::ArrayLength(value) => value_contains_invoke(value),
         DslValue::IntBinOp { left, right, .. } => value_contains_invoke(left) || value_contains_invoke(right),
+        DslValue::Ternary {
+            condition,
+            then_value,
+            else_value,
+        } => {
+            condition_contains_invoke(condition)
+                || value_contains_invoke(then_value)
+                || value_contains_invoke(else_value)
+        }
         DslValue::Cast { value, .. } => value_contains_invoke(value),
         DslValue::ArrayGet { array, index, .. } => value_contains_invoke(array) || value_contains_invoke(index),
         DslValue::FieldGet { .. }
@@ -1454,6 +1656,20 @@ fn value_contains_invoke(value: &DslValue) -> bool {
         | DslValue::Int(_)
         | DslValue::Bool(_)
         | DslValue::Null => false,
+    }
+}
+
+fn condition_contains_invoke(condition: &DslCondition) -> bool {
+    match condition {
+        DslCondition::Const(_) => false,
+        DslCondition::Null { value, .. } | DslCondition::Bool { value } | DslCondition::InstanceOf { value, .. } => {
+            value_contains_invoke(value)
+        }
+        DslCondition::Cmp { left, right, .. } => value_contains_invoke(left) || value_contains_invoke(right),
+        DslCondition::And(left, right) | DslCondition::Or(left, right) => {
+            condition_contains_invoke(left) || condition_contains_invoke(right)
+        }
+        DslCondition::Not(condition) => condition_contains_invoke(condition),
     }
 }
 
@@ -1560,6 +1776,29 @@ fn emit_call(
         DslCallKind::Interface => ManagedInvokeKind::Interface,
         DslCallKind::Static => ManagedInvokeKind::Static,
     };
+    if stmt.null_safe {
+        let Some((receiver_reg, receiver_desc)) = receiver else {
+            return Err("null-safe call requires a receiver".to_string());
+        };
+        if matches!(invoke_kind, ManagedInvokeKind::Static) {
+            return Err("null-safe call is only valid for instance/interface methods".to_string());
+        }
+        let done_label = ir.new_label();
+        ir.if_eqz(receiver_reg, done_label);
+        emit_invoke_with_values(
+            ir,
+            invoke_kind,
+            method.clone(),
+            Some((receiver_reg, receiver_desc)),
+            &params,
+            &stmt.args,
+            layout,
+            dsl_ctx,
+        )?;
+        emit_discard_result(ir, &return_type)?;
+        ir.bind(done_label)?;
+        return Ok(method);
+    }
     emit_invoke_with_values(
         ir,
         invoke_kind,
@@ -1605,7 +1844,12 @@ fn stmt_int_expr_scratch_count(stmt: &DslStmt) -> u16 {
         DslStmt::LetOrig { args, .. } | DslStmt::ReturnOrig { args } => orig_args_int_expr_scratch_count(args),
         DslStmt::New { args, .. } => values_int_expr_scratch_count(args),
         DslStmt::NewArray { size, .. } => value_int_expr_scratch_count(size),
-        DslStmt::Call(stmt) => values_int_expr_scratch_count(&stmt.args),
+        DslStmt::Call(stmt) => stmt
+            .receiver
+            .as_ref()
+            .map(|receiver| value_int_expr_scratch_count(receiver))
+            .unwrap_or(0)
+            .max(values_int_expr_scratch_count(&stmt.args)),
         DslStmt::Cast { value, .. } | DslStmt::ArrayLength { array: value } => value_int_expr_scratch_count(value),
         DslStmt::ArrayGet { array, index, .. } => {
             value_int_expr_scratch_count(array).max(value_int_expr_scratch_count(index))
@@ -1690,7 +1934,19 @@ fn value_int_expr_scratch_count(value: &DslValue) -> u16 {
         }
         DslValue::UnaryOp { value, .. } => value_int_expr_scratch_count(value),
         DslValue::NewObject { args, .. } => values_int_expr_scratch_count(args),
-        DslValue::Call(stmt) => values_int_expr_scratch_count(&stmt.args),
+        DslValue::Call(stmt) => stmt
+            .receiver
+            .as_ref()
+            .map(|receiver| value_int_expr_scratch_count(receiver))
+            .unwrap_or(0)
+            .max(values_int_expr_scratch_count(&stmt.args)),
+        DslValue::Ternary {
+            condition,
+            then_value,
+            else_value,
+        } => condition_int_expr_scratch_count(condition)
+            .max(value_int_expr_scratch_count(then_value))
+            .max(value_int_expr_scratch_count(else_value)),
         DslValue::Cast { value, .. } | DslValue::ArrayLength(value) => value_int_expr_scratch_count(value),
         DslValue::ArrayGet { array, index, .. } => {
             value_int_expr_scratch_count(array).max(value_int_expr_scratch_count(index))
@@ -1701,6 +1957,22 @@ fn value_int_expr_scratch_count(value: &DslValue) -> u16 {
         | DslValue::Bool(_)
         | DslValue::Null
         | DslValue::FieldGet { .. } => 0,
+    }
+}
+
+fn condition_int_expr_scratch_count(condition: &DslCondition) -> u16 {
+    match condition {
+        DslCondition::Const(_) => 0,
+        DslCondition::Null { value, .. } | DslCondition::Bool { value } | DslCondition::InstanceOf { value, .. } => {
+            value_int_expr_scratch_count(value)
+        }
+        DslCondition::Cmp { left, right, .. } => {
+            value_int_expr_scratch_count(left).max(value_int_expr_scratch_count(right))
+        }
+        DslCondition::And(left, right) | DslCondition::Or(left, right) => {
+            condition_int_expr_scratch_count(left).max(condition_int_expr_scratch_count(right))
+        }
+        DslCondition::Not(condition) => condition_int_expr_scratch_count(condition),
     }
 }
 
@@ -1730,9 +2002,12 @@ fn statements_max_invoke_words(stmts: &[DslStmt], target_params: &[String], is_s
             DslStmt::NewArray { size, .. } => value_max_invoke_words(size)?,
             DslStmt::Call(stmt) => {
                 let params = parse_call_params(&stmt.sig)?;
-                let mut words = invoke_arg_words(stmt.target.is_some(), &params)?;
+                let mut words = invoke_arg_words(stmt.target.is_some() || stmt.receiver.is_some(), &params)?;
                 for arg in &stmt.args {
                     words = words.max(value_max_invoke_words(arg)?);
+                }
+                if let Some(receiver) = &stmt.receiver {
+                    words = words.max(value_max_invoke_words(receiver)?);
                 }
                 words
             }
@@ -1828,15 +2103,25 @@ fn value_max_invoke_words(value: &DslValue) -> Result<u16, String> {
         }
         DslValue::Call(stmt) => {
             let params = parse_call_params(&stmt.sig)?;
-            let mut words = invoke_arg_words(stmt.target.is_some(), &params)?;
+            let mut words = invoke_arg_words(stmt.target.is_some() || stmt.receiver.is_some(), &params)?;
             for arg in &stmt.args {
                 words = words.max(value_max_invoke_words(arg)?);
+            }
+            if let Some(receiver) = &stmt.receiver {
+                words = words.max(value_max_invoke_words(receiver)?);
             }
             Ok(words)
         }
         DslValue::ArrayLength(value) => value_max_invoke_words(value),
         DslValue::IntBinOp { left, right, .. } => Ok(value_max_invoke_words(left)?.max(value_max_invoke_words(right)?)),
         DslValue::UnaryOp { value, .. } => value_max_invoke_words(value),
+        DslValue::Ternary {
+            condition,
+            then_value,
+            else_value,
+        } => Ok(condition_max_invoke_words(condition)?
+            .max(value_max_invoke_words(then_value)?)
+            .max(value_max_invoke_words(else_value)?)),
         DslValue::Cast { value, .. } => value_max_invoke_words(value),
         DslValue::ArrayGet { array, index, .. } => {
             Ok(value_max_invoke_words(array)?.max(value_max_invoke_words(index)?))
@@ -1847,6 +2132,20 @@ fn value_max_invoke_words(value: &DslValue) -> Result<u16, String> {
         | DslValue::Int(_)
         | DslValue::Bool(_)
         | DslValue::Null => Ok(0),
+    }
+}
+
+fn condition_max_invoke_words(condition: &DslCondition) -> Result<u16, String> {
+    match condition {
+        DslCondition::Const(_) => Ok(0),
+        DslCondition::Null { value, .. } | DslCondition::Bool { value } | DslCondition::InstanceOf { value, .. } => {
+            value_max_invoke_words(value)
+        }
+        DslCondition::Cmp { left, right, .. } => Ok(value_max_invoke_words(left)?.max(value_max_invoke_words(right)?)),
+        DslCondition::And(left, right) | DslCondition::Or(left, right) => {
+            Ok(condition_max_invoke_words(left)?.max(condition_max_invoke_words(right)?))
+        }
+        DslCondition::Not(condition) => condition_max_invoke_words(condition),
     }
 }
 

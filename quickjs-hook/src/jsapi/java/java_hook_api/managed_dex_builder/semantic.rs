@@ -1,11 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::dsl::{
-    DslCallKind, DslCallStmt, DslFieldStmt, DslOrigArgs, DslProgram, DslStmt, DslTarget, DslUnaryOp, DslValue,
+    DslCallKind, DslCallStmt, DslCondition, DslFieldStmt, DslOrigArgs, DslProgram, DslStmt, DslTarget, DslUnaryOp,
+    DslValue,
 };
 use super::{
-    array_component_descriptor, java_class_to_descriptor, java_class_to_descriptor_or_primitive,
-    parse_method_signature, resolve_call_proto, return_is_object,
+    array_component_descriptor, common_value_descriptor, java_class_to_descriptor,
+    java_class_to_descriptor_or_primitive, parse_method_signature, resolve_call_proto, return_is_object,
 };
 use crate::jsapi::java::jni_core::JniEnv;
 
@@ -123,6 +124,13 @@ impl DslSemanticContext {
                 DslUnaryOp::Neg | DslUnaryOp::BitNot => Ok(Some("I".to_string())),
                 DslUnaryOp::BoolNot => Ok(Some("Z".to_string())),
             },
+            DslValue::Ternary {
+                then_value, else_value, ..
+            } => {
+                let then_desc = self.infer_value_descriptor(then_value)?;
+                let else_desc = self.infer_value_descriptor(else_value)?;
+                common_value_descriptor(then_desc, else_desc)
+            }
             DslValue::Bool(_) => Ok(Some("Z".to_string())),
             DslValue::Null => Ok(None),
             DslValue::Call(stmt) => {
@@ -218,6 +226,16 @@ impl DslSemanticContext {
                 self.validate_value_inner(left, require_nonnull_receiver)?;
                 self.validate_value_inner(right, require_nonnull_receiver)?;
             }
+            DslValue::Ternary {
+                condition,
+                then_value,
+                else_value,
+            } => {
+                self.validate_condition(condition)?;
+                self.validate_value_inner(then_value, require_nonnull_receiver)?;
+                self.validate_value_inner(else_value, require_nonnull_receiver)?;
+                let _ = self.infer_value_descriptor(value)?;
+            }
             DslValue::Cast { value, class_name } => {
                 self.validate_value_inner(value, require_nonnull_receiver)?;
                 java_class_to_descriptor(class_name)?;
@@ -278,6 +296,32 @@ impl DslSemanticContext {
         Ok(())
     }
 
+    fn validate_condition(&mut self, condition: &DslCondition) -> Result<(), String> {
+        match condition {
+            DslCondition::Const(_) => {}
+            DslCondition::Null { value, .. } => {
+                self.validate_value(value)?;
+            }
+            DslCondition::Bool { value } => {
+                self.validate_bool_condition_value(value)?;
+            }
+            DslCondition::Cmp { left, right, .. } => {
+                self.validate_value(left)?;
+                self.validate_value(right)?;
+            }
+            DslCondition::InstanceOf { value, class_name } => {
+                self.validate_value(value)?;
+                java_class_to_descriptor(class_name)?;
+            }
+            DslCondition::And(left, right) | DslCondition::Or(left, right) => {
+                self.validate_condition(left)?;
+                self.validate_condition(right)?;
+            }
+            DslCondition::Not(condition) => self.validate_condition(condition)?,
+        }
+        Ok(())
+    }
+
     fn validate_call(&mut self, stmt: &DslCallStmt) -> Result<(), String> {
         self.validate_call_inner(stmt, false)
     }
@@ -288,6 +332,12 @@ impl DslSemanticContext {
         }
         if stmt.kind == DslCallKind::Static && stmt.receiver.is_some() {
             return Err("static method call cannot use a receiver expression".to_string());
+        }
+        if stmt.null_safe && stmt.kind == DslCallKind::Static {
+            return Err("null-safe call is only valid for instance/interface methods".to_string());
+        }
+        if stmt.null_safe && stmt.target.is_none() && stmt.receiver.is_none() {
+            return Err("null-safe call requires a receiver".to_string());
         }
         let class_type = self.resolve_member_class_type(
             stmt.class_name.as_deref(),

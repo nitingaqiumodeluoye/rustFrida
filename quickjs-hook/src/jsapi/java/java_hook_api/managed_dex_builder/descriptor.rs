@@ -203,6 +203,22 @@ pub(super) fn return_is_object(return_type: &str) -> bool {
     return_type.starts_with('L') || return_type.starts_with('[')
 }
 
+pub(super) fn common_value_descriptor(left: Option<String>, right: Option<String>) -> Result<Option<String>, String> {
+    match (left, right) {
+        (Some(left), Some(right)) if left == right => Ok(Some(left)),
+        (Some(left), Some(right)) if return_is_object(&left) && return_is_object(&right) => {
+            Ok(Some("Ljava/lang/Object;".to_string()))
+        }
+        (Some(desc), None) | (None, Some(desc)) if return_is_object(&desc) => Ok(Some(desc)),
+        (None, None) => Ok(None),
+        (Some(left), Some(right)) => Err(format!(
+            "ternary branch types are not compatible: {} and {}",
+            left, right
+        )),
+        (Some(desc), None) | (None, Some(desc)) => Err(format!("ternary null branch cannot be assigned to {}", desc)),
+    }
+}
+
 pub(super) fn array_component_descriptor(array_desc: &str) -> Result<String, String> {
     array_desc
         .strip_prefix('[')
