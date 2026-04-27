@@ -1785,6 +1785,55 @@ fn emit_new_object(
     Ok(ctor)
 }
 
+fn emit_new_object_value(
+    ir: &mut DexIrBuilder,
+    class_name: &str,
+    ctor_sig: Option<&str>,
+    args: &[DslValue],
+    expected_type: &str,
+    dst: u8,
+    layout: &HelperParamLayout,
+    dsl_ctx: &mut DslBuildContext,
+) -> Result<u8, String> {
+    let new_type = java_class_to_descriptor(class_name)?;
+    if !value_descriptor_assignable_to(&new_type, expected_type) {
+        return Err(format!(
+            "new expression type {} cannot be passed as {}",
+            new_type, expected_type
+        ));
+    }
+    let (params, return_type) = if let Some(sig) = ctor_sig {
+        parse_method_signature(sig)?
+    } else {
+        (Vec::new(), "V".to_string())
+    };
+    if return_type != "V" {
+        return Err(format!("constructor signature must return void, got '{}'", return_type));
+    }
+    if params.len() != args.len() {
+        return Err(format!(
+            "{}.<init>{} expects {} explicit args, got {}",
+            class_name,
+            ctor_sig.unwrap_or("()V"),
+            params.len(),
+            args.len()
+        ));
+    }
+    let ctor = MethodRef::new(new_type.clone(), "<init>", "V", params.clone());
+    ir.new_instance(dst, new_type);
+    emit_invoke_with_values(
+        ir,
+        ManagedInvokeKind::Direct,
+        ctor,
+        Some((dst, "Ljava/lang/Object;")),
+        &params,
+        args,
+        layout,
+        dsl_ctx,
+    )?;
+    Ok(dst)
+}
+
 fn emit_discard_result(ir: &mut DexIrBuilder, return_type: &str) -> Result<(), String> {
     match return_type {
         "V" => {}
@@ -1973,6 +2022,20 @@ fn emit_load_value(
             Ok(temp_reg)
         }
         DslValue::Call(stmt) => emit_call_value(ir, stmt, expected_type, temp_reg, layout, dsl_ctx),
+        DslValue::NewObject {
+            class_name,
+            ctor_sig,
+            args,
+        } => emit_new_object_value(
+            ir,
+            class_name,
+            ctor_sig.as_deref(),
+            args,
+            expected_type,
+            temp_reg,
+            layout,
+            dsl_ctx,
+        ),
         DslValue::FieldGet { stmt, is_static } => {
             emit_field_get_value(ir, stmt, *is_static, expected_type, temp_reg, layout)
         }
@@ -2030,6 +2093,7 @@ fn infer_value_descriptor(value: &DslValue, layout: &HelperParamLayout) -> Resul
                 Ok(Some(return_type))
             }
         }
+        DslValue::NewObject { class_name, .. } => java_class_to_descriptor(class_name).map(Some),
         DslValue::FieldGet { stmt, .. } => java_class_to_descriptor_or_primitive(&stmt.type_name).map(Some),
         DslValue::Cast { class_name, .. } => java_class_to_descriptor(class_name).map(Some),
         DslValue::ArrayGet { type_name, .. } => match type_name {
@@ -2548,7 +2612,7 @@ enum ManagedInvokeKind {
 
 fn value_contains_invoke(value: &DslValue) -> bool {
     match value {
-        DslValue::Call(_) => true,
+        DslValue::Call(_) | DslValue::NewObject { .. } => true,
         DslValue::AddLit(value, _) | DslValue::SubLit(value, _) | DslValue::ArrayLength(value) => {
             value_contains_invoke(value)
         }
@@ -2781,6 +2845,22 @@ fn statements_max_invoke_words(stmts: &[DslStmt]) -> Result<u16, String> {
 
 fn value_max_invoke_words(value: &DslValue) -> Result<u16, String> {
     match value {
+        DslValue::NewObject { ctor_sig, args, .. } => {
+            let params = if let Some(sig) = ctor_sig {
+                let (params, return_type) = parse_method_signature(sig)?;
+                if return_type != "V" {
+                    return Err(format!("constructor signature must return void, got '{}'", return_type));
+                }
+                params
+            } else {
+                Vec::new()
+            };
+            let mut words = invoke_arg_words(true, &params)?;
+            for arg in args {
+                words = words.max(value_max_invoke_words(arg)?);
+            }
+            Ok(words)
+        }
         DslValue::Call(stmt) => {
             let params = parse_call_params(&stmt.sig)?;
             let mut words = invoke_arg_words(stmt.target.is_some(), &params)?;
@@ -3355,6 +3435,11 @@ enum DslValue {
     AddLit(Box<DslValue>, i8),
     SubLit(Box<DslValue>, i8),
     Call(DslCallStmt),
+    NewObject {
+        class_name: String,
+        ctor_sig: Option<String>,
+        args: Vec<DslValue>,
+    },
     FieldGet {
         stmt: Box<DslFieldStmt>,
         is_static: bool,
@@ -3391,6 +3476,15 @@ impl DslValue {
     fn into_statement(self) -> Option<DslStmt> {
         match self {
             DslValue::Call(stmt) => Some(DslStmt::Call(stmt)),
+            DslValue::NewObject {
+                class_name,
+                ctor_sig,
+                args,
+            } => Some(DslStmt::New {
+                class_name,
+                ctor_sig,
+                args,
+            }),
             DslValue::FieldGet { stmt, is_static } => Some(DslStmt::FieldRead { stmt: *stmt, is_static }),
             DslValue::Cast { value, class_name } => Some(DslStmt::Cast {
                 value: *value,
@@ -3961,6 +4055,9 @@ impl<'a> DslParser<'a> {
         if parts.len() < 2 {
             return Err(self.err("expected member access"));
         }
+        if parts.last().map(|part| part.as_str()) == Some("$new") {
+            return self.parse_js_new_member_value(parts);
+        }
         if parts.len() == 2 && parts[1] == "length" && self.peek() != Some('(') {
             let target = parse_target_name(&parts[0]).unwrap_or_else(|| DslTarget::Local(parts[0].clone()));
             return Ok(DslValue::ArrayLength(Box::new(DslValue::Target(target))));
@@ -4034,6 +4131,21 @@ impl<'a> DslParser<'a> {
                 })
             }
         }
+    }
+
+    fn parse_js_new_member_value(&mut self, mut parts: Vec<String>) -> Result<DslValue, String> {
+        if parts.len() < 2 || parts.pop().as_deref() != Some("$new") {
+            return Err(self.err("expected Class.$new(...)"));
+        }
+        let class_name = parts.join(".");
+        self.expect_char('(')?;
+        let (ctor_sig, args) = self.parse_new_constructor_args()?;
+        self.expect_char(')')?;
+        Ok(DslValue::NewObject {
+            class_name,
+            ctor_sig,
+            args,
+        })
     }
 
     fn parse_js_overload_member_value(&mut self, mut parts: Vec<String>) -> Result<DslValue, String> {

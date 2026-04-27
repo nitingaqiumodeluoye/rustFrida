@@ -25,8 +25,7 @@ Java.ready(function () {
     dsl:
       "let n: int = this.size.overload()();" +
       "let plus: int = n + 1;" +
-      "new java.lang.StringBuilder(\"java.lang.String\", \"seed\");" +
-      "let sb: java.lang.StringBuilder = last;" +
+      "let sb: java.lang.StringBuilder = java.lang.StringBuilder.$new(\"java.lang.String\", \"seed\");" +
       "sb.append.overload(\"java.lang.Object\")(arg0);" +
       "new int[](3);" +
       "let a: int[] = last;" +
@@ -94,6 +93,12 @@ the parser, but the JS-like names above are preferred.
 
 ```js
 "new java.lang.StringBuilder(\"java.lang.String\", \"seed\");"
+```
+
+Constructor expression:
+
+```js
+"let sb: java.lang.StringBuilder = java.lang.StringBuilder.$new(\"java.lang.String\", \"seed\");"
 ```
 
 For no-arg constructors:
