@@ -2536,6 +2536,28 @@ fn emit_if_null(
     Ok(then_returns && else_returns)
 }
 
+fn emit_if_bool(
+    ir: &mut DexIrBuilder,
+    value: &DslValue,
+    then_stmts: &[DslStmt],
+    else_stmts: &[DslStmt],
+    emit_ctx: &mut EmitContext<'_>,
+) -> Result<bool, String> {
+    let reg = emit_load_cmp_value(ir, value, "Z", REG_TMP0, emit_ctx.layout, emit_ctx.dsl_ctx)?;
+    let else_label = ir.new_label();
+    let done_label = ir.new_label();
+    ir.if_eqz(reg, else_label);
+
+    let then_returns = emit_statements(ir, then_stmts, emit_ctx)?;
+    if !then_returns {
+        ir.goto16(done_label);
+    }
+    ir.bind(else_label)?;
+    let else_returns = emit_statements(ir, else_stmts, emit_ctx)?;
+    ir.bind(done_label)?;
+    Ok(then_returns && else_returns)
+}
+
 fn infer_cmp_descriptor(value: &DslValue, layout: &HelperParamLayout) -> Option<&'static str> {
     match value {
         DslValue::Int(_) | DslValue::AddLit(_, _) | DslValue::SubLit(_, _) => Some("I"),
@@ -3009,6 +3031,13 @@ fn statements_max_invoke_words(stmts: &[DslStmt], target_params: &[String], is_s
             } => value_max_invoke_words(value)?
                 .max(statements_max_invoke_words(then_stmts, target_params, is_static)?)
                 .max(statements_max_invoke_words(else_stmts, target_params, is_static)?),
+            DslStmt::IfBool {
+                value,
+                then_stmts,
+                else_stmts,
+            } => value_max_invoke_words(value)?
+                .max(statements_max_invoke_words(then_stmts, target_params, is_static)?)
+                .max(statements_max_invoke_words(else_stmts, target_params, is_static)?),
             DslStmt::IfCmp {
                 left,
                 right,
@@ -3137,6 +3166,9 @@ fn stmt_uses_orig(stmt: &DslStmt) -> bool {
         DslStmt::IfNull {
             then_stmts, else_stmts, ..
         }
+        | DslStmt::IfBool {
+            then_stmts, else_stmts, ..
+        }
         | DslStmt::IfCmp {
             then_stmts, else_stmts, ..
         }
@@ -3178,6 +3210,9 @@ fn analyze_return_flow(stmts: &[DslStmt]) -> ReturnFlow {
                 };
             }
             DslStmt::IfNull {
+                then_stmts, else_stmts, ..
+            }
+            | DslStmt::IfBool {
                 then_stmts, else_stmts, ..
             }
             | DslStmt::IfCmp {
@@ -3265,6 +3300,9 @@ fn program_uses_orig_value(program: &DslProgram) -> Result<bool, String> {
                 DslStmt::IfNull {
                     then_stmts, else_stmts, ..
                 }
+                | DslStmt::IfBool {
+                    then_stmts, else_stmts, ..
+                }
                 | DslStmt::IfCmp {
                     then_stmts, else_stmts, ..
                 }
@@ -3302,6 +3340,9 @@ fn statements_contain_return_orig(stmts: &[DslStmt]) -> bool {
     stmts.iter().any(|stmt| match stmt {
         DslStmt::ReturnOrig { .. } => true,
         DslStmt::IfNull {
+            then_stmts, else_stmts, ..
+        }
+        | DslStmt::IfBool {
             then_stmts, else_stmts, ..
         }
         | DslStmt::IfCmp {
@@ -3368,6 +3409,12 @@ fn collect_local_slots_from_stmts(
                 slots.insert(name.clone(), LocalSlot { reg, descriptor });
             }
             DslStmt::IfNull {
+                then_stmts, else_stmts, ..
+            } => {
+                collect_local_slots_from_stmts(then_stmts, slots, next)?;
+                collect_local_slots_from_stmts(else_stmts, slots, next)?;
+            }
+            DslStmt::IfBool {
                 then_stmts, else_stmts, ..
             } => {
                 collect_local_slots_from_stmts(then_stmts, slots, next)?;
@@ -3633,6 +3680,11 @@ fn emit_statement(ir: &mut DexIrBuilder, stmt: &DslStmt, emit_ctx: &mut EmitCont
             then_stmts,
             else_stmts,
         } => emit_if_null(ir, value, *invert, then_stmts, else_stmts, emit_ctx),
+        DslStmt::IfBool {
+            value,
+            then_stmts,
+            else_stmts,
+        } => emit_if_bool(ir, value, then_stmts, else_stmts, emit_ctx),
         DslStmt::IfCmp {
             op,
             left,
@@ -3838,6 +3890,11 @@ enum DslStmt {
         then_stmts: Vec<DslStmt>,
         else_stmts: Vec<DslStmt>,
     },
+    IfBool {
+        value: DslValue,
+        then_stmts: Vec<DslStmt>,
+        else_stmts: Vec<DslStmt>,
+    },
     IfCmp {
         op: IfCmpOp,
         left: DslValue,
@@ -3946,6 +4003,9 @@ enum DslCondition {
         value: DslValue,
         class_name: String,
     },
+    Bool {
+        value: DslValue,
+    },
     And(Box<DslCondition>, Box<DslCondition>),
     Or(Box<DslCondition>, Box<DslCondition>),
     Not(Box<DslCondition>),
@@ -3957,6 +4017,11 @@ impl DslCondition {
             DslCondition::Null { value, invert } => DslStmt::IfNull {
                 value,
                 invert,
+                then_stmts,
+                else_stmts,
+            },
+            DslCondition::Bool { value } => DslStmt::IfBool {
+                value,
                 then_stmts,
                 else_stmts,
             },
@@ -4851,6 +4916,9 @@ impl<'a> DslParser<'a> {
                 class_name,
             });
         }
+        if !self.peek_js_cmp_op() {
+            return Ok(DslCondition::Bool { value: left });
+        }
         let op = self.parse_js_cmp_op()?;
         let right = self.parse_value_arg()?;
         let left_is_null = matches!(left, DslValue::Null);
@@ -4924,6 +4992,16 @@ impl<'a> DslParser<'a> {
         } else {
             Err(self.err("expected comparison operator"))
         }
+    }
+
+    fn peek_js_cmp_op(&mut self) -> bool {
+        self.skip_ws();
+        self.input[self.pos..].starts_with("==")
+            || self.input[self.pos..].starts_with("!=")
+            || self.input[self.pos..].starts_with("<=")
+            || self.input[self.pos..].starts_with(">=")
+            || self.peek() == Some('<')
+            || self.peek() == Some('>')
     }
 
     fn parse_optional_value_args(&mut self) -> Result<Vec<DslValue>, String> {

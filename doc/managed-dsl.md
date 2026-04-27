@@ -220,6 +220,20 @@ For ambiguous receiver types, include the declaring class:
 Supported comparisons include `==`, `!=`, `<`, `<=`, `>`, and `>=`. `null`
 conditions only support `==` and `!=`.
 
+Boolean values can be used directly as conditions. This is meant for common Java
+boolean calls and fields:
+
+```js
+"if (arg0 != null && arg0.equals.overload(\"java.lang.Object\")(\"target\")) {" +
+"  return orig(arg0, arg1);" +
+"} else {" +
+"  return orig();" +
+"}"
+```
+
+Object method calls follow normal Java null semantics. Add null guards before
+calling methods on arguments from natural app traffic.
+
 `instanceof` is supported:
 
 ```js
