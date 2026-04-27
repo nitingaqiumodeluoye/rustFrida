@@ -2324,6 +2324,33 @@ struct DslSemanticContext {
     this_descriptor: Option<String>,
     arg_descriptors: Vec<String>,
     local_descriptors: BTreeMap<String, String>,
+    nonnull_targets: BTreeSet<DslTargetKey>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum DslTargetKey {
+    This,
+    Arg(usize),
+    Local(String),
+}
+
+fn dsl_target_key(target: &DslTarget) -> Option<DslTargetKey> {
+    match target {
+        DslTarget::This => Some(DslTargetKey::This),
+        DslTarget::Arg(index) => Some(DslTargetKey::Arg(*index)),
+        DslTarget::Local(name) => Some(DslTargetKey::Local(name.clone())),
+        DslTarget::Last | DslTarget::Result => None,
+    }
+}
+
+fn dsl_target_label(target: &DslTarget) -> String {
+    match target {
+        DslTarget::This => "this".to_string(),
+        DslTarget::Arg(index) => format!("arg{}", index),
+        DslTarget::Local(name) => name.clone(),
+        DslTarget::Last => "last".to_string(),
+        DslTarget::Result => "result".to_string(),
+    }
 }
 
 impl DslSemanticContext {
@@ -2333,6 +2360,7 @@ impl DslSemanticContext {
             this_descriptor: if is_static { None } else { Some(target_type) },
             arg_descriptors: target_params,
             local_descriptors: BTreeMap::new(),
+            nonnull_targets: BTreeSet::new(),
         }
     }
 
@@ -2411,22 +2439,56 @@ impl DslSemanticContext {
         }
     }
 
+    fn is_known_nonnull_target(&self, target: &DslTarget) -> bool {
+        matches!(target, DslTarget::This)
+            || dsl_target_key(target)
+                .map(|key| self.nonnull_targets.contains(&key))
+                .unwrap_or(false)
+    }
+
+    fn validate_receiver_nonnull(&self, stmt: &DslCallStmt, class_type: &str) -> Result<(), String> {
+        if stmt.kind == DslCallKind::Static || !return_is_object(class_type) {
+            return Ok(());
+        }
+        let Some(target) = stmt.target.as_ref() else {
+            return Ok(());
+        };
+        if self.is_known_nonnull_target(target) {
+            return Ok(());
+        }
+        Err(format!(
+            "receiver '{}' may be null before calling {}.{}; guard it with '{} != null' first",
+            dsl_target_label(target),
+            stmt.class_label(),
+            stmt.method_name,
+            dsl_target_label(target)
+        ))
+    }
+
     fn validate_value(&mut self, value: &DslValue) -> Result<(), String> {
+        self.validate_value_inner(value, false)
+    }
+
+    fn validate_bool_condition_value(&mut self, value: &DslValue) -> Result<(), String> {
+        self.validate_value_inner(value, true)
+    }
+
+    fn validate_value_inner(&mut self, value: &DslValue, require_nonnull_receiver: bool) -> Result<(), String> {
         match value {
             DslValue::Target(target) => {
                 self.resolve_target_descriptor(target)?;
             }
             DslValue::String(_) | DslValue::Int(_) | DslValue::Null => {}
             DslValue::AddLit(value, _) | DslValue::SubLit(value, _) | DslValue::ArrayLength(value) => {
-                self.validate_value(value)?;
+                self.validate_value_inner(value, require_nonnull_receiver)?;
             }
             DslValue::Cast { value, class_name } => {
-                self.validate_value(value)?;
+                self.validate_value_inner(value, require_nonnull_receiver)?;
                 java_class_to_descriptor(class_name)?;
             }
             DslValue::ArrayGet { array, index, .. } => {
-                self.validate_value(array)?;
-                self.validate_value(index)?;
+                self.validate_value_inner(array, require_nonnull_receiver)?;
+                self.validate_value_inner(index, require_nonnull_receiver)?;
                 if self.infer_value_descriptor(array)?.is_none() {
                     return Err("array element type cannot be inferred; use arr[index: Type]".to_string());
                 }
@@ -2448,7 +2510,8 @@ impl DslSemanticContext {
                         Vec::new()
                     } else {
                         return Err(
-                            "constructor arguments must include a full JNI signature or parameter type list".to_string(),
+                            "constructor arguments must include a full JNI signature or parameter type list"
+                                .to_string(),
                         );
                     }
                 };
@@ -2460,11 +2523,11 @@ impl DslSemanticContext {
                     ));
                 }
                 for arg in args {
-                    self.validate_value(arg)?;
+                    self.validate_value_inner(arg, require_nonnull_receiver)?;
                 }
             }
             DslValue::Call(stmt) => {
-                self.validate_call(stmt)?;
+                self.validate_call_inner(stmt, require_nonnull_receiver)?;
             }
             DslValue::FieldGet { stmt, .. } => {
                 self.validate_field(stmt)?;
@@ -2474,8 +2537,15 @@ impl DslSemanticContext {
     }
 
     fn validate_call(&mut self, stmt: &DslCallStmt) -> Result<(), String> {
+        self.validate_call_inner(stmt, false)
+    }
+
+    fn validate_call_inner(&mut self, stmt: &DslCallStmt, require_nonnull_receiver: bool) -> Result<(), String> {
         let class_type = self.resolve_member_class_type(stmt.class_name.as_deref(), stmt.target.as_ref())?;
         let (params, _, full_sig) = resolve_call_proto(self.env, stmt, &class_type)?;
+        if require_nonnull_receiver {
+            self.validate_receiver_nonnull(stmt, &class_type)?;
+        }
         if params.len() != stmt.args.len() {
             return Err(format!(
                 "{}.{}{} expects {} explicit args, got {}",
@@ -2487,7 +2557,7 @@ impl DslSemanticContext {
             ));
         }
         for arg in &stmt.args {
-            self.validate_value(arg)?;
+            self.validate_value_inner(arg, require_nonnull_receiver)?;
         }
         Ok(())
     }
@@ -2523,6 +2593,21 @@ impl DslSemanticContext {
             self.validate_stmt(stmt)?;
         }
         Ok(())
+    }
+
+    fn validate_stmts_with_nonnull_value(&mut self, value: &DslValue, stmts: &[DslStmt]) -> Result<(), String> {
+        let DslValue::Target(target) = value else {
+            return self.validate_stmts(stmts);
+        };
+        let Some(key) = dsl_target_key(target) else {
+            return self.validate_stmts(stmts);
+        };
+        let inserted = self.nonnull_targets.insert(key.clone());
+        let result = self.validate_stmts(stmts);
+        if inserted {
+            self.nonnull_targets.remove(&key);
+        }
+        result
     }
 
     fn validate_stmt(&mut self, stmt: &DslStmt) -> Result<(), String> {
@@ -2588,23 +2673,36 @@ impl DslSemanticContext {
             DslStmt::FieldRead { stmt, .. } | DslStmt::FieldWrite { stmt, .. } => self.validate_field(stmt)?,
             DslStmt::IfNull {
                 value,
+                invert,
                 then_stmts,
                 else_stmts,
-                ..
+            } => {
+                self.validate_value(value)?;
+                if *invert {
+                    self.validate_stmts_with_nonnull_value(value, then_stmts)?;
+                    self.validate_stmts(else_stmts)?;
+                } else {
+                    self.validate_stmts(then_stmts)?;
+                    self.validate_stmts_with_nonnull_value(value, else_stmts)?;
+                }
             }
-            | DslStmt::IfBool {
+            DslStmt::IfBool {
                 value,
                 then_stmts,
                 else_stmts,
+            } => {
+                self.validate_bool_condition_value(value)?;
+                self.validate_stmts(then_stmts)?;
+                self.validate_stmts(else_stmts)?;
             }
-            | DslStmt::IfInstanceOf {
+            DslStmt::IfInstanceOf {
                 value,
                 then_stmts,
                 else_stmts,
                 ..
             } => {
                 self.validate_value(value)?;
-                self.validate_stmts(then_stmts)?;
+                self.validate_stmts_with_nonnull_value(value, then_stmts)?;
                 self.validate_stmts(else_stmts)?;
             }
             DslStmt::IfCmp {
@@ -4279,7 +4377,7 @@ impl DslCallStmt {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum DslCallKind {
     Virtual,
     Interface,
