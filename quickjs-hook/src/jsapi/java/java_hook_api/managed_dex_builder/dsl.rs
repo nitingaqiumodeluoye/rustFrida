@@ -10,6 +10,7 @@ mod declaration;
 mod lexer;
 mod member;
 mod member_args;
+mod member_overload;
 use lexer::TokenKind as DslTokenKind;
 mod operators;
 mod parser;
