@@ -1008,6 +1008,79 @@
         }
     });
 
+    Object.defineProperty(MethodWrapper.prototype, "dslImpl", {
+        get: function() { return this._dslCode || null; },
+        set: function(code) {
+            var name = this._m === "$init" ? "<init>" : this._m;
+            var cls = this._c;
+
+            var sigs;
+            if (this._s === null) {
+                var ms = _getMethods(this);
+                var match = [];
+                for (var i = 0; i < ms.length; i++) {
+                    if (ms[i].name === name) match.push(ms[i]);
+                }
+                if (match.length === 0)
+                    throw new Error("Method not found: " + cls + "." + this._m);
+                sigs = match.map(function(m) { return m.sig; });
+            } else if (Array.isArray(this._s)) {
+                sigs = this._s;
+            } else {
+                sigs = [this._s];
+            }
+
+            if (code === null || code === undefined) {
+                for (var i = 0; i < sigs.length; i++) {
+                    _unhook(cls, name, sigs[i]);
+                }
+                this._dslCode = null;
+                this._dslInfo = null;
+            } else {
+                if (this._dslInfo !== null && this._dslInfo !== undefined) {
+                    for (var i = 0; i < sigs.length; i++) {
+                        _unhook(cls, name, sigs[i]);
+                    }
+                    this._dslCode = null;
+                    this._dslInfo = null;
+                }
+                var results = [];
+                var installed = [];
+                try {
+                    for (var i = 0; i < sigs.length; i++) {
+                        results.push(Java.managedHookDsl({
+                            className: cls,
+                            methodName: name,
+                            signature: sigs[i],
+                            dsl: code
+                        }));
+                        installed.push(sigs[i]);
+                    }
+                } catch (e) {
+                    for (var j = 0; j < installed.length; j++) {
+                        try { _unhook(cls, name, installed[j]); } catch (_) {}
+                    }
+                    throw e;
+                }
+                this._dslCode = code;
+                this._dslInfo = results.length === 1 ? results[0] : results;
+            }
+        }
+    });
+
+    Object.defineProperty(MethodWrapper.prototype, "dslInfo", {
+        get: function() { return this._dslInfo || null; }
+    });
+
+    MethodWrapper.prototype.dslDrain = function(max) {
+        if (!this._dslInfo) {
+            return [];
+        }
+        return max === undefined
+            ? Java.managedDrainMessages(this._dslInfo)
+            : Java.managedDrainMessages(this._dslInfo, max);
+    };
+
     function _luaString(s) {
         s = String(s);
         return '"' + s
@@ -1286,6 +1359,29 @@
             enumerable: true,
             configurable: true
         });
+
+        Object.defineProperty(callable, "dslImpl", {
+            get: function() {
+                return wrapper.dslImpl;
+            },
+            set: function(code) {
+                wrapper.dslImpl = code;
+            },
+            enumerable: true,
+            configurable: true
+        });
+
+        Object.defineProperty(callable, "dslInfo", {
+            get: function() {
+                return wrapper.dslInfo;
+            },
+            enumerable: true,
+            configurable: true
+        });
+
+        callable.dslDrain = function(max) {
+            return wrapper.dslDrain(max);
+        };
 
         return callable;
     }

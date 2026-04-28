@@ -8,6 +8,7 @@ pub(super) const ACC_PRIVATE: u32 = 0x0002;
 pub(super) const ACC_PROTECTED: u32 = 0x0004;
 pub(super) const ACC_STATIC: u32 = 0x0008;
 pub(super) const ACC_FINAL: u32 = 0x0010;
+pub(super) const ACC_SYNCHRONIZED: u32 = 0x0020;
 pub(super) const ACC_BRIDGE: u32 = 0x0040;
 pub(super) const ACC_VOLATILE: u32 = 0x0040;
 pub(super) const ACC_NATIVE: u32 = 0x0100;
@@ -88,6 +89,8 @@ pub(super) struct GeneratedManagedDex {
     pub uses_orig: bool,
     pub string_literals: Vec<GeneratedStringLiteral>,
     pub counters: Vec<GeneratedCounter>,
+    pub message_channels: Vec<GeneratedMessageChannel>,
+    pub message_capacity: i32,
 }
 
 #[derive(Clone, Debug)]
@@ -101,6 +104,19 @@ pub(super) struct GeneratedCounter {
     pub name: String,
     pub field_name: String,
 }
+
+#[derive(Clone, Debug)]
+pub(super) struct GeneratedMessageChannel {
+    pub name: String,
+    pub code: i32,
+}
+
+pub(super) const MANAGED_MESSAGE_CAPACITY: i32 = 4096;
+pub(super) const MANAGED_MESSAGE_HEAD_FIELD: &str = "__rf_msg_head";
+pub(super) const MANAGED_MESSAGE_TAIL_FIELD: &str = "__rf_msg_tail";
+pub(super) const MANAGED_MESSAGE_DROPPED_FIELD: &str = "__rf_msg_dropped";
+pub(super) const MANAGED_MESSAGE_CODES_FIELD: &str = "__rf_msg_codes";
+pub(super) const MANAGED_MESSAGE_VALUES_FIELD: &str = "__rf_msg_values";
 
 mod descriptor;
 use descriptor::{
@@ -164,6 +180,51 @@ fn build_orig_backup_stub(return_type: &str, ins_size: u16) -> Result<DexCode, S
         _ => unreachable!(),
     }
     Ok(code)
+}
+
+fn generated_int_field(generated_type: &str, name: &str) -> FieldRef {
+    FieldRef::new(generated_type.to_string(), "I".to_string(), name.to_string())
+}
+
+fn generated_int_array_field(generated_type: &str, name: &str) -> FieldRef {
+    FieldRef::new(generated_type.to_string(), "[I".to_string(), name.to_string())
+}
+
+fn build_message_send_code(generated_type: &str) -> Result<DexCode, String> {
+    let capacity = i16::try_from(MANAGED_MESSAGE_CAPACITY)
+        .map_err(|_| format!("managed message capacity too large: {}", MANAGED_MESSAGE_CAPACITY))?;
+    let mask = i16::try_from(MANAGED_MESSAGE_CAPACITY - 1)
+        .map_err(|_| format!("managed message mask too large: {}", MANAGED_MESSAGE_CAPACITY - 1))?;
+    let head_field = generated_int_field(generated_type, MANAGED_MESSAGE_HEAD_FIELD);
+    let tail_field = generated_int_field(generated_type, MANAGED_MESSAGE_TAIL_FIELD);
+    let dropped_field = generated_int_field(generated_type, MANAGED_MESSAGE_DROPPED_FIELD);
+    let codes_field = generated_int_array_field(generated_type, MANAGED_MESSAGE_CODES_FIELD);
+    let values_field = generated_int_array_field(generated_type, MANAGED_MESSAGE_VALUES_FIELD);
+
+    // v6/v7 are incoming static method args: channel code and int payload.
+    let mut ir = DexIrBuilder::new(8, 2, 0);
+    let ok = ir.new_label();
+    ir.sget(1, head_field.clone(), ValueKind::Narrow);
+    ir.sget(2, tail_field, ValueKind::Narrow);
+    ir.int_binop(DexIntBinOp::Sub, 3, 1, 2);
+    ir.const16(4, capacity);
+    ir.if_cmp(IfCmpOp::Lt, 3, 4, ok);
+
+    ir.sget(5, dropped_field.clone(), ValueKind::Narrow);
+    ir.int_binop_lit8(DexIntLit8Op::Add, 5, 5, 1);
+    ir.sput(5, dropped_field, ValueKind::Narrow);
+    ir.return_void();
+
+    ir.bind(ok)?;
+    ir.int_binop_lit16(DexIntLit16Op::And, 4, 1, mask);
+    ir.sget(0, codes_field, ValueKind::Object);
+    ir.aput(6, 0, 4, ValueKind::Narrow);
+    ir.sget(0, values_field, ValueKind::Object);
+    ir.aput(7, 0, 4, ValueKind::Narrow);
+    ir.int_binop_lit8(DexIntLit8Op::Add, 1, 1, 1);
+    ir.sput(1, head_field, ValueKind::Narrow);
+    ir.return_void();
+    ir.finish()
 }
 
 mod semantic;
@@ -542,6 +603,32 @@ pub(super) unsafe fn build_managed_dsl_dex(
     for counter in &dsl_ctx.counters {
         class.static_field(&counter.field_name, "I", ACC_PUBLIC | ACC_STATIC | ACC_VOLATILE);
     }
+    if !dsl_ctx.message_channels.is_empty() {
+        class.static_field(MANAGED_MESSAGE_HEAD_FIELD, "I", ACC_PUBLIC | ACC_STATIC | ACC_VOLATILE);
+        class.static_field(MANAGED_MESSAGE_TAIL_FIELD, "I", ACC_PUBLIC | ACC_STATIC | ACC_VOLATILE);
+        class.static_field(
+            MANAGED_MESSAGE_DROPPED_FIELD,
+            "I",
+            ACC_PUBLIC | ACC_STATIC | ACC_VOLATILE,
+        );
+        class.static_field(
+            MANAGED_MESSAGE_CODES_FIELD,
+            "[I",
+            ACC_PUBLIC | ACC_STATIC | ACC_VOLATILE,
+        );
+        class.static_field(
+            MANAGED_MESSAGE_VALUES_FIELD,
+            "[I",
+            ACC_PUBLIC | ACC_STATIC | ACC_VOLATILE,
+        );
+        class.direct_method(
+            "__rf_send",
+            "V",
+            vec!["I".to_string(), "I".to_string()],
+            ACC_PUBLIC | ACC_STATIC | ACC_SYNCHRONIZED | ACC_SYNTHETIC,
+            build_message_send_code(&generated_type)?,
+        );
+    }
     class.direct_method(
         "hook",
         &return_type,
@@ -577,6 +664,8 @@ pub(super) unsafe fn build_managed_dsl_dex(
         uses_orig,
         string_literals: dsl_ctx.string_literals,
         counters: dsl_ctx.counters,
+        message_channels: dsl_ctx.message_channels,
+        message_capacity: MANAGED_MESSAGE_CAPACITY,
     })
 }
 

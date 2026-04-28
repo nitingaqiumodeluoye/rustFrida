@@ -122,6 +122,10 @@ pub(in crate::jsapi::java::java_hook_api::managed_dex_builder) enum DslStmt {
     Count {
         name: String,
     },
+    Send {
+        name: String,
+        value: DslValue,
+    },
     Throw {
         value: DslValue,
     },

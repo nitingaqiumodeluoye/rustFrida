@@ -13,7 +13,11 @@ use super::super::java_lua_fast_api::{compile_art_method_to_quick, RequestedComp
 use super::super::jni_core::*;
 use super::super::reflect::{decode_method_id, find_class_safe, get_app_classloader_local_ref};
 use super::install_support::{create_class_global_ref, update_original_method_flags_for_hook, JavaHookInstallGuard};
-use super::managed_dex_builder::{build_managed_dsl_dex, GeneratedCounter, GeneratedStringLiteral};
+use super::managed_dex_builder::{
+    build_managed_dsl_dex, GeneratedCounter, GeneratedMessageChannel, GeneratedStringLiteral, MANAGED_MESSAGE_CAPACITY,
+    MANAGED_MESSAGE_CODES_FIELD, MANAGED_MESSAGE_DROPPED_FIELD, MANAGED_MESSAGE_HEAD_FIELD, MANAGED_MESSAGE_TAIL_FIELD,
+    MANAGED_MESSAGE_VALUES_FIELD,
+};
 
 struct DynamicManagedHelperRefs {
     class_name: String,
@@ -228,6 +232,73 @@ unsafe fn initialize_generated_string_literals(
     Ok(())
 }
 
+unsafe fn initialize_generated_message_queue(
+    env: JniEnv,
+    helper_cls: *mut std::ffi::c_void,
+    channels: &[GeneratedMessageChannel],
+) -> Result<(), String> {
+    if channels.is_empty() {
+        return Ok(());
+    }
+
+    let get_static_field_id: GetStaticFieldIdFn = jni_fn!(env, GetStaticFieldIdFn, JNI_GET_STATIC_FIELD_ID);
+    type SetStaticObjectFieldFn =
+        unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void, *mut std::ffi::c_void);
+    let set_static_object_field: SetStaticObjectFieldFn =
+        jni_fn!(env, SetStaticObjectFieldFn, JNI_SET_STATIC_OBJECT_FIELD);
+    let set_static_int_field: SetStaticIntFieldFn = jni_fn!(env, SetStaticIntFieldFn, JNI_SET_STATIC_INT_FIELD);
+    let new_int_array: NewPrimitiveArrayFn = jni_fn!(env, NewPrimitiveArrayFn, JNI_NEW_INT_ARRAY);
+    let delete_local_ref: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
+
+    let int_sig = CString::new("I").unwrap();
+    for field in [
+        MANAGED_MESSAGE_HEAD_FIELD,
+        MANAGED_MESSAGE_TAIL_FIELD,
+        MANAGED_MESSAGE_DROPPED_FIELD,
+    ] {
+        let name = CString::new(field).unwrap();
+        let fid = get_static_field_id(env, helper_cls, name.as_ptr(), int_sig.as_ptr());
+        if fid.is_null() || jni_check_exc(env) {
+            return Err(format!("generated message field {} not found", field));
+        }
+        set_static_int_field(env, helper_cls, fid, 0);
+        if jni_check_exc(env) {
+            return Err(format!(
+                "SetStaticIntField failed for generated message field {}",
+                field
+            ));
+        }
+    }
+
+    let int_array_sig = CString::new("[I").unwrap();
+    for field in [MANAGED_MESSAGE_CODES_FIELD, MANAGED_MESSAGE_VALUES_FIELD] {
+        let name = CString::new(field).unwrap();
+        let fid = get_static_field_id(env, helper_cls, name.as_ptr(), int_array_sig.as_ptr());
+        if fid.is_null() || jni_check_exc(env) {
+            return Err(format!("generated message array field {} not found", field));
+        }
+        let array = new_int_array(env, MANAGED_MESSAGE_CAPACITY);
+        if array.is_null() || jni_check_exc(env) {
+            return Err(format!("NewIntArray failed for generated message array {}", field));
+        }
+        set_static_object_field(env, helper_cls, fid, array);
+        delete_local_ref(env, array);
+        if jni_check_exc(env) {
+            return Err(format!(
+                "SetStaticObjectField failed for generated message array {}",
+                field
+            ));
+        }
+    }
+
+    output_message(&format!(
+        "[managedHook] initialized message queue capacity={} channel(s)={}",
+        MANAGED_MESSAGE_CAPACITY,
+        channels.len()
+    ));
+    Ok(())
+}
+
 unsafe fn install_orig_backup_art_method(
     backup_art_method: u64,
     original_art_method: u64,
@@ -258,6 +329,7 @@ unsafe fn install_managed_method_helper(
     class_name: &str,
     method_name: &str,
     actual_sig: &str,
+    resolved_art_method: Option<u64>,
     helper_cls: *mut std::ffi::c_void,
     helper_method_name_str: &str,
     helper_method_sig_str: &str,
@@ -265,7 +337,11 @@ unsafe fn install_managed_method_helper(
     label: &str,
     uses_orig: bool,
 ) -> Result<(), String> {
-    let (art_method, _is_static) = resolve_art_method(env, class_name, method_name, actual_sig, false)?;
+    let art_method = if let Some(art_method) = resolved_art_method {
+        art_method
+    } else {
+        resolve_art_method(env, class_name, method_name, actual_sig, false)?.0
+    };
 
     init_java_registry();
     if crate::jsapi::callback_util::with_registry(&JAVA_HOOK_REGISTRY, |r| r.contains_key(&art_method)).unwrap_or(false)
@@ -484,6 +560,8 @@ struct ManagedDslInstallResult {
     helper_signature: String,
     uses_orig: bool,
     counters: Vec<GeneratedCounter>,
+    message_channels: Vec<GeneratedMessageChannel>,
+    message_capacity: i32,
 }
 
 unsafe fn install_managed_dsl_inner(
@@ -494,7 +572,15 @@ unsafe fn install_managed_dsl_inner(
 ) -> Result<ManagedDslInstallResult, String> {
     let scoped_env = scoped_jni_env()?;
     let env = scoped_env.env();
-    let (_, is_static) = resolve_art_method(env, class_name, method_name, sig, false)?;
+    let (art_method, is_static) = resolve_art_method(env, class_name, method_name, sig, false)?;
+    init_java_registry();
+    if crate::jsapi::callback_util::with_registry(&JAVA_HOOK_REGISTRY, |r| r.contains_key(&art_method)).unwrap_or(false)
+    {
+        return Err(format!(
+            "{}.{}{} already hooked — unhook first",
+            class_name, method_name, sig
+        ));
+    }
     let class_id = DYNAMIC_MANAGED_CLASS_ID.fetch_add(1, Ordering::Relaxed);
     let generated = build_managed_dsl_dex(env, class_id, class_name, method_name, sig, is_static, dsl)?;
     let helper_class = generated.class_name.clone();
@@ -502,6 +588,8 @@ unsafe fn install_managed_dsl_inner(
     let helper_signature = generated.method_sig.clone();
     let uses_orig = generated.uses_orig;
     let counters = generated.counters.clone();
+    let message_channels = generated.message_channels.clone();
+    let message_capacity = generated.message_capacity;
     output_message(&format!(
         "[managedHook] generated generic DSL dex class={} target={}.{}{} static={} dexSize={}",
         generated.class_name,
@@ -513,11 +601,13 @@ unsafe fn install_managed_dsl_inner(
     ));
     let helper_cls = load_dynamic_managed_helper_class(env, generated.dex, &generated.class_name)?;
     initialize_generated_string_literals(env, helper_cls, &generated.string_literals)?;
+    initialize_generated_message_queue(env, helper_cls, &generated.message_channels)?;
     install_managed_method_helper(
         env,
         class_name,
         method_name,
         sig,
+        Some(art_method),
         helper_cls,
         &generated.method_name,
         &generated.method_sig,
@@ -535,6 +625,8 @@ unsafe fn install_managed_dsl_inner(
         helper_signature,
         uses_orig,
         counters,
+        message_channels,
+        message_capacity,
     })
 }
 
@@ -643,7 +735,146 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_managed_hook_dsl(
         counters.set_property(ctx, &counter.name, JSValue::string(ctx, &counter.field_name));
     }
     obj.set_property(ctx, "counters", counters);
+    let messages = JSValue(ffi::JS_NewObject(ctx));
+    for channel in result.message_channels {
+        messages.set_property(ctx, &channel.name, JSValue::int(channel.code));
+    }
+    obj.set_property(ctx, "messages", messages);
+    obj.set_property(ctx, "messageCapacity", JSValue::int(result.message_capacity));
     obj.raw()
+}
+
+unsafe fn extract_helper_class_arg(
+    ctx: *mut ffi::JSContext,
+    value: JSValue,
+    api: &str,
+) -> Result<String, ffi::JSValue> {
+    if value.is_object() && ffi::JS_IsArray(ctx, value.raw()) == 0 {
+        return extract_string_prop(ctx, value, &["helperClass", "className", "class"], api);
+    }
+    value
+        .to_string(ctx)
+        .ok_or_else(|| throw_internal_error(ctx, format!("{} helperClass must be a string or dslInfo object", api)))
+}
+
+unsafe fn managed_static_field_id(
+    env: JniEnv,
+    helper_cls: *mut std::ffi::c_void,
+    name: &str,
+    sig: &str,
+) -> Result<*mut std::ffi::c_void, String> {
+    let get_static_field_id: GetStaticFieldIdFn = jni_fn!(env, GetStaticFieldIdFn, JNI_GET_STATIC_FIELD_ID);
+    let name = CString::new(name).map_err(|_| format!("invalid managed field name {}", name))?;
+    let sig = CString::new(sig).map_err(|_| format!("invalid managed field sig {}", sig))?;
+    let fid = get_static_field_id(env, helper_cls, name.as_ptr(), sig.as_ptr());
+    if fid.is_null() || jni_check_exc(env) {
+        return Err("managed message field not found".to_string());
+    }
+    Ok(fid)
+}
+
+pub(in crate::jsapi::java) unsafe extern "C" fn js_managed_drain_messages(
+    ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    argc: i32,
+    argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    if argc < 1 {
+        return throw_internal_error(ctx, "managedDrainMessages requires (dslInfoOrHelperClass[, max])");
+    }
+    let helper_class = match extract_helper_class_arg(ctx, JSValue(*argv), "managedDrainMessages") {
+        Ok(value) => value,
+        Err(err) => return err,
+    };
+    let max_items = if argc >= 2 {
+        JSValue(*argv.add(1))
+            .to_i64(ctx)
+            .map(|value| value.clamp(0, MANAGED_MESSAGE_CAPACITY as i64) as i32)
+            .unwrap_or(MANAGED_MESSAGE_CAPACITY)
+    } else {
+        MANAGED_MESSAGE_CAPACITY
+    };
+    let Some(helper_cls) = find_dynamic_managed_helper_class(&helper_class) else {
+        return throw_internal_error(ctx, format!("managed helper class not found: {}", helper_class));
+    };
+    let scoped_env = match scoped_jni_env() {
+        Ok(env) => env,
+        Err(msg) => return throw_internal_error(ctx, msg),
+    };
+    let env = scoped_env.env();
+    let get_static_int_field: GetStaticIntFieldFn = jni_fn!(env, GetStaticIntFieldFn, JNI_GET_STATIC_INT_FIELD);
+    let set_static_int_field: SetStaticIntFieldFn = jni_fn!(env, SetStaticIntFieldFn, JNI_SET_STATIC_INT_FIELD);
+    let get_static_object_field: GetStaticObjectFieldFn =
+        jni_fn!(env, GetStaticObjectFieldFn, JNI_GET_STATIC_OBJECT_FIELD);
+    let get_int_array_region: GetIntArrayRegionFn = jni_fn!(env, GetIntArrayRegionFn, JNI_GET_INT_ARRAY_REGION);
+    let delete_local_ref: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
+
+    let head_fid = match managed_static_field_id(env, helper_cls, MANAGED_MESSAGE_HEAD_FIELD, "I") {
+        Ok(fid) => fid,
+        Err(msg) => return throw_internal_error(ctx, msg),
+    };
+    let tail_fid = match managed_static_field_id(env, helper_cls, MANAGED_MESSAGE_TAIL_FIELD, "I") {
+        Ok(fid) => fid,
+        Err(msg) => return throw_internal_error(ctx, msg),
+    };
+    let dropped_fid = match managed_static_field_id(env, helper_cls, MANAGED_MESSAGE_DROPPED_FIELD, "I") {
+        Ok(fid) => fid,
+        Err(msg) => return throw_internal_error(ctx, msg),
+    };
+    let codes_fid = match managed_static_field_id(env, helper_cls, MANAGED_MESSAGE_CODES_FIELD, "[I") {
+        Ok(fid) => fid,
+        Err(msg) => return throw_internal_error(ctx, msg),
+    };
+    let values_fid = match managed_static_field_id(env, helper_cls, MANAGED_MESSAGE_VALUES_FIELD, "[I") {
+        Ok(fid) => fid,
+        Err(msg) => return throw_internal_error(ctx, msg),
+    };
+
+    let head = get_static_int_field(env, helper_cls, head_fid);
+    let tail = get_static_int_field(env, helper_cls, tail_fid);
+    let dropped = get_static_int_field(env, helper_cls, dropped_fid);
+    if jni_check_exc(env) {
+        return throw_internal_error(ctx, "managedDrainMessages failed to read queue counters");
+    }
+    let available = (head as i64 - tail as i64).clamp(0, MANAGED_MESSAGE_CAPACITY as i64) as i32;
+    let count = available.min(max_items);
+
+    let arr = ffi::JS_NewArray(ctx);
+    if count > 0 {
+        let codes_array = get_static_object_field(env, helper_cls, codes_fid);
+        let values_array = get_static_object_field(env, helper_cls, values_fid);
+        if codes_array.is_null() || values_array.is_null() || jni_check_exc(env) {
+            return throw_internal_error(ctx, "managedDrainMessages message arrays are not initialized");
+        }
+        let mut codes = vec![0i32; MANAGED_MESSAGE_CAPACITY as usize];
+        let mut values = vec![0i32; MANAGED_MESSAGE_CAPACITY as usize];
+        get_int_array_region(env, codes_array, 0, MANAGED_MESSAGE_CAPACITY, codes.as_mut_ptr());
+        get_int_array_region(env, values_array, 0, MANAGED_MESSAGE_CAPACITY, values.as_mut_ptr());
+        delete_local_ref(env, codes_array);
+        delete_local_ref(env, values_array);
+        if jni_check_exc(env) {
+            return throw_internal_error(ctx, "managedDrainMessages failed to read message arrays");
+        }
+        let mask = MANAGED_MESSAGE_CAPACITY - 1;
+        for i in 0..count {
+            let slot = ((tail + i) & mask) as usize;
+            let item = JSValue(ffi::JS_NewObject(ctx));
+            item.set_property(ctx, "code", JSValue::int(codes[slot]));
+            item.set_property(ctx, "value", JSValue::int(values[slot]));
+            ffi::JS_SetPropertyUint32(ctx, arr, i as u32, item.raw());
+        }
+    }
+    let new_tail = tail.wrapping_add(count);
+    set_static_int_field(env, helper_cls, tail_fid, new_tail);
+    if jni_check_exc(env) {
+        return throw_internal_error(ctx, "managedDrainMessages failed to update queue tail");
+    }
+
+    let out = JSValue(arr);
+    out.set_property(ctx, "head", JSValue::int(head));
+    out.set_property(ctx, "tail", JSValue::int(new_tail));
+    out.set_property(ctx, "dropped", JSValue::int(dropped));
+    out.raw()
 }
 
 pub(in crate::jsapi::java) unsafe extern "C" fn js_managed_read_counter(

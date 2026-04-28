@@ -10,7 +10,7 @@ use super::{
     descriptor_word_count, emit_return_from_orig, java_class_to_descriptor, java_class_to_descriptor_or_primitive,
     parse_call_params, parse_method_signature, resolve_call_proto_with_arg_types, resolve_field_with_env,
     return_is_object, value_kind_from_descriptor, DexIntBinOp, DexIntLit16Op, DexIntLit8Op, DexIrBuilder, FieldRef,
-    GeneratedCounter, GeneratedStringLiteral, IfCmpOp, IrCatchHandler, MethodRef, ValueKind,
+    GeneratedCounter, GeneratedMessageChannel, GeneratedStringLiteral, IfCmpOp, IrCatchHandler, MethodRef, ValueKind,
 };
 use crate::jsapi::java::jni_core::JniEnv;
 
@@ -41,6 +41,7 @@ pub(super) struct DslBuildContext {
     generated_type: String,
     pub(super) string_literals: Vec<GeneratedStringLiteral>,
     pub(super) counters: Vec<GeneratedCounter>,
+    pub(super) message_channels: Vec<GeneratedMessageChannel>,
     int_expr_scratch_base: u16,
     int_expr_scratch_count: u16,
     array_literal_scratch_base: u16,
@@ -111,6 +112,7 @@ impl DslBuildContext {
             generated_type,
             string_literals: Vec::new(),
             counters: Vec::new(),
+            message_channels: Vec::new(),
             int_expr_scratch_base,
             int_expr_scratch_count,
             array_literal_scratch_base,
@@ -244,6 +246,27 @@ impl DslBuildContext {
         FieldRef::new(self.generated_type.clone(), "I".to_string(), field_name)
     }
 
+    fn message_channel_code(&mut self, name: &str) -> i32 {
+        if let Some(existing) = self.message_channels.iter().find(|channel| channel.name == name) {
+            return existing.code;
+        }
+        let code = (self.message_channels.len() + 1) as i32;
+        self.message_channels.push(GeneratedMessageChannel {
+            name: name.to_string(),
+            code,
+        });
+        code
+    }
+
+    fn message_send_method(&self) -> MethodRef {
+        MethodRef::new(
+            self.generated_type.clone(),
+            "__rf_send".to_string(),
+            "V".to_string(),
+            vec!["I".to_string(), "I".to_string()],
+        )
+    }
+
     fn with_target_narrow_type<F>(&mut self, key: DslTargetKey, descriptor: String, f: F) -> Result<bool, String>
     where
         F: FnOnce(&mut Self) -> Result<bool, String>,
@@ -307,6 +330,10 @@ fn collect_stmt_strings(stmts: &[DslStmt], dsl_ctx: &mut DslBuildContext) {
             | DslStmt::Cast { value: size, .. }
             | DslStmt::ArrayLength { array: size } => collect_value_strings(size, dsl_ctx),
             DslStmt::Call(call) => collect_call_strings(call, dsl_ctx),
+            DslStmt::Send { name, value } => {
+                dsl_ctx.message_channel_code(name);
+                collect_value_strings(value, dsl_ctx);
+            }
             DslStmt::ArrayGet { array, index, .. } => {
                 collect_value_strings(array, dsl_ctx);
                 collect_value_strings(index, dsl_ctx);
@@ -3048,6 +3075,7 @@ fn stmt_max_invoke_depth(stmt: &DslStmt) -> u16 {
             .max(condition.as_ref().map(condition_max_invoke_depth).unwrap_or(0))
             .max(statements_max_invoke_depth(update_stmts))
             .max(statements_max_invoke_depth(body_stmts)),
+        DslStmt::Send { value, .. } => 1 + value_max_invoke_depth(value),
         DslStmt::Break | DslStmt::Continue | DslStmt::Count { .. } => 0,
         DslStmt::ReturnValue { value } => value.as_ref().map(value_max_invoke_depth).unwrap_or(0),
     }
@@ -3232,6 +3260,7 @@ fn stmt_int_expr_scratch_count(stmt: &DslStmt) -> u16 {
             .max(condition.as_ref().map(condition_int_expr_scratch_count).unwrap_or(0))
             .max(statements_int_expr_scratch_count(update_stmts))
             .max(statements_int_expr_scratch_count(body_stmts)),
+        DslStmt::Send { value, .. } => value_int_expr_scratch_count(value),
         DslStmt::Break | DslStmt::Continue | DslStmt::Count { .. } => 0,
         DslStmt::ReturnValue { value } => value.as_ref().map(value_int_expr_scratch_count).unwrap_or(0),
         DslStmt::Throw { value } => value_int_expr_scratch_count(value),
@@ -3410,6 +3439,7 @@ fn stmt_array_literal_scratch_count(stmt: &DslStmt) -> u16 {
             )
             .max(statements_array_literal_scratch_count(update_stmts))
             .max(statements_array_literal_scratch_count(body_stmts)),
+        DslStmt::Send { value, .. } => value_array_literal_scratch_count(value),
         DslStmt::Break | DslStmt::Continue | DslStmt::Count { .. } => 0,
         DslStmt::ReturnValue { value } => value.as_ref().map(value_array_literal_scratch_count).unwrap_or(0),
     }
@@ -3634,6 +3664,7 @@ fn statements_max_invoke_words(stmts: &[DslStmt], target_params: &[String], is_s
                 .transpose()?
                 .unwrap_or(0)
                 .max(value_max_invoke_words(value)?),
+            DslStmt::Send { value, .. } => 2u16.max(value_max_invoke_words(value)?),
             DslStmt::Break | DslStmt::Continue | DslStmt::Count { .. } => 0,
             DslStmt::ReturnOrig { args } => orig_args_max_invoke_words(args, target_params, is_static)?,
             DslStmt::ReturnValue { value } => value.as_ref().map(value_max_invoke_words).transpose()?.unwrap_or(0),
@@ -3862,6 +3893,7 @@ fn stmt_uses_orig(stmt: &DslStmt) -> bool {
                 || statements_use_orig(update_stmts)
                 || statements_use_orig(body_stmts)
         }
+        DslStmt::Send { value, .. } => value_uses_orig(value),
         DslStmt::Break | DslStmt::Continue | DslStmt::Count { .. } => false,
         DslStmt::ReturnValue { value } => value.as_ref().map(value_uses_orig).unwrap_or(false),
     }
@@ -4231,6 +4263,24 @@ fn emit_count(ir: &mut DexIrBuilder, name: &str, dsl_ctx: &mut DslBuildContext) 
     ir.sput(REG_TMP0, field, ValueKind::Narrow);
 }
 
+fn emit_send(
+    ir: &mut DexIrBuilder,
+    name: &str,
+    value: &DslValue,
+    layout: &HelperParamLayout,
+    dsl_ctx: &mut DslBuildContext,
+) -> Result<(), String> {
+    let code = dsl_ctx.message_channel_code(name);
+    if i16::try_from(code).is_err() {
+        return Err(format!("too many DSL message channels: {}", code));
+    }
+    ir.const16(REG_TMP0, code as i16);
+    let value_reg = emit_load_value(ir, value, "I", REG_TMP1, layout, dsl_ctx)?;
+    let value_reg = emit_copy_field_value_if_needed(ir, value_reg, REG_TMP1, ValueKind::Narrow);
+    ir.invoke_static(vec![REG_TMP0, value_reg], dsl_ctx.message_send_method());
+    Ok(())
+}
+
 fn emit_statement(ir: &mut DexIrBuilder, stmt: &DslStmt, emit_ctx: &mut EmitContext<'_>) -> Result<bool, String> {
     match stmt {
         DslStmt::Block(stmts) => emit_statements(ir, stmts, emit_ctx),
@@ -4413,6 +4463,10 @@ fn emit_statement(ir: &mut DexIrBuilder, stmt: &DslStmt, emit_ctx: &mut EmitCont
         }
         DslStmt::Count { name } => {
             emit_count(ir, name, emit_ctx.dsl_ctx);
+            Ok(false)
+        }
+        DslStmt::Send { name, value } => {
+            emit_send(ir, name, value, emit_ctx.layout, emit_ctx.dsl_ctx)?;
             Ok(false)
         }
         DslStmt::ReturnOrig { args } => {

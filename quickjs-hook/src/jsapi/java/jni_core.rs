@@ -206,6 +206,7 @@ pub(super) type GetStaticDoubleFieldFn =
     unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void) -> f64;
 pub(super) type GetStaticObjectFieldFn =
     unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+pub(super) type SetStaticIntFieldFn = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void, i32);
 pub(super) type NewDirectByteBufferFn =
     unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, i64) -> *mut std::ffi::c_void;
 pub(super) type RegisterNativesFn =

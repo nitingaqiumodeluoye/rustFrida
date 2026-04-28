@@ -1153,6 +1153,7 @@ pub fn register_java_api(ctx: &JSContext) {
         add_cfunction_to_object(ctx_ptr, java_obj, "fastHook", js_fast_hook, 4);
         add_cfunction_to_object(ctx_ptr, java_obj, "managedHookDsl", js_managed_hook_dsl, 4);
         add_cfunction_to_object(ctx_ptr, java_obj, "managedReadCounter", js_managed_read_counter, 2);
+        add_cfunction_to_object(ctx_ptr, java_obj, "managedDrainMessages", js_managed_drain_messages, 2);
         add_cfunction_to_object(ctx_ptr, java_obj, "fastHookSig", js_fast_hook_signature, 1);
         add_cfunction_to_object(ctx_ptr, java_obj, "fastHookCheck", js_fast_hook_check, 2);
         add_cfunction_to_object(ctx_ptr, java_obj, "unhook", js_java_unhook, 3);

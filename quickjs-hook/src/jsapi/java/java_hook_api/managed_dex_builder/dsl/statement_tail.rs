@@ -23,6 +23,9 @@ impl<'a> DslParser<'a> {
         if name == "count" && self.peek() == Some('(') {
             return self.parse_count_statement();
         }
+        if name == "send" && self.peek() == Some('(') {
+            return self.parse_send_statement();
+        }
         if self.peek() == Some('=') {
             self.expect_char('=')?;
             let value = self.parse_value_arg()?;
@@ -72,6 +75,27 @@ impl<'a> DslParser<'a> {
         self.skip_ws();
         self.expect_char(';')?;
         Ok(DslStmt::Count { name: counter_name })
+    }
+
+    fn parse_send_statement(&mut self) -> Result<DslStmt, String> {
+        self.expect_char('(')?;
+        self.skip_ws();
+        let channel_name = self.parse_string_arg()?;
+        self.skip_ws();
+        let value = if self.peek() == Some(',') {
+            self.expect_char(',')?;
+            self.parse_value_arg()?
+        } else {
+            DslValue::Int(0)
+        };
+        self.skip_ws();
+        self.expect_char(')')?;
+        self.skip_ws();
+        self.expect_char(';')?;
+        Ok(DslStmt::Send {
+            name: channel_name,
+            value,
+        })
     }
 
     pub(super) fn parse_value_statement_tail(

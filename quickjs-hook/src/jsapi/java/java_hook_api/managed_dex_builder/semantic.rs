@@ -1102,6 +1102,12 @@ impl DslSemanticContext {
                     return Err("count() name must not be empty".to_string());
                 }
             }
+            DslStmt::Send { name, value } => {
+                if name.is_empty() {
+                    return Err("send() channel name must not be empty".to_string());
+                }
+                self.validate_value_for_expected(value, "I", false)?;
+            }
             DslStmt::ReturnOrig { args } => self.validate_orig_args(args)?,
             DslStmt::ReturnValue { value } => {
                 if let Some(value) = value {
