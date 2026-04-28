@@ -36,6 +36,10 @@ impl<'a> DslParser<'a> {
         } else {
             false
         };
+        self.parse_i16_after_sign(negative)
+    }
+
+    pub(super) fn parse_i16_after_sign(&mut self, negative: bool) -> Result<i16, String> {
         let value_text = self.parse_number_text()?;
         let value: i32 = value_text.parse().map_err(|_| self.err("invalid integer"))?;
         let signed = if negative { -value } else { value };

@@ -47,8 +47,7 @@ impl<'a> DslParser<'a> {
         if self.peek() == Some('-') {
             self.expect_char('-')?;
             if self.peek_number() {
-                self.rewind_one();
-                return Ok(DslValue::Int(self.parse_i16()?));
+                return Ok(DslValue::Int(self.parse_i16_after_sign(true)?));
             }
             let value = self.parse_value_unary()?;
             return Ok(fold_unary_op(DslUnaryOp::Neg, value));

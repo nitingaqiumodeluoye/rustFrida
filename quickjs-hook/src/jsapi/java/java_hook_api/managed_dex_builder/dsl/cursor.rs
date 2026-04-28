@@ -11,10 +11,6 @@ impl<'a> DslParser<'a> {
         self.pos = mark.0;
     }
 
-    pub(super) fn rewind_one(&mut self) {
-        self.pos = self.pos.saturating_sub(1);
-    }
-
     pub(super) fn expect_ident(&mut self, expected: &str) -> Result<(), String> {
         match self.current_kind() {
             Some(DslTokenKind::Ident(value)) if value == expected => {
