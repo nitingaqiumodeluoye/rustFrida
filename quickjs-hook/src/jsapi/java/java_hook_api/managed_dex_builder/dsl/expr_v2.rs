@@ -72,7 +72,40 @@ fn parse_v2_unary_expr(
         let value = parse_v2_unary_expr(stream, local_scopes)?;
         return Ok(fold_unary_op(DslUnaryOp::BoolNot, value));
     }
-    parse_v2_primary_expr(stream, local_scopes)
+    parse_v2_postfix_expr(stream, local_scopes)
+}
+
+fn parse_v2_postfix_expr(
+    stream: &mut DslTokenStream<'_>,
+    local_scopes: &[BTreeMap<String, String>],
+) -> Result<DslValue, String> {
+    let mut value = parse_v2_primary_expr(stream, local_scopes)?;
+    loop {
+        if stream.consume_ident("as") {
+            let class_name = parse_type_name_v2(stream)?;
+            value = DslValue::Cast {
+                value: Box::new(value),
+                class_name,
+            };
+        } else if stream.consume_char('[') {
+            let index = parse_v2_int_binary_expr(stream, local_scopes, 0)?;
+            let type_name = if stream.consume_char(':') {
+                Some(parse_type_name_v2(stream)?)
+            } else {
+                None
+            };
+            if !stream.consume_char(']') {
+                return Err(stream.err("expected ']'"));
+            }
+            value = DslValue::ArrayGet {
+                array: Box::new(value),
+                index: Box::new(index),
+                type_name,
+            };
+        } else {
+            return Ok(value);
+        }
+    }
 }
 
 fn parse_v2_primary_expr(
@@ -161,10 +194,27 @@ fn resolve_local_v2(local_scopes: &[BTreeMap<String, String>], source_name: &str
         .find_map(|scope| scope.get(source_name).cloned())
 }
 
+fn parse_type_name_v2(stream: &mut DslTokenStream<'_>) -> Result<String, String> {
+    if matches!(stream.current_kind(), Some(DslTokenKind::String(_))) {
+        return stream.parse_string();
+    }
+    let mut name = stream.parse_ident()?;
+    loop {
+        if stream.consume_char('.') {
+            let part = stream.parse_ident()?;
+            name.push('.');
+            name.push_str(&part);
+        } else if stream.consume_char('[') {
+            if !stream.consume_char(']') {
+                return Err(stream.err("expected ']'"));
+            }
+            name.push_str("[]");
+        } else {
+            return Ok(name);
+        }
+    }
+}
+
 fn has_v2_unsupported_trailing_token(stream: &DslTokenStream<'_>) -> bool {
-    stream.peek_char('.')
-        || stream.peek_char('[')
-        || stream.peek_char('(')
-        || stream.peek_op("?.")
-        || stream.peek_ident("as")
+    stream.peek_char('.') || stream.peek_char('(') || stream.peek_op("?.")
 }

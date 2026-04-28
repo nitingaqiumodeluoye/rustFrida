@@ -53,6 +53,33 @@ impl<'a> DslTokenStream<'a> {
         matches!(self.current_kind(), Some(DslTokenKind::Ident(value)) if value == expected)
     }
 
+    pub(super) fn consume_ident(&mut self, expected: &str) -> bool {
+        if self.peek_ident(expected) {
+            self.advance();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(super) fn parse_ident(&mut self) -> Result<String, String> {
+        let value = match self.current_kind() {
+            Some(DslTokenKind::Ident(value)) => value.clone(),
+            _ => return Err(self.err("expected identifier")),
+        };
+        self.advance();
+        Ok(value)
+    }
+
+    pub(super) fn parse_string(&mut self) -> Result<String, String> {
+        let value = match self.current_kind() {
+            Some(DslTokenKind::String(value)) => value.clone(),
+            _ => return Err(self.err("expected string")),
+        };
+        self.advance();
+        Ok(value)
+    }
+
     pub(super) fn parse_i16_after_sign(&mut self, negative: bool) -> Result<i16, String> {
         let value_text = match self.current_kind() {
             Some(DslTokenKind::Number(value)) => value.clone(),
