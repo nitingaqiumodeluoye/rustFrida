@@ -19,6 +19,7 @@ pub(super) use ast_call::*;
 pub(super) use ast_expr::*;
 mod cursor;
 mod declaration;
+mod expr_const;
 mod lexer;
 mod member;
 mod member_args;
@@ -32,6 +33,7 @@ use parser::{DslMark, DslParser};
 mod scope;
 mod statement_tail;
 mod syntax;
+mod token_stream;
 
 mod expr_core;
 mod expression;

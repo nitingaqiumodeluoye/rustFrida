@@ -26,6 +26,11 @@ impl<'a> DslParser<'a> {
     }
 
     fn parse_int_binary_expr(&mut self, min_prec: u8) -> Result<DslValue, String> {
+        if min_prec == 0 {
+            if let Some(value) = self.try_parse_const_expr_v2() {
+                return Ok(value);
+            }
+        }
         let mut left = self.parse_value_unary()?;
         loop {
             self.skip_ws();
