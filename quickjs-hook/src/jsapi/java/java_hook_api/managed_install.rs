@@ -469,6 +469,39 @@ unsafe extern "C" fn managed_dbb_get_u8(
     *src as i32
 }
 
+unsafe extern "C" fn managed_reentry_guard_enter(_env: JniEnv, _cls: *mut c_void) {
+    crate::ffi::hook::hook_managed_reentry_guard_enter();
+}
+
+unsafe extern "C" fn managed_reentry_guard_leave(_env: JniEnv, _cls: *mut c_void) {
+    crate::ffi::hook::hook_managed_reentry_guard_leave();
+}
+
+unsafe fn register_managed_guard_helpers(env: JniEnv, helper_cls: *mut c_void) -> Result<(), String> {
+    let register_natives: RegisterNativesFn = jni_fn!(env, RegisterNativesFn, JNI_REGISTER_NATIVES);
+    let names = [
+        CString::new("__rf_guard_enter").unwrap(),
+        CString::new("__rf_guard_leave").unwrap(),
+    ];
+    let sigs = [CString::new("()V").unwrap(), CString::new("()V").unwrap()];
+    let methods = [
+        JniNativeMethod {
+            name: names[0].as_ptr(),
+            signature: sigs[0].as_ptr(),
+            fn_ptr: managed_reentry_guard_enter as *mut c_void,
+        },
+        JniNativeMethod {
+            name: names[1].as_ptr(),
+            signature: sigs[1].as_ptr(),
+            fn_ptr: managed_reentry_guard_leave as *mut c_void,
+        },
+    ];
+    if register_natives(env, helper_cls, methods.as_ptr(), methods.len() as i32) != 0 || jni_check_exc(env) {
+        return Err("RegisterNatives failed for managed reentrancy guard helpers".to_string());
+    }
+    Ok(())
+}
+
 unsafe fn register_direct_buffer_helpers(env: JniEnv, helper_cls: *mut c_void) -> Result<(), String> {
     let register_natives: RegisterNativesFn = jni_fn!(env, RegisterNativesFn, JNI_REGISTER_NATIVES);
     let names = [
@@ -828,6 +861,7 @@ unsafe fn install_managed_dsl_inner(
         generated.dex.len()
     ));
     let helper_cls = load_dynamic_managed_helper_class(env, generated.dex, &generated.class_name)?;
+    register_managed_guard_helpers(env, helper_cls)?;
     initialize_generated_string_literals(env, helper_cls, &generated.string_literals)?;
     initialize_generated_message_queue(env, helper_cls, &generated.message_channels, generated.message_capacity)?;
     if generated.uses_direct_buffer_helpers {

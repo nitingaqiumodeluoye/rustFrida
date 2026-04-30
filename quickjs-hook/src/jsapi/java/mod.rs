@@ -598,6 +598,32 @@ unsafe extern "C" fn js_art_route_stats(
     );
     obj_val.set_property(
         ctx,
+        "managedReentryGuardEnabled",
+        JSValue::bool(hook_ffi::hook_managed_reentry_guard_enabled() != 0),
+    );
+    obj_val.set_property(
+        ctx,
+        "managedReentryGuardDepth",
+        JSValue(ffi::JS_NewBigUint64(
+            ctx,
+            hook_ffi::hook_managed_reentry_guard_depth() as u64,
+        )),
+    );
+    obj_val.set_property(
+        ctx,
+        "managedReentryGuardEnters",
+        JSValue(ffi::JS_NewBigUint64(ctx, hook_ffi::hook_managed_reentry_guard_enters())),
+    );
+    obj_val.set_property(
+        ctx,
+        "managedReentryGuardBypassHits",
+        JSValue(ffi::JS_NewBigUint64(
+            ctx,
+            hook_ffi::hook_managed_reentry_guard_bypass_hits(),
+        )),
+    );
+    obj_val.set_property(
+        ctx,
         "origBypassHits",
         JSValue(ffi::JS_NewBigUint64(ctx, hook_ffi::hook_orig_bypass_hits())),
     );
@@ -681,6 +707,58 @@ unsafe extern "C" fn js_reset_art_route_stats(
     art_controller::GET_OAT_HOOK_POOL_LAST_METHOD.store(0, std::sync::atomic::Ordering::Relaxed);
     art_controller::GET_OAT_HOOK_POOL_LAST_PC.store(0, std::sync::atomic::Ordering::Relaxed);
     JSValue::bool(true).raw()
+}
+
+unsafe extern "C" fn js_set_managed_reentry_guard(
+    _ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    argc: i32,
+    argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    let enabled = if argc >= 1 {
+        JSValue(*argv).to_bool().unwrap_or(true)
+    } else {
+        true
+    };
+    hook_ffi::hook_set_managed_reentry_guard_enabled(enabled as i32);
+    JSValue::bool(enabled).raw()
+}
+
+unsafe extern "C" fn js_managed_reentry_guard_stats(
+    ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    _argc: i32,
+    _argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    let obj = ffi::JS_NewObject(ctx);
+    let obj_val = JSValue(obj);
+    obj_val.set_property(
+        ctx,
+        "enabled",
+        JSValue::bool(hook_ffi::hook_managed_reentry_guard_enabled() != 0),
+    );
+    obj_val.set_property(
+        ctx,
+        "depth",
+        JSValue(ffi::JS_NewBigUint64(
+            ctx,
+            hook_ffi::hook_managed_reentry_guard_depth() as u64,
+        )),
+    );
+    obj_val.set_property(
+        ctx,
+        "enters",
+        JSValue(ffi::JS_NewBigUint64(ctx, hook_ffi::hook_managed_reentry_guard_enters())),
+    );
+    obj_val.set_property(
+        ctx,
+        "bypassHits",
+        JSValue(ffi::JS_NewBigUint64(
+            ctx,
+            hook_ffi::hook_managed_reentry_guard_bypass_hits(),
+        )),
+    );
+    obj
 }
 
 /// JS CFunction: Java.setStealth(mode) — 设置 stealth 模式
@@ -1044,6 +1122,14 @@ pub fn register_java_api(ctx: &JSContext) {
         add_cfunction_to_object(ctx_ptr, java_obj, "deoptimizeMethod", js_java_deoptimize_method, 3);
         add_cfunction_to_object(ctx_ptr, java_obj, "setStealth", js_java_set_stealth, 1);
         add_cfunction_to_object(ctx_ptr, java_obj, "getStealth", js_java_get_stealth, 0);
+        add_cfunction_to_object(ctx_ptr, java_obj, "setManagedHookGuard", js_set_managed_reentry_guard, 1);
+        add_cfunction_to_object(
+            ctx_ptr,
+            java_obj,
+            "managedHookGuardStats",
+            js_managed_reentry_guard_stats,
+            0,
+        );
         add_cfunction_to_object(ctx_ptr, java_obj, "_artRouterDebug", js_art_router_debug, 0);
         add_cfunction_to_object(ctx_ptr, java_obj, "_artRouteStats", js_art_route_stats, 0);
         add_cfunction_to_object(ctx_ptr, java_obj, "_resetArtRouteStats", js_reset_art_route_stats, 0);

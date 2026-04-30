@@ -7,11 +7,11 @@ use super::dsl::{
 };
 use super::{
     array_component_descriptor, common_value_descriptor_with_env, descriptor_is_interface, descriptor_list_word_count,
-    descriptor_word_count, emit_return_from_orig, java_class_to_descriptor, java_class_to_descriptor_or_primitive,
-    parse_call_params, parse_method_signature, resolve_call_proto_with_arg_types,
-    resolve_constructor_proto_with_arg_types, resolve_field_with_env, return_is_object, value_kind_from_descriptor,
-    DexIntBinOp, DexIntLit16Op, DexIntLit8Op, DexIrBuilder, FieldRef, GeneratedCounter, GeneratedMessageChannel,
-    GeneratedStringLiteral, IfCmpOp, IrCatchHandler, MethodRef, ValueKind,
+    descriptor_word_count, java_class_to_descriptor, java_class_to_descriptor_or_primitive, parse_call_params,
+    parse_method_signature, resolve_call_proto_with_arg_types, resolve_constructor_proto_with_arg_types,
+    resolve_field_with_env, return_is_object, value_kind_from_descriptor, DexIntBinOp, DexIntLit16Op, DexIntLit8Op,
+    DexIrBuilder, FieldRef, GeneratedCounter, GeneratedMessageChannel, GeneratedStringLiteral, IfCmpOp,
+    IrCatchHandler, MethodRef, ValueKind,
 };
 use crate::jsapi::java::jni_core::JniEnv;
 
@@ -343,6 +343,24 @@ impl DslBuildContext {
             "__rf_dbb_get_u8".to_string(),
             "I".to_string(),
             vec!["Ljava/nio/ByteBuffer;".to_string(), "I".to_string()],
+        )
+    }
+
+    pub(super) fn guard_enter_method(&self) -> MethodRef {
+        MethodRef::new(
+            self.generated_type.clone(),
+            "__rf_guard_enter".to_string(),
+            "V".to_string(),
+            Vec::new(),
+        )
+    }
+
+    pub(super) fn guard_leave_method(&self) -> MethodRef {
+        MethodRef::new(
+            self.generated_type.clone(),
+            "__rf_guard_leave".to_string(),
+            "V".to_string(),
+            Vec::new(),
         )
     }
 
@@ -4438,7 +4456,29 @@ fn emit_orig_value(
 
 fn emit_return_orig(ir: &mut DexIrBuilder, args: &DslOrigArgs, emit_ctx: &mut EmitContext<'_>) -> Result<(), String> {
     emit_orig_invoke(ir, args, emit_ctx)?;
-    emit_return_from_orig(ir, emit_ctx.return_type)
+    match emit_ctx.return_type {
+        "V" => {
+            emit_managed_guard_leave(ir, emit_ctx.dsl_ctx);
+            ir.return_void();
+        }
+        "J" | "D" => {
+            ir.move_result_wide(REG_RESULT);
+            emit_managed_guard_leave(ir, emit_ctx.dsl_ctx);
+            ir.return_wide(REG_RESULT);
+        }
+        ret if return_is_object(ret) => {
+            ir.move_result_object(REG_RESULT);
+            emit_managed_guard_leave(ir, emit_ctx.dsl_ctx);
+            ir.return_object(REG_RESULT);
+        }
+        "Z" | "B" | "C" | "S" | "I" | "F" => {
+            ir.move_result(REG_RESULT);
+            emit_managed_guard_leave(ir, emit_ctx.dsl_ctx);
+            ir.return_value(REG_RESULT);
+        }
+        other => Err(format!("unsupported return type '{}'", other))?,
+    }
+    Ok(())
 }
 
 fn emit_return_value(
@@ -4451,6 +4491,7 @@ fn emit_return_value(
             if value.is_some() {
                 return Err("void method can only use return; or return orig(...);".to_string());
             }
+            emit_managed_guard_leave(ir, emit_ctx.dsl_ctx);
             ir.return_void();
         }
         "J" | "D" => {
@@ -4468,6 +4509,7 @@ fn emit_return_value(
                 emit_ctx.layout,
                 emit_ctx.dsl_ctx,
             )?;
+            emit_managed_guard_leave(ir, emit_ctx.dsl_ctx);
             ir.return_wide(reg);
         }
         ret if return_is_object(ret) => {
@@ -4485,6 +4527,7 @@ fn emit_return_value(
                 emit_ctx.layout,
                 emit_ctx.dsl_ctx,
             )?;
+            emit_managed_guard_leave(ir, emit_ctx.dsl_ctx);
             ir.return_object(reg);
         }
         "Z" | "B" | "C" | "S" | "I" | "F" => {
@@ -4502,11 +4545,20 @@ fn emit_return_value(
                 emit_ctx.layout,
                 emit_ctx.dsl_ctx,
             )?;
+            emit_managed_guard_leave(ir, emit_ctx.dsl_ctx);
             ir.return_value(reg);
         }
         other => return Err(format!("unsupported direct return type '{}'", other)),
     }
     Ok(())
+}
+
+pub(super) fn emit_managed_guard_enter(ir: &mut DexIrBuilder, dsl_ctx: &DslBuildContext) {
+    ir.invoke_static(Vec::new(), dsl_ctx.guard_enter_method());
+}
+
+pub(super) fn emit_managed_guard_leave(ir: &mut DexIrBuilder, dsl_ctx: &DslBuildContext) {
+    ir.invoke_static(Vec::new(), dsl_ctx.guard_leave_method());
 }
 
 fn emit_throw(ir: &mut DexIrBuilder, value: &DslValue, emit_ctx: &mut EmitContext<'_>) -> Result<(), String> {

@@ -33,6 +33,14 @@ volatile uint64_t g_art_router_last_do_call_x0 = 0;
 volatile uint64_t g_managed_backup_stub_hit_count = 0;
 volatile uint64_t g_managed_direct_hit_count = 0;
 
+/* Managed helper reentrancy guard.  Generated managed helpers enter this
+ * guard before executing DSL code; ART routing checks it to bypass nested Java
+ * calls made from inside the helper on the same thread. */
+static __thread uint32_t g_managed_reentry_guard_depth = 0;
+volatile uint32_t g_managed_reentry_guard_enabled = 1;
+volatile uint64_t g_managed_reentry_guard_enter = 0;
+volatile uint64_t g_managed_reentry_guard_bypass = 0;
+
 /* Fast $orig bypass state */
 OrigBypassState g_orig_bypass[ORIG_BYPASS_SLOTS] = {{0}};
 volatile uint64_t g_orig_bypass_active = 0;
@@ -234,6 +242,8 @@ void hook_art_router_reset_debug(void) {
     g_art_router_last_do_call_x0 = 0;
     __atomic_store_n(&g_managed_backup_stub_hit_count, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&g_managed_direct_hit_count, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_managed_reentry_guard_enter, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_managed_reentry_guard_bypass, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&g_orig_bypass_hit, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&g_orig_bypass_set_success, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&g_orig_bypass_set_fail, 0, __ATOMIC_RELAXED);
@@ -250,6 +260,53 @@ uint64_t hook_managed_backup_stub_hits(void) {
 
 uint64_t hook_managed_direct_hits(void) {
     return __atomic_load_n(&g_managed_direct_hit_count, __ATOMIC_RELAXED);
+}
+
+void hook_set_managed_reentry_guard_enabled(int enabled) {
+    __atomic_store_n(&g_managed_reentry_guard_enabled, enabled ? 1u : 0u, __ATOMIC_RELEASE);
+}
+
+int hook_managed_reentry_guard_enabled(void) {
+    return __atomic_load_n(&g_managed_reentry_guard_enabled, __ATOMIC_ACQUIRE) != 0;
+}
+
+void hook_managed_reentry_guard_enter(void) {
+    if (__atomic_load_n(&g_managed_reentry_guard_enabled, __ATOMIC_RELAXED) == 0) {
+        return;
+    }
+    if (g_managed_reentry_guard_depth != UINT32_MAX) {
+        g_managed_reentry_guard_depth++;
+    }
+    __atomic_add_fetch(&g_managed_reentry_guard_enter, 1, __ATOMIC_RELAXED);
+}
+
+void hook_managed_reentry_guard_leave(void) {
+    if (g_managed_reentry_guard_depth > 0) {
+        g_managed_reentry_guard_depth--;
+    }
+}
+
+int hook_managed_reentry_guard_active(void) {
+    if (__atomic_load_n(&g_managed_reentry_guard_enabled, __ATOMIC_RELAXED) == 0) {
+        return 0;
+    }
+    if (g_managed_reentry_guard_depth == 0) {
+        return 0;
+    }
+    __atomic_add_fetch(&g_managed_reentry_guard_bypass, 1, __ATOMIC_RELAXED);
+    return 1;
+}
+
+uint32_t hook_managed_reentry_guard_depth(void) {
+    return g_managed_reentry_guard_depth;
+}
+
+uint64_t hook_managed_reentry_guard_enters(void) {
+    return __atomic_load_n(&g_managed_reentry_guard_enter, __ATOMIC_RELAXED);
+}
+
+uint64_t hook_managed_reentry_guard_bypass_hits(void) {
+    return __atomic_load_n(&g_managed_reentry_guard_bypass, __ATOMIC_RELAXED);
 }
 
 uint64_t hook_orig_bypass_hits(void) {
@@ -1687,6 +1744,35 @@ static void emit_managed_direct_set_bypass(Arm64Writer* w, uint64_t original_met
     arm64_writer_put_label(w, lbl_done);
 }
 
+static void emit_managed_direct_reentry_guard(Arm64Writer* w, uint64_t trampoline_target) {
+    uint64_t lbl_continue = arm64_writer_new_label_id(w);
+
+    /* Preserve the quick-call argument registers around the C guard check.  The
+     * direct thunk may be entered from compiled Java with primitive args in
+     * x0-x7/d0-d7, and a guard hit must tail-call the original trampoline with
+     * those registers untouched. */
+    arm64_writer_put_sub_reg_reg_imm(w, ARM64_REG_SP, ARM64_REG_SP, 80);
+    for (int i = 0; i < 8; i += 2) {
+        arm64_writer_put_fp_stp_offset(w, i, i + 1, ARM64_REG_SP, i * 8);
+    }
+    arm64_writer_put_push_all_regs(w);
+    arm64_writer_put_call_address(w, (uint64_t)hook_managed_reentry_guard_active);
+    /* Current SP is 256 bytes below the FP save area; store the C return value
+     * into the extra 16-byte slot at FP-save+64. */
+    arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X0, ARM64_REG_SP, 320);
+    arm64_writer_put_pop_all_regs(w);
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X16, ARM64_REG_SP, 64);
+    for (int i = 0; i < 8; i += 2) {
+        arm64_writer_put_fp_ldp_offset(w, i, i + 1, ARM64_REG_SP, i * 8);
+    }
+    arm64_writer_put_add_reg_reg_imm(w, ARM64_REG_SP, ARM64_REG_SP, 80);
+
+    arm64_writer_put_cbz_reg_label(w, ARM64_REG_X16, lbl_continue);
+    arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X16, trampoline_target);
+    arm64_writer_put_br_reg(w, ARM64_REG_X16);
+    arm64_writer_put_label(w, lbl_continue);
+}
+
 static size_t generate_managed_direct_thunk(void* thunk_mem, size_t thunk_alloc,
                                             void* trampoline_target,
                                             uint64_t helper_method,
@@ -1705,9 +1791,11 @@ static size_t generate_managed_direct_thunk(void* thunk_mem, size_t thunk_alloc,
      * per HashMap.put orig() is enough for JD's crash monitor to hit
      * SuspendThreadByPeer timeouts under startup load. The short trampoline
      * window is covered by the later all-thread PC/LR safepoint before munmap.
-     */
+    */
     emit_art_router_fast_bypass(&w, lbl_normal_path, bypass_dec_before_trampoline);
     arm64_writer_put_label(&w, lbl_normal_path);
+
+    emit_managed_direct_reentry_guard(&w, (uint64_t)trampoline_target);
 
     emit_thunk_inflight_inc(&w);
     emit_art_quick_test_suspend_poll_ex(&w, 0);

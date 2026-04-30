@@ -1022,6 +1022,10 @@ unsafe extern "C" fn on_do_call_enter(ctx_ptr: *mut hook_ffi::HookContext, _user
     let ctx = &mut *ctx_ptr;
     let method = ctx.x[0];
     DO_CALL_COUNT.fetch_add(1, Ordering::Relaxed);
+    if hook_ffi::hook_managed_reentry_guard_active() != 0 {
+        ctx.intercept_leave = 0;
+        return;
+    }
     let route_mode = hook_ffi::hook_art_router_record_do_call(method);
 
     // 默认: miss → tail-jump (原函数跑完不回 thunk, 无栈帧残留)
@@ -1204,6 +1208,9 @@ pub(crate) fn get_interpreter_bridge() -> u64 {
 #[no_mangle]
 pub unsafe extern "C" fn art_router_stack_check(replacement: u64) -> i32 {
     if art_controller_reload_paused() {
+        return 0;
+    }
+    if hook_ffi::hook_managed_reentry_guard_active() != 0 {
         return 0;
     }
     let original_for_quick = hook_ffi::hook_art_router_table_lookup_original(replacement);

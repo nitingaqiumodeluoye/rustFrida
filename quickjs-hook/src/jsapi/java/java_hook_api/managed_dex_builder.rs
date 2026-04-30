@@ -8,7 +8,6 @@ pub(super) const ACC_PRIVATE: u32 = 0x0002;
 pub(super) const ACC_PROTECTED: u32 = 0x0004;
 pub(super) const ACC_STATIC: u32 = 0x0008;
 pub(super) const ACC_FINAL: u32 = 0x0010;
-pub(super) const ACC_SYNCHRONIZED: u32 = 0x0020;
 pub(super) const ACC_BRIDGE: u32 = 0x0040;
 pub(super) const ACC_VOLATILE: u32 = 0x0040;
 pub(super) const ACC_NATIVE: u32 = 0x0100;
@@ -128,26 +127,6 @@ use descriptor::{
     java_class_to_descriptor, java_class_to_descriptor_or_primitive, object_assignability_score, parse_call_params,
     parse_method_params_signature, parse_method_signature, resolve_field_with_env, return_is_object,
 };
-
-fn emit_return_from_orig(ir: &mut DexIrBuilder, return_type: &str) -> Result<(), String> {
-    match return_type {
-        "V" => ir.return_void(),
-        "J" | "D" => {
-            ir.move_result_wide(0);
-            ir.return_wide(0);
-        }
-        ret if return_is_object(ret) => {
-            ir.move_result_object(0);
-            ir.return_object(0);
-        }
-        "Z" | "B" | "C" | "S" | "I" | "F" => {
-            ir.move_result(0);
-            ir.return_value(0);
-        }
-        other => return Err(format!("unsupported return type '{}'", other)),
-    }
-    Ok(())
-}
 
 fn build_orig_backup_stub(return_type: &str, ins_size: u16) -> Result<DexCode, String> {
     let min_ret_regs = match return_type {
@@ -560,9 +539,10 @@ fn format_inferred_arg_types(arg_types: &[Option<String>]) -> String {
 
 mod emitter;
 use emitter::{
-    collect_local_slots, emit_statements, helper_param_layout, precollect_string_literals,
-    program_array_literal_scratch_count, program_int_expr_scratch_count, program_max_invoke_depth,
-    program_max_invoke_words, program_uses_orig, DslBuildContext, EmitContext, BASE_LOCAL_REG_COUNT,
+    collect_local_slots, emit_managed_guard_enter, emit_managed_guard_leave, emit_statements, helper_param_layout,
+    precollect_string_literals, program_array_literal_scratch_count, program_int_expr_scratch_count,
+    program_max_invoke_depth, program_max_invoke_words, program_uses_orig, DslBuildContext, EmitContext,
+    BASE_LOCAL_REG_COUNT,
 };
 
 pub(super) unsafe fn build_managed_dsl_dex(
@@ -678,23 +658,36 @@ pub(super) unsafe fn build_managed_dsl_dex(
     let mut ir = DexIrBuilder::new(registers_size, ins_size, outs_size);
     let layout = helper_param_layout(is_static, &target_type, &target_params, local_count, local_slots)?;
     let target_is_interface = !is_static && descriptor_is_interface(env, &target_type);
-    let mut emit_ctx = EmitContext {
-        layout: &layout,
-        dsl_ctx: &mut dsl_ctx,
-        is_static,
-        local_count,
-        ins_size,
-        target: &target,
-        orig_backup: &orig_backup,
-        target_is_interface,
-        return_type: &return_type,
-        sink: &sink,
-        loop_stack: Vec::new(),
+    emit_managed_guard_enter(&mut ir, &dsl_ctx);
+    let guard_try_start = ir.new_label();
+    let guard_try_end = ir.new_label();
+    let guard_catch_all = ir.new_label();
+    ir.bind(guard_try_start)?;
+    let saw_return = {
+        let mut emit_ctx = EmitContext {
+            layout: &layout,
+            dsl_ctx: &mut dsl_ctx,
+            is_static,
+            local_count,
+            ins_size,
+            target: &target,
+            orig_backup: &orig_backup,
+            target_is_interface,
+            return_type: &return_type,
+            sink: &sink,
+            loop_stack: Vec::new(),
+        };
+        emit_statements(&mut ir, &program.stmts, &mut emit_ctx)?
     };
-    let saw_return = emit_statements(&mut ir, &program.stmts, &mut emit_ctx)?;
+    ir.bind(guard_try_end)?;
     if !saw_return {
         return Err("managed DSL must end with return statement".to_string());
     }
+    ir.bind(guard_catch_all)?;
+    ir.move_exception(1);
+    emit_managed_guard_leave(&mut ir, &dsl_ctx);
+    ir.throw_value(1);
+    ir.add_try_handlers(guard_try_start, guard_try_end, Vec::new(), Some(guard_catch_all));
     let code = ir.finish()?;
 
     let mut class = DexClass::new(generated_type.clone()).source_file("RustFridaDynamicManagedHook.java");
@@ -736,14 +729,14 @@ pub(super) unsafe fn build_managed_dsl_dex(
             "__rf_send",
             "V",
             vec!["I".to_string(), "I".to_string()],
-            ACC_PUBLIC | ACC_STATIC | ACC_SYNCHRONIZED | ACC_SYNTHETIC,
+            ACC_PUBLIC | ACC_STATIC | ACC_SYNTHETIC,
             build_message_send_code(&generated_type, message_capacity)?,
         );
         class.direct_method(
             "__rf_send_str",
             "V",
             vec!["I".to_string(), "Ljava/lang/String;".to_string()],
-            ACC_PUBLIC | ACC_STATIC | ACC_SYNCHRONIZED | ACC_SYNTHETIC,
+            ACC_PUBLIC | ACC_STATIC | ACC_SYNTHETIC,
             build_message_send_string_code(&generated_type, message_capacity)?,
         );
     }
@@ -796,6 +789,18 @@ pub(super) unsafe fn build_managed_dsl_dex(
             ACC_PUBLIC | ACC_STATIC | ACC_NATIVE | ACC_SYNTHETIC,
         );
     }
+    class.native_direct_method(
+        "__rf_guard_enter",
+        "V",
+        Vec::new(),
+        ACC_PUBLIC | ACC_STATIC | ACC_NATIVE | ACC_SYNTHETIC,
+    );
+    class.native_direct_method(
+        "__rf_guard_leave",
+        "V",
+        Vec::new(),
+        ACC_PUBLIC | ACC_STATIC | ACC_NATIVE | ACC_SYNTHETIC,
+    );
     class.direct_method(
         "hook",
         &return_type,
