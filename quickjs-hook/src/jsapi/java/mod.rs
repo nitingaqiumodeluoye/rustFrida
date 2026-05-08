@@ -297,14 +297,8 @@ pub(crate) unsafe fn try_find_class(env_ptr: u64, name: &str) -> Option<u64> {
     if env.is_null() {
         return None;
     }
-    let cstr = match std::ffi::CString::new(name) {
-        Ok(c) => c,
-        Err(_) => return None,
-    };
-    let find_class: FindClassFn = jni_fn!(env, FindClassFn, JNI_FIND_CLASS);
-    let cls = find_class(env, cstr.as_ptr());
-    let exc = jni_check_exc(env);
-    if cls.is_null() || exc {
+    let cls = reflect::find_class_safe(env, name);
+    if cls.is_null() {
         None
     } else {
         Some(cls as u64)
@@ -1137,7 +1131,13 @@ pub fn register_java_api(ctx: &JSContext) {
         add_cfunction_to_object(ctx_ptr, java_obj, "deoptimizeMethod", js_java_deoptimize_method, 3);
         add_cfunction_to_object(ctx_ptr, java_obj, "setStealth", js_java_set_stealth, 1);
         add_cfunction_to_object(ctx_ptr, java_obj, "getStealth", js_java_get_stealth, 0);
-        add_cfunction_to_object(ctx_ptr, java_obj, "setManagedHookGuard", js_set_managed_reentry_guard, 1);
+        add_cfunction_to_object(
+            ctx_ptr,
+            java_obj,
+            "setManagedHookGuard",
+            js_set_managed_reentry_guard,
+            1,
+        );
         add_cfunction_to_object(
             ctx_ptr,
             java_obj,

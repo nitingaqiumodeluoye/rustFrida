@@ -38,33 +38,20 @@ pub(crate) fn probe_module_range(module_name: &str) -> (u64, u64) {
 /// Returns `None` if not found. Used by `module_dlsym` for direct ELF parsing.
 fn find_module_path_and_base(module_name: &str) -> Option<(String, u64)> {
     {
-        let guard = module_cache()
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(info) = guard
-            .snapshot
-            .modules
-            .iter()
-            .find(|m| matches_module_lookup_name(&m.path, module_name))
-        {
-            return Some((info.path.clone(), info.base));
+        let guard = module_cache().read().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(found) = guard.snapshot.find_module_path_and_base(module_name) {
+            return Some(found);
         }
     }
 
     let snapshot = refresh_module_snapshot_cache();
-    snapshot
-        .modules
-        .iter()
-        .find(|m| matches_module_lookup_name(&m.path, module_name))
-        .map(|info| (info.path.clone(), info.base))
+    snapshot.find_module_path_and_base(module_name)
 }
 
 /// Parse /proc/self/maps to find a module's base address.
 pub(crate) fn find_module_base(module_name: &str) -> u64 {
     {
-        let guard = module_cache()
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let guard = module_cache().read().unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(base) = guard.snapshot.find_module_base(module_name) {
             return base;
         }
@@ -99,6 +86,7 @@ impl ModuleInfo {
 struct ModuleMapEntry {
     start: u64,
     end: u64,
+    prot_flags: i32,
     path: String,
 }
 
@@ -112,6 +100,7 @@ impl ModuleMapEntry {
         Some(Self {
             start: entry.start,
             end: entry.end,
+            prot_flags: entry.prot_flags(),
             path: path.to_string(),
         })
     }
@@ -126,6 +115,10 @@ impl ModuleMapEntry {
         } else {
             0
         }
+    }
+
+    fn is_executable(&self) -> bool {
+        self.prot_flags & libc::PROT_EXEC != 0
     }
 }
 
@@ -163,10 +156,7 @@ impl ModuleSnapshot {
         Self::from_entries(read_module_map_entries())
     }
 
-    fn summarize_matching_paths(
-        &self,
-        mut matches_path: impl FnMut(&str) -> bool,
-    ) -> Option<PathMapSummary> {
+    fn summarize_matching_paths(&self, mut matches_path: impl FnMut(&str) -> bool) -> Option<PathMapSummary> {
         let mut base = u64::MAX;
         let mut end = 0;
         let mut first_path = None;
@@ -188,17 +178,76 @@ impl ModuleSnapshot {
             }
         }
 
-        first_path.map(|first_path| PathMapSummary {
-            base,
-            end,
-            first_path,
-        })
+        first_path.map(|first_path| PathMapSummary { base, end, first_path })
     }
 
     fn find_module_base(&self, module_name: &str) -> Option<u64> {
-        self.entries.iter().find_map(|entry| {
-            matches_module_lookup_name(&entry.path, module_name).then_some(entry.start)
-        })
+        self.entries
+            .iter()
+            .find_map(|entry| matches_module_lookup_name(&entry.path, module_name).then_some(entry.start))
+    }
+
+    fn find_module_path_and_base(&self, module_name: &str) -> Option<(String, u64)> {
+        const MAX_MODULE_CLUSTER_GAP: u64 = 64 * 1024 * 1024;
+
+        let mut fallback: Option<(String, u64)> = None;
+        let mut cluster_path: Option<String> = None;
+        let mut cluster_base = 0u64;
+        let mut cluster_end = 0u64;
+        let mut cluster_has_exec = false;
+
+        let finish_cluster = |path: &mut Option<String>,
+                              base: u64,
+                              has_exec: bool,
+                              fallback: &mut Option<(String, u64)>|
+         -> Option<(String, u64)> {
+            let Some(path_value) = path.take() else {
+                return None;
+            };
+            let candidate = (path_value, base);
+            if has_exec {
+                return Some(candidate);
+            }
+            if fallback.is_none() {
+                *fallback = Some(candidate);
+            }
+            None
+        };
+
+        for entry in self
+            .entries
+            .iter()
+            .filter(|entry| matches_module_lookup_name(&entry.path, module_name))
+        {
+            let same_cluster = cluster_path.as_ref().map_or(false, |path| {
+                path == &entry.path && entry.start <= cluster_end.saturating_add(MAX_MODULE_CLUSTER_GAP)
+            });
+
+            if !same_cluster {
+                if let Some(found) = finish_cluster(&mut cluster_path, cluster_base, cluster_has_exec, &mut fallback) {
+                    return Some(found);
+                }
+                cluster_path = Some(entry.path.clone());
+                cluster_base = entry.start;
+                cluster_end = entry.end;
+                cluster_has_exec = entry.is_executable();
+                continue;
+            }
+
+            if entry.start < cluster_base {
+                cluster_base = entry.start;
+            }
+            if entry.end > cluster_end {
+                cluster_end = entry.end;
+            }
+            cluster_has_exec |= entry.is_executable();
+        }
+
+        if let Some(found) = finish_cluster(&mut cluster_path, cluster_base, cluster_has_exec, &mut fallback) {
+            return Some(found);
+        }
+
+        fallback
     }
 
     fn find_module_by_address(&self, addr: u64) -> Option<(ModuleMapEntry, ModuleInfo)> {
@@ -260,8 +309,7 @@ impl ModuleCache {
     }
 }
 
-static MODULE_CACHE: std::sync::OnceLock<std::sync::RwLock<ModuleCache>> =
-    std::sync::OnceLock::new();
+static MODULE_CACHE: std::sync::OnceLock<std::sync::RwLock<ModuleCache>> = std::sync::OnceLock::new();
 
 #[derive(Clone, Debug)]
 struct AggregatedModuleRange {
@@ -310,15 +358,12 @@ fn read_module_map_entries() -> Vec<ModuleMapEntry> {
 }
 
 fn module_cache() -> &'static std::sync::RwLock<ModuleCache> {
-    MODULE_CACHE
-        .get_or_init(|| std::sync::RwLock::new(ModuleCache::new(ModuleSnapshot::load_current())))
+    MODULE_CACHE.get_or_init(|| std::sync::RwLock::new(ModuleCache::new(ModuleSnapshot::load_current())))
 }
 
 fn refresh_module_snapshot_cache() -> ModuleSnapshot {
     let snapshot = ModuleSnapshot::load_current();
-    let mut guard = module_cache()
-        .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut guard = module_cache().write().unwrap_or_else(|poisoned| poisoned.into_inner());
     guard.refresh_snapshot(snapshot.clone());
     snapshot
 }
@@ -341,24 +386,18 @@ fn find_module_by_address_in_entries(
     addr: u64,
 ) -> Option<ModuleInfo> {
     let snapshot = ModuleSnapshot::from_entries(entries.into_iter().collect());
-    snapshot
-        .find_module_by_address(addr)
-        .map(|(_, module)| module)
+    snapshot.find_module_by_address(addr).map(|(_, module)| module)
 }
 
 fn try_find_module_by_address_in_cache(addr: u64) -> Option<ModuleInfo> {
     {
-        let guard = module_cache()
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let guard = module_cache().read().unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(module) = guard.lookup_hint(addr) {
             return Some(module);
         }
     }
 
-    let mut guard = module_cache()
-        .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut guard = module_cache().write().unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(module) = guard.lookup_hint(addr) {
         return Some(module);
     }
@@ -371,9 +410,7 @@ fn refresh_and_find_module_by_address(addr: u64) -> Option<ModuleInfo> {
     let snapshot = ModuleSnapshot::load_current();
     let found = snapshot.find_module_by_address(addr);
 
-    let mut guard = module_cache()
-        .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut guard = module_cache().write().unwrap_or_else(|poisoned| poisoned.into_inner());
     guard.refresh_snapshot(snapshot);
     guard.lookup_hint = found.as_ref().map(|(entry, module)| AddressLookupHint {
         entry: entry.clone(),
@@ -388,9 +425,7 @@ fn find_module_by_address(addr: u64) -> Option<ModuleInfo> {
     try_find_module_by_address_in_cache(addr).or_else(|| refresh_and_find_module_by_address(addr))
 }
 
-fn collect_module_ranges<'a>(
-    entries: impl IntoIterator<Item = &'a ModuleMapEntry>,
-) -> Vec<AggregatedModuleRange> {
+fn collect_module_ranges<'a>(entries: impl IntoIterator<Item = &'a ModuleMapEntry>) -> Vec<AggregatedModuleRange> {
     let mut module_indices: HashMap<&str, usize> = HashMap::new();
     let mut modules: Vec<AggregatedModuleRange> = Vec::new();
 
@@ -419,9 +454,7 @@ fn is_system_libart_path(path: &str) -> bool {
     if module_basename(path) != "libart.so" {
         return false;
     }
-    path.starts_with("/apex/")
-        || path.starts_with("/system/")
-        || path.starts_with("/system_ext/")
+    path.starts_with("/apex/") || path.starts_with("/system/") || path.starts_with("/system_ext/")
 }
 
 fn matches_module_lookup_name(path: &str, module_name: &str) -> bool {
@@ -430,9 +463,7 @@ fn matches_module_lookup_name(path: &str, module_name: &str) -> bool {
     }
 
     let basename = module_basename(path);
-    basename == module_name
-        || basename.starts_with(&format!("{}.", module_name))
-        || path.ends_with(module_name)
+    basename == module_name || basename.starts_with(&format!("{}.", module_name)) || path.ends_with(module_name)
 }
 
 struct PathMapSummary {

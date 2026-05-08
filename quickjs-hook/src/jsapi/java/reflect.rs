@@ -1133,10 +1133,14 @@ pub(super) unsafe fn update_app_classloader(env: JniEnv, cl_local: *mut std::ffi
 
 /// 检查 app ClassLoader 是否可用（init 阶段或 override 阶段均算）
 pub(super) fn is_classloader_ready() -> bool {
-    if CL_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) != 0 {
+    if CL_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) != 0
+        && LC_MID_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) != 0
+    {
         return true;
     }
-    REFLECT_IDS.get().map_or(false, |r| !r.app_classloader.is_null())
+    REFLECT_IDS
+        .get()
+        .map_or(false, |r| !r.app_classloader.is_null() && !r.load_class_mid.is_null())
 }
 
 pub(super) unsafe fn get_app_classloader_local_ref(env: JniEnv) -> *mut std::ffi::c_void {
@@ -1184,7 +1188,7 @@ pub(super) unsafe fn reprobe_classloader() -> bool {
     false
 }
 
-unsafe fn reprobe_classloader_once() -> bool {
+pub(super) unsafe fn reprobe_classloader_once() -> bool {
     if is_classloader_ready() {
         return true;
     }
@@ -1192,12 +1196,11 @@ unsafe fn reprobe_classloader_once() -> bool {
         Ok(e) => e,
         Err(_) => return false,
     };
-    let reflect = match REFLECT_IDS.get() {
-        Some(r) => r,
-        None => return false,
-    };
-    // 如果已有 classloader，不需要重新探测
-    if !reflect.app_classloader.is_null() {
+    reprobe_classloader_once_with_env(env)
+}
+
+pub(super) unsafe fn reprobe_classloader_once_with_env(env: JniEnv) -> bool {
+    if is_classloader_ready() {
         return true;
     }
 
@@ -1207,7 +1210,6 @@ unsafe fn reprobe_classloader_once() -> bool {
         jni_fn!(env, CallStaticObjectMethodAFn, JNI_CALL_STATIC_OBJECT_METHOD_A);
     let call_obj_a: CallObjectMethodAFn = jni_fn!(env, CallObjectMethodAFn, JNI_CALL_OBJECT_METHOD_A);
     let get_mid: GetMethodIdFn = jni_fn!(env, GetMethodIdFn, JNI_GET_METHOD_ID);
-    let new_global_ref: NewGlobalRefFn = jni_fn!(env, NewGlobalRefFn, JNI_NEW_GLOBAL_REF);
     let delete_local_ref: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
     let null_args: *const std::ffi::c_void = std::ptr::null();
 
@@ -1269,26 +1271,15 @@ unsafe fn reprobe_classloader_once() -> bool {
         return false;
     }
 
-    // 成功！更新缓存 — 用 UnsafeCell 式写入（REFLECT_IDS 已初始化，字段是裸指针）
-    let r = REFLECT_IDS.get().unwrap() as *const ReflectIds as *mut ReflectIds;
-    (*r).app_classloader = new_global_ref(env, cl);
-
-    // 同时获取 loadClass method ID
-    let c_cl_cls = CString::new("java/lang/ClassLoader").unwrap();
-    let cl_cls = find_class(env, c_cl_cls.as_ptr());
-    if !cl_cls.is_null() && !jni_check_exc(env) {
-        let c_lc = CString::new("loadClass").unwrap();
-        let c_lc_sig = CString::new("(Ljava/lang/String;)Ljava/lang/Class;").unwrap();
-        let lc_mid = get_mid(env, cl_cls, c_lc.as_ptr(), c_lc_sig.as_ptr());
-        if !lc_mid.is_null() && !jni_check_exc(env) {
-            (*r).load_class_mid = lc_mid;
-        }
-        delete_local_ref(env, cl_cls);
-    }
+    update_app_classloader(env, cl);
     delete_local_ref(env, cl);
 
-    crate::jsapi::console::output_verbose("[Java.ready] reprobe_classloader: app ClassLoader found");
-    true
+    if is_classloader_ready() {
+        crate::jsapi::console::output_verbose("[Java.ready] reprobe_classloader: app ClassLoader found");
+        true
+    } else {
+        false
+    }
 }
 
 /// Resolve a class name directly via `Class.getName()`.
@@ -1353,15 +1344,10 @@ pub(crate) unsafe fn find_class_safe(env: JniEnv, class_name: &str) -> *mut std:
         return cached;
     }
 
-    let has_classloader = {
-        let ovr_cl = CL_OVERRIDE.load(std::sync::atomic::Ordering::Acquire);
-        let ovr_mid = LC_MID_OVERRIDE.load(std::sync::atomic::Ordering::Acquire);
-        if ovr_cl != 0 && ovr_mid != 0 {
-            true
-        } else {
-            matches!(REFLECT_IDS.get(), Some(r) if !r.app_classloader.is_null() && !r.load_class_mid.is_null())
-        }
-    };
+    let mut has_classloader = is_classloader_ready();
+    if !has_classloader && reprobe_classloader_once_with_env(env) {
+        has_classloader = true;
+    }
 
     if has_classloader {
         let result = find_class_via_classloader(env, class_name);
