@@ -163,6 +163,56 @@ pub(super) fn init_java_registry() {
     ensure_registry_initialized(&JAVA_HOOK_REGISTRY);
 }
 
+pub(super) fn fast_hook_invoke_meta(art_method: u64) -> Option<(u64, bool)> {
+    let guard = JAVA_HOOK_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+    let data = guard.as_ref()?.get(&art_method)?;
+    match data.hook_type {
+        HookType::Quick { .. } if crate::fast_hook::is_fast_hook(art_method) => {
+            Some((data.quick_trampoline, data.use_blr))
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn registered_methods_for_class(class_name: &str) -> Vec<MethodInfo> {
+    let prefix = format!("{}.", class_name);
+    let guard = JAVA_HOOK_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(registry) = guard.as_ref() else {
+        return Vec::new();
+    };
+
+    registry
+        .values()
+        .filter_map(|data| {
+            let rest = data.method_key.strip_prefix(&prefix)?;
+            let sig_start = rest.find('(')?;
+            let name = &rest[..sig_start];
+            let sig = &rest[sig_start..];
+            Some(MethodInfo {
+                name: name.to_string(),
+                sig: sig.to_string(),
+                is_static: data.is_static,
+                modifiers: 0,
+            })
+        })
+        .collect()
+}
+
+pub(super) fn registered_invoke_target_for_key(
+    class_name: &str,
+    method_name: &str,
+    sig: &str,
+    is_static: bool,
+) -> Option<(u64, usize)> {
+    let key = method_key(class_name, method_name, sig);
+    let guard = JAVA_HOOK_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+    let data = guard
+        .as_ref()?
+        .values()
+        .find(|data| data.method_key == key && data.is_static == is_static)?;
+    Some((data.art_method, data.class_global_ref))
+}
+
 /// Build a unique key string for method lookup
 pub(super) fn method_key(class: &str, method: &str, sig: &str) -> String {
     format!("{}.{}{}", class, method, sig)

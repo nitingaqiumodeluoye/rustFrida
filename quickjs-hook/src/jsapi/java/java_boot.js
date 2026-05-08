@@ -16,6 +16,7 @@
     var _setClassLoader = Java._setClassLoader;
     var _enumerateInstances = Java._enumerateInstances;
     var _releaseInstanceRefs = Java._releaseInstanceRefs;
+    var _methodListCache = Object.create(null);
     delete Java.hook;
     delete Java.unhook;
     delete Java._methods;
@@ -69,6 +70,14 @@
         return _wrapJavaReturn(
             _invokeStaticMethod.apply(Java, [jcls, name, sig].concat(args))
         );
+    }
+
+    function _getMethodList(jcls) {
+        var cached = _methodListCache[jcls];
+        if (cached) return cached;
+        cached = _methods(jcls);
+        _methodListCache[jcls] = cached;
+        return cached;
     }
 
     // 简单的 JNI 签名解析，将 "(IILjava/lang/String;)V" → ["I","I","Ljava/lang/String;"]
@@ -383,7 +392,7 @@
     }
 
     function _resolveInstanceMethodSig(jcls, name, jsArgs) {
-        var methods = _methods(jcls);
+        var methods = _getMethodList(jcls);
         var best = null;
         var bestScore = -1;
 
@@ -410,7 +419,7 @@
     }
 
     function _resolveStaticMethodSig(jcls, name, jsArgs) {
-        var methods = _methods(jcls);
+        var methods = _getMethodList(jcls);
         var best = null;
         var bestScore = -1;
 
@@ -437,7 +446,7 @@
     }
 
     function _resolveConstructorSig(jcls, jsArgs) {
-        var methods = _methods(jcls);
+        var methods = _getMethodList(jcls);
         var best = null;
         var bestScore = -1;
 
@@ -528,6 +537,12 @@
         return cache[prop];
     }
 
+    function _cachedFieldMeta(cls, prop) {
+        var cache = _classFieldMeta[cls];
+        if (!cache || !(prop in cache)) return undefined;
+        return cache[prop];
+    }
+
     function FieldWrapper(target, meta) {
         this._t = target;  // Proxy 的 backing {__jptr, __jclass}
         this._m = meta;     // {id: BigUint64, sig: string, st: boolean, cls: string}
@@ -568,7 +583,7 @@
         var set = _classMethodNames[cls];
         if (!set) {
             set = Object.create(null);
-            var ms = _methods(cls);
+            var ms = _getMethodList(cls);
             for (var i = 0; i < ms.length; i++) set[ms[i].name] = true;
             _classMethodNames[cls] = set;
         }
@@ -677,18 +692,28 @@
                 // 已缓存 — 直接返回（FieldWrapper 或 hybrid 函数）
                 if (fieldWrappers[prop]) return fieldWrappers[prop];
 
+                var cachedMeta = _cachedFieldMeta(target.__jclass, prop);
+                if (cachedMeta) {
+                    var cachedFw;
+                    if (_hasMethod(target.__jclass, prop)) {
+                        cachedFw = _decorateWithFieldValue(
+                            _makeInstanceMethodInvoker(target, prop), target, cachedMeta
+                        );
+                    } else {
+                        cachedFw = new FieldWrapper(target, cachedMeta);
+                    }
+                    fieldWrappers[prop] = cachedFw;
+                    return cachedFw;
+                }
+
+                if (_hasMethod(target.__jclass, prop)) {
+                    return _makeInstanceMethodInvoker(target, prop);
+                }
+
                 // 解析字段元数据（per-class 缓存，首次走 C，后续纯 JS 查找）
                 var meta = _resolveFieldMeta(target.__jclass, prop, target.__jptr);
                 if (meta) {
-                    var fw;
-                    if (_hasMethod(target.__jclass, prop)) {
-                        // 同名冲突：hybrid（可调用 + .value）
-                        fw = _decorateWithFieldValue(
-                            _makeInstanceMethodInvoker(target, prop), target, meta
-                        );
-                    } else {
-                        fw = new FieldWrapper(target, meta);
-                    }
+                    var fw = new FieldWrapper(target, meta);
                     fieldWrappers[prop] = fw;
                     return fw;
                 }
@@ -748,7 +773,7 @@
     // 获取方法列表（带缓存）
     function _getMethods(wrapper) {
         if (wrapper._cache && wrapper._cache.methods) return wrapper._cache.methods;
-        var ms = _methods(wrapper._c);
+        var ms = _getMethodList(wrapper._c);
         if (wrapper._cache) wrapper._cache.methods = ms;
         return ms;
     }
@@ -787,7 +812,7 @@
         if (methodsCache && methodsCache.methods) {
             ms = methodsCache.methods;
         } else {
-            ms = _methods(cls);
+            ms = _getMethodList(cls);
             if (methodsCache) methodsCache.methods = ms;
         }
         var m = name === "$init" ? "<init>" : name;
@@ -1255,7 +1280,7 @@
                                     paramSig += _jniType(arguments[i]);
                                 }
                                 paramSig += ")";
-                                var ms = _methods(cls);
+                                var ms = _getMethodList(cls);
                                 var found = _findOverload(ms, "<init>", paramSig);
                                 if (!found) {
                                     throw new Error("No matching constructor: "
@@ -1299,7 +1324,7 @@
             },
             ownKeys: function(_) {
                 if (cache._ownKeys) return cache._ownKeys;
-                var ms = _methods(cls);
+                var ms = _getMethodList(cls);
                 var seen = Object.create(null);
                 var keys = [];
                 keys.push("$new");

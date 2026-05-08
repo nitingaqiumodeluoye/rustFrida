@@ -15,6 +15,63 @@
 // - boxed primitives (Integer/Long/...) → JS primitive (unboxed)
 // - 数组 / List → JS Array（元素递归转换：基础类型 unbox，复杂对象保留 wrapper）
 // - 其他 Object → {__jptr, __jclass} wrapper (Proxy-wrapped on JS side)
+struct FastHookInvokeBypass {
+    active: bool,
+    c_thread_id: u64,
+    c_active: bool,
+}
+
+impl FastHookInvokeBypass {
+    unsafe fn for_method(env: JniEnv, cls: *mut std::ffi::c_void, method_id: *mut std::ffi::c_void, is_static: bool) -> Self {
+        if method_id.is_null() {
+            return Self {
+                active: false,
+                c_thread_id: 0,
+                c_active: false,
+            };
+        }
+        let raw_method_id = method_id as u64;
+        let art_method = if fast_hook_invoke_meta(raw_method_id).is_some() {
+            raw_method_id
+        } else {
+            decode_method_id(env, cls, raw_method_id, is_static)
+        };
+        if let Some((quick_trampoline, _use_blr)) = fast_hook_invoke_meta(art_method) {
+            crate::jsapi::java::art_controller::set_call_original_bypass(art_method);
+            let c_thread_id = crate::current_thread_id_u64();
+            let c_active = quick_trampoline != 0
+                && hook_ffi::orig_bypass_set(c_thread_id, art_method, quick_trampoline) == 0;
+            crate::jsapi::console::output_verbose(&format!(
+                "[java.invoke] fastHook bypass: ArtMethod={:#x}, trampoline={:#x}, c_bypass={}",
+                art_method, quick_trampoline, c_active
+            ));
+            return Self {
+                active: true,
+                c_thread_id,
+                c_active,
+            };
+        }
+        Self {
+            active: false,
+            c_thread_id: 0,
+            c_active: false,
+        }
+    }
+}
+
+impl Drop for FastHookInvokeBypass {
+    fn drop(&mut self) {
+        if self.active {
+            if self.c_active {
+                unsafe {
+                    hook_ffi::orig_bypass_clear(self.c_thread_id);
+                }
+            }
+            crate::jsapi::java::art_controller::clear_call_original_bypass();
+        }
+    }
+}
+
 pub(super) unsafe extern "C" fn js_java_invoke_method(
     ctx: *mut ffi::JSContext,
     _this: ffi::JSValue,
@@ -80,18 +137,22 @@ pub(super) unsafe extern "C" fn js_java_invoke_method(
         Ok(e) => e,
         Err(msg) => return js_throw_internal_error(ctx, msg),
     };
+    let registered_target = registered_invoke_target_for_key(&class_name, &method_name, &method_sig, false);
+    let delete_local_ref: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
+    let new_local_ref: NewLocalRefFn = jni_fn!(env, NewLocalRefFn, JNI_NEW_LOCAL_REF);
 
     // Resolve declaring class
-    let cls = find_class_safe(env, &class_name);
+    let cls = if let Some((_, class_global_ref)) = registered_target {
+        new_local_ref(env, class_global_ref as *mut std::ffi::c_void)
+    } else {
+        find_class_safe(env, &class_name)
+    };
     if cls.is_null() || jni_check_exc(env) {
         return js_throw_internal_error(
             ctx,
             format!("Java._invokeMethod: FindClass('{}') failed", class_name),
         );
     }
-
-    let delete_local_ref: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
-    let new_local_ref: NewLocalRefFn = jni_fn!(env, NewLocalRefFn, JNI_NEW_LOCAL_REF);
 
     // Wrap raw mirror pointer as a proper local ref
     let local_obj = new_local_ref(env, obj_ptr as *mut std::ffi::c_void);
@@ -127,7 +188,11 @@ pub(super) unsafe extern "C" fn js_java_invoke_method(
         }
     };
 
-    let mid = get_mid(env, cls, c_name.as_ptr(), c_sig.as_ptr());
+    let mid = if let Some((art_method, _)) = registered_target {
+        art_method as *mut std::ffi::c_void
+    } else {
+        get_mid(env, cls, c_name.as_ptr(), c_sig.as_ptr())
+    };
     if mid.is_null() || jni_check_exc(env) {
         return cleanup_and_throw_internal(
             ctx,
@@ -140,6 +205,7 @@ pub(super) unsafe extern "C" fn js_java_invoke_method(
             ),
         );
     }
+    let _fast_hook_bypass = FastHookInvokeBypass::for_method(env, cls, mid, false);
 
     // Build jvalue args from JS values
     let jargs = build_invoke_jargs(ctx, env, argv, &param_types);
@@ -398,7 +464,13 @@ pub(super) unsafe extern "C" fn js_java_invoke_static_method(
         Err(msg) => return js_throw_internal_error(ctx, msg),
     };
 
-    let cls = find_class_safe(env, &class_name);
+    let registered_target = registered_invoke_target_for_key(&class_name, &method_name, &method_sig, true);
+    let new_local_ref: NewLocalRefFn = jni_fn!(env, NewLocalRefFn, JNI_NEW_LOCAL_REF);
+    let cls = if let Some((_, class_global_ref)) = registered_target {
+        new_local_ref(env, class_global_ref as *mut std::ffi::c_void)
+    } else {
+        find_class_safe(env, &class_name)
+    };
     if cls.is_null() || jni_check_exc(env) {
         return js_throw_internal_error(
             ctx,
@@ -432,7 +504,11 @@ pub(super) unsafe extern "C" fn js_java_invoke_static_method(
         }
     };
 
-    let mid = get_mid(env, cls, c_name.as_ptr(), c_sig.as_ptr());
+    let mid = if let Some((art_method, _)) = registered_target {
+        art_method as *mut std::ffi::c_void
+    } else {
+        get_mid(env, cls, c_name.as_ptr(), c_sig.as_ptr())
+    };
     if mid.is_null() || jni_check_exc(env) {
         return cleanup_and_throw_internal(
             ctx,
@@ -445,6 +521,7 @@ pub(super) unsafe extern "C" fn js_java_invoke_static_method(
             ),
         );
     }
+    let _fast_hook_bypass = FastHookInvokeBypass::for_method(env, cls, mid, true);
 
     let jargs = build_jargs_from_argv(ctx, env, argv, 3, &param_types);
     let jargs_ptr = if param_count > 0 {
@@ -745,7 +822,13 @@ pub(super) unsafe extern "C" fn js_java_new_object(
         Err(msg) => return js_throw_internal_error(ctx, msg),
     };
 
-    let cls = find_class_safe(env, &class_name);
+    let registered_target = registered_invoke_target_for_key(&class_name, "<init>", &ctor_sig, false);
+    let new_local_ref: NewLocalRefFn = jni_fn!(env, NewLocalRefFn, JNI_NEW_LOCAL_REF);
+    let cls = if let Some((_, class_global_ref)) = registered_target {
+        new_local_ref(env, class_global_ref as *mut std::ffi::c_void)
+    } else {
+        find_class_safe(env, &class_name)
+    };
     if cls.is_null() || jni_check_exc(env) {
         return js_throw_internal_error(
             ctx,
@@ -770,7 +853,11 @@ pub(super) unsafe extern "C" fn js_java_new_object(
         }
     };
 
-    let mid = get_mid(env, cls, c_ctor_name.as_ptr(), c_sig.as_ptr());
+    let mid = if let Some((art_method, _)) = registered_target {
+        art_method as *mut std::ffi::c_void
+    } else {
+        get_mid(env, cls, c_ctor_name.as_ptr(), c_sig.as_ptr())
+    };
     if mid.is_null() || jni_check_exc(env) {
         return cleanup_and_throw_internal(
             ctx,
@@ -780,6 +867,7 @@ pub(super) unsafe extern "C" fn js_java_new_object(
             format!("Java._newObject: GetMethodID failed: {}.<init>{}", class_name, ctor_sig),
         );
     }
+    let _fast_hook_bypass = FastHookInvokeBypass::for_method(env, cls, mid, false);
 
     let jargs = build_jargs_from_argv(ctx, env, argv, 2, &param_types);
     let jargs_ptr = if param_count > 0 {

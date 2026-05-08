@@ -35,12 +35,17 @@ pub(super) unsafe extern "C" fn js_java_methods(
         }
     };
 
-    let methods = match enumerate_methods(env, &class_name) {
-        Ok(m) => m,
-        Err(msg) => {
-            let err = CString::new(msg).unwrap();
-            return ffi::JS_ThrowInternalError(ctx, err.as_ptr());
+    let registered_methods = super::callback::registered_methods_for_class(&class_name);
+    let methods = if registered_methods.is_empty() {
+        match enumerate_methods(env, &class_name) {
+            Ok(m) => m,
+            Err(msg) => {
+                let err = CString::new(msg).unwrap();
+                return ffi::JS_ThrowInternalError(ctx, err.as_ptr());
+            }
         }
+    } else {
+        registered_methods
     };
 
     // Build JS array: [{name: "...", sig: "...", static: bool}, ...]
