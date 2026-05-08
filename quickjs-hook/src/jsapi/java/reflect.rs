@@ -1294,14 +1294,35 @@ pub(crate) unsafe fn get_class_name_unchecked(env_ptr: u64, cls_ptr: u64) -> Opt
         return None;
     }
 
-    let reflect = REFLECT_IDS.get()?;
+    let class_get_name_mid = if let Some(reflect) = REFLECT_IDS.get() {
+        reflect.class_get_name_mid
+    } else {
+        let find_class: FindClassFn = jni_fn!(env, FindClassFn, JNI_FIND_CLASS);
+        let get_mid: GetMethodIdFn = jni_fn!(env, GetMethodIdFn, JNI_GET_METHOD_ID);
+        let delete_local_ref: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
+
+        let c_class = CString::new("java/lang/Class").unwrap();
+        let class_cls = find_class(env, c_class.as_ptr());
+        if class_cls.is_null() || jni_check_exc(env) {
+            return None;
+        }
+
+        let c_get_name = CString::new("getName").unwrap();
+        let c_get_name_sig = CString::new("()Ljava/lang/String;").unwrap();
+        let mid = get_mid(env, class_cls, c_get_name.as_ptr(), c_get_name_sig.as_ptr());
+        delete_local_ref(env, class_cls);
+        if mid.is_null() || jni_check_exc(env) {
+            return None;
+        }
+        mid
+    };
 
     let call_obj: CallObjectMethodAFn = jni_fn!(env, CallObjectMethodAFn, JNI_CALL_OBJECT_METHOD_A);
     let get_str: GetStringUtfCharsFn = jni_fn!(env, GetStringUtfCharsFn, JNI_GET_STRING_UTF_CHARS);
     let rel_str: ReleaseStringUtfCharsFn = jni_fn!(env, ReleaseStringUtfCharsFn, JNI_RELEASE_STRING_UTF_CHARS);
     let delete_local_ref: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
 
-    let name_jstr = call_obj(env, cls, reflect.class_get_name_mid, std::ptr::null());
+    let name_jstr = call_obj(env, cls, class_get_name_mid, std::ptr::null());
     if name_jstr.is_null() {
         jni_check_exc(env);
         return None;
