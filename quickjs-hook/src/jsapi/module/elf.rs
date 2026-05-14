@@ -170,7 +170,10 @@ fn elf_find_symbols_in_data(
             return;
         }
 
-        // Find SHT_SYMTAB first (more complete), fall back to SHT_DYNSYM for stripped libs.
+        // Scan both .symtab and .dynsym. Android's linker64 exposes some
+        // public __loader_* names only in .dynsym while .symtab contains the
+        // internal __dl___loader_* aliases, so preferring one table loses
+        // valid lookups.
         let mut symtab_shdr: Option<&Elf64Shdr> = None;
         let mut dynsym_shdr: Option<&Elf64Shdr> = None;
         for i in 0..shnum {
@@ -182,70 +185,69 @@ fn elf_find_symbols_in_data(
             }
         }
 
-        let symtab = match symtab_shdr.or(dynsym_shdr) {
-            Some(s) => s,
-            None => return,
-        };
-
-        let strtab_idx = symtab.sh_link as usize;
-        if strtab_idx >= shnum {
-            return;
-        }
-        let strtab_shdr =
-            &*(data.as_ptr().add(shdr_off + strtab_idx * shdr_size) as *const Elf64Shdr);
-        if strtab_shdr.sh_type != SHT_STRTAB {
-            return;
-        }
-
-        let strtab_off = strtab_shdr.sh_offset as usize;
-        let strtab_size = strtab_shdr.sh_size as usize;
-        if strtab_off + strtab_size > data.len() {
-            return;
-        }
-
-        let symtab_off = symtab.sh_offset as usize;
-        let sym_size = if symtab.sh_entsize > 0 {
-            symtab.sh_entsize as usize
-        } else {
-            std::mem::size_of::<Elf64Sym>()
-        };
-        let nsyms = symtab.sh_size as usize / sym_size;
-
-        if symtab_off + nsyms * sym_size > data.len() {
-            return;
-        }
-
-        let mut remaining = wanted.len();
-
-        for idx in 0..nsyms {
-            if remaining == 0 {
+        let tables = [symtab_shdr, dynsym_shdr];
+        for symtab in tables.into_iter().flatten() {
+            if wanted.iter().all(|name| result.contains_key(*name)) {
                 break;
             }
 
-            let sym = &*(data.as_ptr().add(symtab_off + idx * sym_size) as *const Elf64Sym);
-            if sym.st_name == 0 || sym.st_value == 0 {
+            let strtab_idx = symtab.sh_link as usize;
+            if strtab_idx >= shnum {
+                continue;
+            }
+            let strtab_shdr =
+                &*(data.as_ptr().add(shdr_off + strtab_idx * shdr_size) as *const Elf64Shdr);
+            if strtab_shdr.sh_type != SHT_STRTAB {
                 continue;
             }
 
-            let name_off = strtab_off + sym.st_name as usize;
-            if name_off >= strtab_off + strtab_size {
+            let strtab_off = strtab_shdr.sh_offset as usize;
+            let strtab_size = strtab_shdr.sh_size as usize;
+            if strtab_off + strtab_size > data.len() {
                 continue;
             }
 
-            // Read null-terminated name
-            let name_slice = &data[name_off..strtab_off + strtab_size];
-            let name_len = name_slice.iter().position(|&b| b == 0).unwrap_or(0);
-            if name_len == 0 {
+            let symtab_off = symtab.sh_offset as usize;
+            let sym_size = if symtab.sh_entsize > 0 {
+                symtab.sh_entsize as usize
+            } else {
+                std::mem::size_of::<Elf64Sym>()
+            };
+            let nsyms = symtab.sh_size as usize / sym_size;
+
+            if symtab_off + nsyms * sym_size > data.len() {
                 continue;
             }
 
-            if let Ok(name) = std::str::from_utf8(&name_slice[..name_len]) {
-                if wanted.contains(name) && !result.contains_key(name) {
-                    result.insert(name.to_string(), load_bias + sym.st_value);
-                    if sym.st_type() == STT_GNU_IFUNC {
-                        ifunc_names.insert(name.to_string());
+            for idx in 0..nsyms {
+                if wanted.iter().all(|name| result.contains_key(*name)) {
+                    break;
+                }
+
+                let sym = &*(data.as_ptr().add(symtab_off + idx * sym_size) as *const Elf64Sym);
+                if sym.st_name == 0 || sym.st_value == 0 {
+                    continue;
+                }
+
+                let name_off = strtab_off + sym.st_name as usize;
+                if name_off >= strtab_off + strtab_size {
+                    continue;
+                }
+
+                // Read null-terminated name
+                let name_slice = &data[name_off..strtab_off + strtab_size];
+                let name_len = name_slice.iter().position(|&b| b == 0).unwrap_or(0);
+                if name_len == 0 {
+                    continue;
+                }
+
+                if let Ok(name) = std::str::from_utf8(&name_slice[..name_len]) {
+                    if wanted.contains(name) && !result.contains_key(name) {
+                        result.insert(name.to_string(), load_bias + sym.st_value);
+                        if sym.st_type() == STT_GNU_IFUNC {
+                            ifunc_names.insert(name.to_string());
+                        }
                     }
-                    remaining -= 1;
                 }
             }
         }
@@ -290,7 +292,7 @@ unsafe fn elf_find_symbols_in_memory(
         return;
     }
 
-    // Find SHT_SYMTAB first (more complete), fall back to SHT_DYNSYM for stripped libs.
+    // Scan both tables for the same reason as the file-backed path above.
     let mut symtab_shdr: Option<Elf64ShdrCopy> = None;
     let mut dynsym_shdr: Option<Elf64ShdrCopy> = None;
     for i in 0..shnum {
@@ -308,83 +310,84 @@ unsafe fn elf_find_symbols_in_memory(
         }
     }
 
-    let symtab = match symtab_shdr.or(dynsym_shdr) {
-        Some(s) => s,
-        None => {
-            crate::jsapi::console::output_verbose(
-                "[module] .symtab/.dynsym not found in memory ELF",
-            );
-            return;
-        }
-    };
-
-    let strtab_idx = symtab.sh_link as usize;
-    if strtab_idx >= shnum {
-        return;
-    }
-    let strtab_shdr = &*((shdr_addr as usize + strtab_idx * shdr_size) as *const Elf64Shdr);
-    if strtab_shdr.sh_type != SHT_STRTAB {
+    if symtab_shdr.is_none() && dynsym_shdr.is_none() {
+        crate::jsapi::console::output_verbose(
+            "[module] .symtab/.dynsym not found in memory ELF",
+        );
         return;
     }
 
-    // Check .symtab and .strtab data accessible
-    let symtab_data_addr = base_address + symtab.sh_offset;
-    let strtab_data_addr = base_address + strtab_shdr.sh_offset;
-
-    let sym_size = if symtab.sh_entsize > 0 {
-        symtab.sh_entsize as usize
-    } else {
-        std::mem::size_of::<Elf64Sym>()
-    };
-    let nsyms = symtab.sh_size as usize / sym_size;
-    let strtab_size = strtab_shdr.sh_size as usize;
-
-    if !is_addr_accessible(symtab_data_addr, nsyms * sym_size) {
-        crate::jsapi::console::output_verbose("[module] .symtab data not accessible in memory");
-        return;
-    }
-    if !is_addr_accessible(strtab_data_addr, strtab_size) {
-        crate::jsapi::console::output_verbose("[module] .strtab data not accessible in memory");
-        return;
-    }
-
-    crate::jsapi::console::output_verbose(&format!(
-        "[module] reading .symtab from memory: {} symbols",
-        nsyms
-    ));
-
-    let mut remaining = wanted.len();
-
-    for idx in 0..nsyms {
-        if remaining == 0 {
+    let tables = [symtab_shdr, dynsym_shdr];
+    for symtab in tables.into_iter().flatten() {
+        if wanted.iter().all(|name| result.contains_key(*name)) {
             break;
         }
 
-        let sym = &*((symtab_data_addr as usize + idx * sym_size) as *const Elf64Sym);
-        if sym.st_name == 0 || sym.st_value == 0 {
+        let strtab_idx = symtab.sh_link as usize;
+        if strtab_idx >= shnum {
+            continue;
+        }
+        let strtab_shdr = &*((shdr_addr as usize + strtab_idx * shdr_size) as *const Elf64Shdr);
+        if strtab_shdr.sh_type != SHT_STRTAB {
             continue;
         }
 
-        let name_off = sym.st_name as usize;
-        if name_off >= strtab_size {
+        // Check .symtab/.dynsym and linked string table data are accessible.
+        let symtab_data_addr = base_address + symtab.sh_offset;
+        let strtab_data_addr = base_address + strtab_shdr.sh_offset;
+
+        let sym_size = if symtab.sh_entsize > 0 {
+            symtab.sh_entsize as usize
+        } else {
+            std::mem::size_of::<Elf64Sym>()
+        };
+        let nsyms = symtab.sh_size as usize / sym_size;
+        let strtab_size = strtab_shdr.sh_size as usize;
+
+        if !is_addr_accessible(symtab_data_addr, nsyms * sym_size) {
+            crate::jsapi::console::output_verbose("[module] symbol table data not accessible in memory");
+            continue;
+        }
+        if !is_addr_accessible(strtab_data_addr, strtab_size) {
+            crate::jsapi::console::output_verbose("[module] string table data not accessible in memory");
             continue;
         }
 
-        let name_ptr = (strtab_data_addr as usize + name_off) as *const u8;
-        let max_len = strtab_size - name_off;
-        let name_slice = std::slice::from_raw_parts(name_ptr, max_len);
-        let name_len = name_slice.iter().position(|&b| b == 0).unwrap_or(0);
-        if name_len == 0 {
-            continue;
-        }
+        crate::jsapi::console::output_verbose(&format!(
+            "[module] reading symbol table from memory: {} symbols",
+            nsyms
+        ));
 
-        if let Ok(name) = std::str::from_utf8(&name_slice[..name_len]) {
-            if wanted.contains(name) && !result.contains_key(name) {
-                result.insert(name.to_string(), load_bias + sym.st_value);
-                if sym.st_type() == STT_GNU_IFUNC {
-                    ifunc_names.insert(name.to_string());
+        for idx in 0..nsyms {
+            if wanted.iter().all(|name| result.contains_key(*name)) {
+                break;
+            }
+
+            let sym = &*((symtab_data_addr as usize + idx * sym_size) as *const Elf64Sym);
+            if sym.st_name == 0 || sym.st_value == 0 {
+                continue;
+            }
+
+            let name_off = sym.st_name as usize;
+            if name_off >= strtab_size {
+                continue;
+            }
+
+            let name_ptr = (strtab_data_addr as usize + name_off) as *const u8;
+            let max_len = strtab_size - name_off;
+            let name_slice = std::slice::from_raw_parts(name_ptr, max_len);
+            let name_len = name_slice.iter().position(|&b| b == 0).unwrap_or(0);
+            if name_len == 0 {
+                continue;
+            }
+
+            if let Ok(name) = std::str::from_utf8(&name_slice[..name_len]) {
+                if wanted.contains(name) && !result.contains_key(name) {
+                    result.insert(name.to_string(), load_bias + sym.st_value);
+                    if sym.st_type() == STT_GNU_IFUNC {
+                        ifunc_names.insert(name.to_string());
+                    }
                 }
-                remaining -= 1;
             }
         }
     }
