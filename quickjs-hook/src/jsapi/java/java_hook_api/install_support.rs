@@ -1,7 +1,7 @@
 use crate::ffi::hook as hook_ffi;
 use crate::jsapi::console::{output_message, output_verbose};
 
-use super::super::art_controller::prepare_hook_target;
+use super::super::art_controller::{cached_thread_top_quick_frame_offset, prepare_hook_target};
 use super::super::art_method::*;
 use super::super::callback::delete_replacement_method;
 use super::super::jni_core::*;
@@ -9,6 +9,10 @@ use super::super::reflect::find_class_safe;
 
 pub(super) unsafe fn delete_global_ref_best_effort(class_global_ref: usize) {
     if class_global_ref == 0 {
+        return;
+    }
+    if crate::is_raw_clone_js_thread() && !raw_clone_executor_jni_scope_active() {
+        output_verbose("[java hook] raw clone: skip DeleteGlobalRef cleanup");
         return;
     }
     if let Ok(env) = get_thread_env() {
@@ -143,6 +147,14 @@ pub(super) unsafe fn alloc_art_method_clone(art_method: u64, clone_size: usize) 
 }
 
 pub(super) unsafe fn create_class_global_ref(env: JniEnv, class_name: &str) -> Result<usize, String> {
+    if crate::is_raw_clone_js_thread() && !raw_clone_executor_jni_scope_active() {
+        output_verbose(&format!(
+            "[java hook] raw clone: skip class global ref for {}",
+            class_name
+        ));
+        return Ok(0);
+    }
+
     let cls = find_class_safe(env, class_name);
     if cls.is_null() {
         return Err(format!("FindClass('{}') failed for global ref", class_name));
@@ -189,7 +201,7 @@ pub(super) unsafe fn create_replacement_art_method(
 }
 
 pub(super) unsafe fn create_quick_stack_sentinel_art_method(
-    env: JniEnv,
+    source_art_method: u64,
     clone_size: usize,
     spec: &ArtMethodSpec,
     data_off: usize,
@@ -198,36 +210,27 @@ pub(super) unsafe fn create_quick_stack_sentinel_art_method(
 ) -> Result<(usize, u64), String> {
     const K_ACC_STATIC: u32 = 0x0008;
 
-    let sentinel_src =
-        get_known_native_art_method(env).ok_or("failed to resolve Process.getElapsedCpuTime sentinel ArtMethod")?;
-    if (sentinel_src & 0x3) != 0 {
+    if (source_art_method & 0x3) != 0 {
         return Err(format!(
-            "Process.getElapsedCpuTime sentinel ArtMethod is still tagged/opaque: {:#x}",
-            sentinel_src
+            "quick stack sentinel source ArtMethod is tagged/opaque: {:#x}",
+            source_art_method
         ));
     }
     let ptr = libc::malloc(clone_size);
     if ptr.is_null() {
         return Err("malloc failed for quick stack sentinel ArtMethod".to_string());
     }
-    std::ptr::copy_nonoverlapping(sentinel_src as *const u8, ptr as *mut u8, clone_size);
+    std::ptr::copy_nonoverlapping(source_art_method as *const u8, ptr as *mut u8, clone_size);
 
     let repl = ptr as usize;
-    let src_declaring_class = std::ptr::read_volatile(sentinel_src as *const u32);
-    let src_dex_method_index = std::ptr::read_volatile((sentinel_src as usize + 12) as *const u32);
-    let src_flags = std::ptr::read_volatile((sentinel_src as usize + spec.access_flags_offset) as *const u32);
+    let src_declaring_class = std::ptr::read_volatile(source_art_method as *const u32);
+    let src_dex_method_index = std::ptr::read_volatile((source_art_method as usize + 12) as *const u32);
+    let src_flags = std::ptr::read_volatile((source_art_method as usize + spec.access_flags_offset) as *const u32);
     if src_declaring_class == 0 || src_declaring_class == 1 {
         libc::free(ptr);
         return Err(format!(
-            "invalid Process.getElapsedCpuTime declaring_class={:#x}, src={:#x}",
-            src_declaring_class, sentinel_src
-        ));
-    }
-    if (src_flags & (K_ACC_NATIVE | K_ACC_STATIC)) != (K_ACC_NATIVE | K_ACC_STATIC) {
-        libc::free(ptr);
-        return Err(format!(
-            "Process.getElapsedCpuTime is not static native: src={:#x}, flags={:#x}",
-            sentinel_src, src_flags
+            "invalid quick stack sentinel declaring_class={:#x}, src={:#x}",
+            src_declaring_class, source_art_method
         ));
     }
     let repl_flags = (src_flags & !(K_ACC_CRITICAL_NATIVE | K_ACC_FAST_NATIVE | K_ACC_NTERP_ENTRY_POINT_FAST_PATH))
@@ -245,14 +248,14 @@ pub(super) unsafe fn create_quick_stack_sentinel_art_method(
     let repl_ep = std::ptr::read_volatile((repl + ep_offset) as *const u64);
     output_message(&format!(
         "[java hook] quick stack sentinel: src={:#x}, addr={:#x}, decl={:#x}->{:#x}, dex_idx={:#x}->{:#x}, flags={:#x}->{:#x}, data_off={}, ep_off={}, data={:#x}, ep={:#x}",
-        sentinel_src, repl,
+        source_art_method, repl,
         src_declaring_class, repl_declaring_class,
         src_dex_method_index, repl_dex_method_index,
         src_flags, repl_flags,
         data_off, ep_offset, repl_data, repl_ep
     ));
 
-    Ok((repl, sentinel_src))
+    Ok((repl, source_art_method))
 }
 
 pub(super) unsafe fn update_original_method_flags_for_hook(
@@ -287,6 +290,23 @@ pub(super) unsafe fn install_per_method_router_hook(
     enable_fast_orig: bool,
 ) -> Result<(Option<u64>, u64, bool, Option<u64>), String> {
     if has_independent_code {
+        if cached_thread_top_quick_frame_offset().is_none() {
+            let stub = hook_ffi::hook_create_art_router_stub(original_entry_point, ep_offset as u32) as u64;
+            if stub == 0 {
+                return Err(format!(
+                    "hook_create_art_router_stub failed for compiled entry {:#x}",
+                    original_entry_point
+                ));
+            }
+            std::ptr::write_volatile((art_method as usize + ep_offset) as *mut u64, stub);
+            hook_ffi::hook_flush_cache((art_method as usize + ep_offset) as *mut std::ffi::c_void, 8);
+            output_verbose(&format!(
+                "[java hook] Step 9: compiled entry standalone router installed: ep={:#x} -> stub={:#x} (quick frame offsets unavailable)",
+                original_entry_point, stub
+            ));
+            return Ok((Some(stub), 0, false, Some(stub)));
+        }
+
         // Layer 3: inline hook quickCode 作为快速路径 (直接调用场景)
         let mut hooked_target: *mut std::ffi::c_void = std::ptr::null_mut();
         let (hook_addr, sflag) = prepare_hook_target(original_entry_point as u64, env as *mut std::ffi::c_void)

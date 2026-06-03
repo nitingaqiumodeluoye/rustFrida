@@ -8,6 +8,8 @@
 use crate::vma_name::set_anon_vma_name_raw;
 use libc::{munmap, sysconf, MAP_FAILED, _SC_PAGESIZE};
 
+#[cfg(feature = "qbdi")]
+use quickjs_hook::shutdown_qbdi_helper;
 use quickjs_hook::{
     cleanup_engine, cleanup_wxshadow_patches, complete_script, cut_art_controller_routing_hooks,
     cut_art_controller_walkstack_guards, cut_java_hooks, cut_native_hooks, detach_current_jni_thread,
@@ -15,17 +17,67 @@ use quickjs_hook::{
     init_hook_engine, load_script, load_script_with_filename, set_art_controller_reload_paused, set_console_callback,
     set_qbdi_helper_blob, set_qbdi_output_dir,
 };
-#[cfg(feature = "qbdi")]
-use quickjs_hook::{preload_qbdi_helper, shutdown_qbdi_helper};
+use std::collections::VecDeque;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::OnceLock;
+use std::sync::mpsc;
+use std::sync::{Condvar, Mutex, OnceLock};
 
 use crate::communication::{log_msg, write_stream};
 
+const JAVA_WORKER_EVAL_TIMEOUT_MS: u64 = 60_000;
+const JAVA_WORKER_BUSY_FAST_FAIL_MS: u64 = 500;
+
 static ENGINE_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static HOOK_RUNTIME_INITIALIZED: AtomicBool = AtomicBool::new(false);
+static JAVA_WORKER_START_REQUESTED: AtomicBool = AtomicBool::new(false);
+static JAVA_WORKER_STARTED: AtomicBool = AtomicBool::new(false);
+static JAVA_WORKER_LOOP_ENTERED: AtomicBool = AtomicBool::new(false);
+static JAVA_WORKER_LOOP_RUNNING: AtomicBool = AtomicBool::new(false);
+static JAVA_WORKER_EVAL_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+static EXEC_MEM_UNMAPPED: AtomicBool = AtomicBool::new(false);
+static JAVA_WORKER_QUEUE: OnceLock<JavaWorkerQueue> = OnceLock::new();
 static HOOK_EXEC_VMA_NAME: &[u8] = b"wwb_hook_exec\0";
+
+enum JavaWorkerTask {
+    Eval {
+        script: String,
+        filename: String,
+        init_engine: bool,
+        reply: mpsc::Sender<Result<String, String>>,
+    },
+    Stop,
+}
+
+struct JavaWorkerQueue {
+    tasks: Mutex<VecDeque<JavaWorkerTask>>,
+    cv: Condvar,
+}
+
+impl JavaWorkerQueue {
+    fn get() -> &'static Self {
+        JAVA_WORKER_QUEUE.get_or_init(|| Self {
+            tasks: Mutex::new(VecDeque::new()),
+            cv: Condvar::new(),
+        })
+    }
+
+    fn push(&self, task: JavaWorkerTask) {
+        let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+        tasks.push_back(task);
+        self.cv.notify_one();
+    }
+
+    fn pop(&self) -> JavaWorkerTask {
+        let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(task) = tasks.pop_front() {
+                return task;
+            }
+            tasks = self.cv.wait(tasks).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -49,6 +101,10 @@ fn hook_engine_exec_ranges() -> Vec<(u64, u64)> {
         .take(n as usize)
         .filter_map(|r| (r.base != 0 && r.size != 0).then_some((r.base, r.size)))
         .collect()
+}
+
+fn hook_runtime_initialized() -> bool {
+    HOOK_RUNTIME_INITIALIZED.load(Ordering::SeqCst)
 }
 
 /// 从 /proc/self/maps 找 libart.so 的 r-xp 基址（用作 mmap hint）
@@ -184,24 +240,137 @@ pub fn init() -> Result<(), String> {
     // 初始化 JS 引擎（complete_script 依赖它）
     get_or_init_engine()?;
 
-    #[cfg(feature = "qbdi")]
-    if let Err(err) = preload_qbdi_helper() {
-        if err != "qbdi helper blob not configured" {
-            write_stream(format!("[qbdi] preload on jsinit failed: {}", err).as_bytes());
-        }
-    }
-
     ENGINE_INITIALIZED.store(true, Ordering::SeqCst);
 
     Ok(())
 }
 
+unsafe extern "C" fn java_worker_native_loop(_env: *mut *const *const std::ffi::c_void, _cls: *mut std::ffi::c_void) {
+    JAVA_WORKER_LOOP_ENTERED.store(true, Ordering::Release);
+    JAVA_WORKER_LOOP_RUNNING.store(true, Ordering::Release);
+    let result = std::panic::catch_unwind(|| loop {
+        match JavaWorkerQueue::get().pop() {
+            JavaWorkerTask::Eval {
+                script,
+                filename,
+                init_engine,
+                reply,
+            } => {
+                let result = run_eval_task(&script, &filename, init_engine);
+                JAVA_WORKER_EVAL_IN_FLIGHT.store(false, Ordering::Release);
+                let _ = reply.send(result);
+            }
+            JavaWorkerTask::Stop => break,
+        }
+    });
+    if result.is_err() {
+        write_stream(b"[java worker] native loop panic");
+    }
+    JAVA_WORKER_EVAL_IN_FLIGHT.store(false, Ordering::Release);
+    JAVA_WORKER_LOOP_RUNNING.store(false, Ordering::Release);
+}
+
+fn run_eval_task(script: &str, filename: &str, init_engine: bool) -> Result<String, String> {
+    if init_engine {
+        match init() {
+            Ok(()) => {}
+            Err(e) if e.contains("已初始化") => {}
+            Err(e) => return Err(e),
+        }
+    }
+
+    if filename.is_empty() {
+        execute_script(script)
+    } else {
+        execute_script_with_filename(script, filename)
+    }
+}
+
+pub fn start_java_worker() -> Result<(), String> {
+    if JAVA_WORKER_STARTED.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    init_hook_runtime()?;
+    set_console_callback(|msg| {
+        write_stream(format!("[JS] {}", msg).as_bytes());
+    });
+    write_stream(b"[java worker] starting");
+    JAVA_WORKER_LOOP_ENTERED.store(false, Ordering::Release);
+    JAVA_WORKER_START_REQUESTED.store(true, Ordering::Release);
+    if let Err(err) = quickjs_hook::start_java_worker_thread(java_worker_native_loop as *mut std::ffi::c_void) {
+        JAVA_WORKER_START_REQUESTED.store(false, Ordering::Release);
+        return Err(err);
+    }
+    JAVA_WORKER_STARTED.store(true, Ordering::Release);
+    write_stream(b"[java worker] ready");
+    Ok(())
+}
+
+pub fn is_java_worker_started() -> bool {
+    JAVA_WORKER_STARTED.load(Ordering::Acquire)
+}
+
+pub fn stop_java_worker() -> bool {
+    let requested = JAVA_WORKER_START_REQUESTED.swap(false, Ordering::AcqRel);
+    let started = JAVA_WORKER_STARTED.swap(false, Ordering::AcqRel);
+    if requested || started {
+        JavaWorkerQueue::get().push(JavaWorkerTask::Stop);
+    }
+    requested || started
+}
+
+fn wait_java_worker_stopped(had_worker: bool, timeout_ms: u64) -> bool {
+    if !had_worker {
+        return true;
+    }
+    let start = std::time::Instant::now();
+    loop {
+        if JAVA_WORKER_LOOP_ENTERED.load(Ordering::Acquire) && !JAVA_WORKER_LOOP_RUNNING.load(Ordering::Acquire) {
+            return true;
+        }
+        if start.elapsed() >= std::time::Duration::from_millis(timeout_ms) {
+            return false;
+        }
+        crate::raw_thread::sleep_ms(5);
+    }
+    true
+}
+
+pub fn eval_on_java_worker(script: String, filename: String, init_engine: bool) -> Result<String, String> {
+    start_java_worker()?;
+    let queue = JavaWorkerQueue::get();
+    if JAVA_WORKER_EVAL_IN_FLIGHT
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Err("Java worker busy: previous Java eval is still running".to_string());
+    }
+    let (tx, rx) = mpsc::channel();
+    queue.push(JavaWorkerTask::Eval {
+        script,
+        filename,
+        init_engine,
+        reply: tx,
+    });
+    let timeout_ms = if init_engine {
+        JAVA_WORKER_EVAL_TIMEOUT_MS
+    } else {
+        JAVA_WORKER_BUSY_FAST_FAIL_MS
+    };
+    rx.recv_timeout(std::time::Duration::from_millis(timeout_ms))
+        .map_err(|e| {
+            if matches!(e, mpsc::RecvTimeoutError::Disconnected) {
+                JAVA_WORKER_EVAL_IN_FLIGHT.store(false, Ordering::Release);
+            }
+            format!(
+                "java worker eval timed out after {}ms or channel closed: {}; task remains in-flight until worker returns",
+                timeout_ms, e
+            )
+        })?
+}
+
 pub fn install_qbdi_helper(blob: Vec<u8>) {
     set_qbdi_helper_blob(blob);
-    #[cfg(feature = "qbdi")]
-    if let Err(err) = preload_qbdi_helper() {
-        write_stream(format!("[qbdi] preload on helper install failed: {}", err).as_bytes());
-    }
 }
 
 /// Load and execute a JavaScript script
@@ -242,7 +411,7 @@ pub fn is_initialized() -> bool {
 /// Phase 2: **drain g_thunk_in_flight → 0**。归零表示无线程在 thunk 或 callee 中。
 /// Phase 3: **注销 recomp + 全线程 safepoint**。确认活动栈不再引用生成代码。
 /// Phase 4: **释放资源 + hook_engine cleanup + munmap pool/recomp 页**。
-pub fn cleanup() {
+pub fn cleanup() -> bool {
     use std::time::Instant;
     let t0 = Instant::now();
     let mut t = t0;
@@ -255,6 +424,13 @@ pub fn cleanup() {
     };
 
     stage("cleanup start", &mut t);
+    let had_java_worker = stop_java_worker();
+    if !wait_java_worker_stopped(had_java_worker, 800) {
+        log_msg("[quickjs] Java worker native loop still running; destructive cleanup skipped\n".to_string());
+        detach_current_jni_thread();
+        stage("cleanup detach_jni_thread", &mut t);
+        return false;
+    }
     ENGINE_INITIALIZED.store(false, Ordering::SeqCst);
     quickjs_hook::recomp::set_cleanup_release_only(true);
     // Recomp full cleanup is release-only: first stop kernel redirection, then
@@ -285,10 +461,17 @@ pub fn cleanup() {
     //   → OAT bypass 可以安全卸载
     //   → pool 可以安全 munmap
     // ============================================================
-    // drain_thunk_in_flight 现在无限等待直到归零 (never returns false),
-    // 保证 Phase 3/4 安全执行, 不再走 leak 分支。若线程真卡死, 外层会一直等。
-    let _drained = drain_thunk_in_flight();
+    let drained = drain_thunk_in_flight();
     stage("phase2 drain_thunk_in_flight", &mut t);
+    if !drained {
+        log_msg(format!(
+            "[quickjs] drain timeout: keep hook resources and executable memory mapped; destructive cleanup skipped (total {}ms)\n",
+            t0.elapsed().as_millis()
+        ));
+        detach_current_jni_thread();
+        stage("cleanup detach_jni_thread", &mut t);
+        return false;
+    }
 
     // ============================================================
     // Phase 3: 停止新 recomp 执行，并等待所有线程活动栈离开 hook/recomp 地址。
@@ -319,10 +502,11 @@ pub fn cleanup() {
             }
         ));
     }
+    const CLEANUP_SAFEPOINT_BUDGET_MS: u64 = 2_500;
     let stack_clean = if scan_stack_for_art_frames {
-        crate::safepoint::wait_until_clean(&protected_ranges, 30_000)
+        crate::safepoint::wait_until_clean(&protected_ranges, CLEANUP_SAFEPOINT_BUDGET_MS)
     } else {
-        crate::safepoint::wait_until_pc_lr_clean(&protected_ranges, 30_000)
+        crate::safepoint::wait_until_pc_lr_clean(&protected_ranges, CLEANUP_SAFEPOINT_BUDGET_MS)
     };
     stage("phase3 safepoint_stack_clean", &mut t);
     if !stack_clean {
@@ -332,7 +516,7 @@ pub fn cleanup() {
         );
         detach_current_jni_thread();
         stage("cleanup detach_jni_thread", &mut t);
-        return;
+        return false;
     }
 
     // ============================================================
@@ -347,9 +531,9 @@ pub fn cleanup() {
     let post_guard_scan_stack = !post_guard_recomp_ranges.is_empty();
     post_guard_ranges.extend(post_guard_recomp_ranges);
     let post_guard_clean = if post_guard_scan_stack {
-        crate::safepoint::wait_until_clean(&post_guard_ranges, 30_000)
+        crate::safepoint::wait_until_clean(&post_guard_ranges, CLEANUP_SAFEPOINT_BUDGET_MS)
     } else {
-        crate::safepoint::wait_until_pc_lr_clean(&post_guard_ranges, 30_000)
+        crate::safepoint::wait_until_pc_lr_clean(&post_guard_ranges, CLEANUP_SAFEPOINT_BUDGET_MS)
     };
     stage("phase4 safepoint_after_guard_cut", &mut t);
     if !post_guard_clean {
@@ -358,7 +542,7 @@ pub fn cleanup() {
         );
         detach_current_jni_thread();
         stage("cleanup detach_jni_thread", &mut t);
-        return;
+        return false;
     }
     free_art_controller_state();
     stage("phase4 free_art_controller_state", &mut t);
@@ -393,16 +577,60 @@ pub fn cleanup() {
         "[quickjs] cleanup done (total {}ms)\n",
         t0.elapsed().as_millis()
     ));
+    true
 }
 
 // 注：full cleanup 在 callback/exec 两套计数都归零后同步 munmap hook pool/recomp 页。
 
+fn munmap_initial_exec_mem_for_unload() {
+    if EXEC_MEM_UNMAPPED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let Some(exec_mem) = EXEC_MEM.get() else {
+        return;
+    };
+    unsafe {
+        let ret = munmap(exec_mem.ptr as *mut _, exec_mem.size);
+        if ret == 0 {
+            log_msg(format!("[quickjs] munmap initial hook exec: bytes={}\n", exec_mem.size));
+        } else {
+            log_msg(format!(
+                "[quickjs] munmap initial hook exec failed: {}\n",
+                std::io::Error::last_os_error()
+            ));
+        }
+    }
+}
+
+pub fn cleanup_for_unload() {
+    if cleanup() {
+        munmap_initial_exec_mem_for_unload();
+    } else {
+        log_msg("[quickjs] unload cleanup retained initial executable memory after timeout\n".to_string());
+    }
+}
+
+pub fn prepare_unload_fast() -> bool {
+    if !hook_runtime_initialized() {
+        return true;
+    }
+
+    let executor_cut = quickjs_hook::abort_raw_clone_java_executor_for_unload();
+    if !executor_cut {
+        log_msg("[quickjs] raw-clone Java executor hook cut failed; keep executable memory mapped\n".to_string());
+        return false;
+    }
+
+    !quickjs_hook::raw_clone_java_executor_hook_active()
+}
+
 /// Agent unload path for hot managed hooks.
 ///
 /// Cut hook entry points, wait until callback/thunk/managed-helper counters all
-/// drain to zero, then free JS-facing resources. Keep ART guards and executable
-/// pools mapped because ART may still keep historical quick-code PCs in metadata.
-pub fn cleanup_for_unload_leak_safe() {
+/// drain to zero, then free JS-facing resources. The loader unmaps the agent
+/// image after this returns, so ART guards whose callbacks live in the agent
+/// must be removed here instead of being retained in libsigchain/hook_engine.
+pub fn cleanup_for_unload_leak_safe() -> bool {
     use std::time::Instant;
     let t0 = Instant::now();
     let mut t = t0;
@@ -415,6 +643,19 @@ pub fn cleanup_for_unload_leak_safe() {
     };
 
     stage("cleanup start (managed-safe unload)", &mut t);
+    let had_java_worker = stop_java_worker();
+    if wait_java_worker_stopped(had_java_worker, 800) {
+        stage("phase0 stop_java_worker", &mut t);
+    } else {
+        stage("phase0 stop_java_worker_timeout", &mut t);
+        log_msg(
+            "[quickjs] Java worker native loop still running; skip managed-safe unload to avoid unmapping agent code\n"
+                .to_string(),
+        );
+        detach_current_jni_thread();
+        stage("cleanup detach_jni_thread", &mut t);
+        return false;
+    }
     ENGINE_INITIALIZED.store(false, Ordering::SeqCst);
     quickjs_hook::recomp::set_cleanup_release_only(true);
     crate::recompiler::release_all();
@@ -427,11 +668,25 @@ pub fn cleanup_for_unload_leak_safe() {
     cut_art_controller_routing_hooks();
     stage("phase1 cut_art_controller_routing", &mut t);
 
-    let _drained = drain_thunk_in_flight();
+    let drained = drain_thunk_in_flight();
     stage("phase2 drain_thunk_in_flight", &mut t);
+    if !drained {
+        log_msg(format!(
+            "[quickjs] managed-safe unload drain timeout: keep hook resources and walkstack guards; destructive cleanup skipped (total {}ms)\n",
+            t0.elapsed().as_millis()
+        ));
+        detach_current_jni_thread();
+        stage("cleanup detach_jni_thread", &mut t);
+        return false;
+    }
 
     crate::recompiler::release_all();
     stage("phase3 release_all_recomp", &mut t);
+
+    cut_art_controller_walkstack_guards();
+    stage("phase3 cut_art_controller_walkstack_guards", &mut t);
+    free_art_controller_state();
+    stage("phase3 free_art_controller_state", &mut t);
 
     free_java_hooks();
     stage("phase3 free_java_hooks", &mut t);
@@ -448,9 +703,10 @@ pub fn cleanup_for_unload_leak_safe() {
     stage("phase3 cleanup_engine", &mut t);
 
     log_msg(format!(
-        "[quickjs] cleanup done (managed-safe unload, executable pools and walkstack guards retained, total {}ms)\n",
+        "[quickjs] cleanup done (managed-safe unload, executable pools retained, walkstack guards removed, total {}ms)\n",
         t0.elapsed().as_millis()
     ));
+    true
 }
 
 /// **软清理**：完整 unhook + drain=0 + 销毁 runtime，保留 hook 基础设施和 RWX 内存。

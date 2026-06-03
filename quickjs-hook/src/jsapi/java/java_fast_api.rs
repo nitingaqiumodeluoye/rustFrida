@@ -241,6 +241,9 @@ pub unsafe extern "C" fn art_quick_callee_save_suspend_method() -> *mut std::ffi
 
 #[no_mangle]
 pub unsafe extern "C" fn art_quick_test_suspend_entrypoint() -> *mut std::ffi::c_void {
+    if crate::is_raw_clone_js_thread() {
+        return std::ptr::null_mut();
+    }
     *ART_QUICK_TEST_SUSPEND_ENTRYPOINT.get_or_init(|| unsafe {
         let env = get_thread_env().unwrap_or(std::ptr::null_mut());
         current_art_thread(env)
@@ -499,7 +502,7 @@ fn shorty_char(type_sig: &str) -> u8 {
     }
 }
 
-unsafe fn resolve_fast_method(
+pub(in crate::jsapi::java) unsafe fn resolve_fast_method(
     env: JniEnv,
     class_name: &str,
     method_name: &str,
@@ -518,7 +521,7 @@ unsafe fn resolve_fast_method(
     let delete_global_ref: DeleteGlobalRefFn = jni_fn!(env, DeleteGlobalRefFn, JNI_DELETE_GLOBAL_REF);
     let new_global_ref: NewGlobalRefFn = jni_fn!(env, NewGlobalRefFn, JNI_NEW_GLOBAL_REF);
     let class_global = new_global_ref(env, cls);
-    if class_global.is_null() || jni_check_exc(env) {
+    if jni_null_or_exc(env, class_global) {
         delete_local_ref(env, cls);
         return Err(format!("NewGlobalRef failed for {}", class_name));
     }
@@ -526,26 +529,111 @@ unsafe fn resolve_fast_method(
     if !force_static {
         let get_method_id: GetMethodIdFn = jni_fn!(env, GetMethodIdFn, JNI_GET_METHOD_ID);
         let method_id = get_method_id(env, cls, c_method.as_ptr(), c_sig.as_ptr());
-        if !method_id.is_null() && !jni_check_exc(env) {
+        if !jni_null_or_exc(env, method_id) {
             let art_method = decode_method_id(env, cls, method_id as u64, false);
             delete_local_ref(env, cls);
             return Ok((art_method, method_id as u64, class_global as u64, false));
         }
-        jni_check_exc(env);
     }
 
     let get_static_method_id: GetStaticMethodIdFn = jni_fn!(env, GetStaticMethodIdFn, JNI_GET_STATIC_METHOD_ID);
     let method_id = get_static_method_id(env, cls, c_method.as_ptr(), c_sig.as_ptr());
-    if !method_id.is_null() && !jni_check_exc(env) {
+    if !jni_null_or_exc(env, method_id) {
         let art_method = decode_method_id(env, cls, method_id as u64, true);
         delete_local_ref(env, cls);
         return Ok((art_method, method_id as u64, class_global as u64, true));
     }
-    jni_check_exc(env);
     delete_local_ref(env, cls);
     delete_global_ref(env, class_global);
 
     Err(format!("method not found: {}.{}{}", class_name, method_name, signature))
+}
+
+pub(in crate::jsapi::java) unsafe fn resolve_fast_field(
+    env: JniEnv,
+    class_name: String,
+    field_name: String,
+    requested_sig: Option<String>,
+) -> Result<FastField, String> {
+    let Some(spec) = get_art_field_spec() else {
+        return Err("unsupported ArtField layout".to_string());
+    };
+
+    cache_fields_for_class(env, &class_name);
+    let (jni_sig, field_id, is_static) = {
+        let guard = FIELD_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        let cached = guard
+            .as_ref()
+            .and_then(|cache| cache.get(&class_name))
+            .and_then(|fields| fields.get(&field_name))
+            .map(|info| (info.jni_sig.clone(), info.field_id, info.is_static));
+        match cached {
+            Some(v) => v,
+            None => {
+                let Some(sig) = requested_sig.clone() else {
+                    return Err(format!("field not found: {}.{}", class_name, field_name));
+                };
+                let cls = find_class_safe(env, &class_name);
+                if cls.is_null() {
+                    return Err(format!("class not found: {}", class_name));
+                }
+                let c_name = CString::new(field_name.as_str()).map_err(|_| "invalid field name".to_string())?;
+                let c_sig = CString::new(sig.as_str()).map_err(|_| "invalid field signature".to_string())?;
+                jni_check_exc(env);
+                let get_field_id: GetFieldIdFn = jni_fn!(env, GetFieldIdFn, JNI_GET_FIELD_ID);
+                let field_id = get_field_id(env, cls, c_name.as_ptr(), c_sig.as_ptr());
+                if !jni_null_or_exc(env, field_id) {
+                    (sig, field_id, false)
+                } else {
+                    let get_static_field_id: GetStaticFieldIdFn =
+                        jni_fn!(env, GetStaticFieldIdFn, JNI_GET_STATIC_FIELD_ID);
+                    let field_id = get_static_field_id(env, cls, c_name.as_ptr(), c_sig.as_ptr());
+                    if !jni_null_or_exc(env, field_id) {
+                        (sig, field_id, true)
+                    } else {
+                        return Err(format!("field not found: {}.{}{}", class_name, field_name, sig));
+                    }
+                }
+            }
+        }
+    };
+
+    if let Some(sig) = requested_sig.as_ref() {
+        if sig != &jni_sig {
+            return Err("field signature mismatch".to_string());
+        }
+    }
+    if is_static {
+        return Err("fastField only supports instance fields".to_string());
+    }
+    if !is_fast_field_type(&jni_sig) {
+        return Err("fastField only supports primitive/object instance fields".to_string());
+    }
+
+    let cls = find_class_safe(env, &class_name);
+    if cls.is_null() {
+        return Err(format!("class not found: {}", class_name));
+    }
+    let art_field = decode_field_id(env, cls, field_id as u64, is_static);
+    jni_check_exc(env);
+    if art_field == 0 {
+        return Err(format!("failed to decode field id: {}.{}", class_name, field_name));
+    }
+    refresh_mem_regions();
+    let offset = safe_read_u32(art_field + spec.offset_offset as u64);
+    if offset == 0 {
+        return Err(format!("invalid field offset: {}.{}", class_name, field_name));
+    }
+
+    Ok(FastField {
+        art_field,
+        offset,
+        is_static,
+        value_type: jni_sig.as_bytes()[0],
+        jni_sig,
+        class_name,
+        field_name,
+    })
 }
 
 pub(crate) fn get_fast_method(handle: u64) -> Option<FastMethod> {
@@ -654,54 +742,77 @@ pub(crate) unsafe extern "C" fn js_java_fast_method(
         (sig_str, false)
     };
 
-    let env = match ensure_jni_initialized() {
-        Ok(e) => e,
-        Err(msg) => return throw_internal_error(ctx, msg),
-    };
-
-    let (art_method, _method_id, class_global_ref, is_static) =
-        match resolve_fast_method(env, &class_name, &method_name, &actual_sig, force_static) {
-            Ok(v) => v,
-            Err(msg) => return throw_internal_error(ctx, msg),
-        };
-
     let (should_compile, compile_kind) = match parse_fast_options(ctx, argc, argv, 3) {
         Ok(v) => v,
         Err(e) => return e,
     };
 
-    let spec = get_art_method_spec(env, art_method);
-    let bridge = find_art_bridge_functions(env, spec.entry_point_offset);
-    let mut entry_point = read_entry_point(art_method, spec.entry_point_offset);
-    if is_art_quick_entrypoint(entry_point, &bridge) && should_compile {
-        let compile = compile_art_method_to_quick(env, art_method, spec.entry_point_offset, bridge, compile_kind);
-        entry_point = compile.after;
-        crate::jsapi::console::output_verbose(&format!(
-            "[fastMethod] compile {}.{}{} kind={} success={} before={:#x} after={:#x} msg={}",
-            class_name,
-            method_name,
-            actual_sig,
-            compile.kind,
-            compile.success,
-            compile.before,
-            compile.after,
-            compile.message
-        ));
-    }
-    if is_art_quick_entrypoint(entry_point, &bridge) {
-        return throw_internal_error(
-            ctx,
-            format!(
-                "fastMethod rejected {}.{}{}: no independent quick entrypoint (entry={:#x})",
-                class_name, method_name, actual_sig, entry_point
-            ),
-        );
-    }
+    let raw_clone = crate::is_raw_clone_js_thread();
+    let (art_method, class_global_ref, class_mirror, is_static) = if raw_clone {
+        match super::callback::resolve_fast_method_via_executor(
+            class_name.clone(),
+            method_name.clone(),
+            actual_sig.clone(),
+            force_static,
+            should_compile,
+            compile_kind,
+        ) {
+            Ok((art_method, class_global_ref, class_mirror, is_static)) => {
+                (art_method, class_global_ref, class_mirror, is_static)
+            }
+            Err(msg) => return throw_internal_error(ctx, msg),
+        }
+    } else {
+        let env = match ensure_jni_initialized() {
+            Ok(e) => e,
+            Err(msg) => return throw_internal_error(ctx, msg),
+        };
+
+        let (art_method, _method_id, class_global_ref, is_static) =
+            match resolve_fast_method(env, &class_name, &method_name, &actual_sig, force_static) {
+                Ok(v) => v,
+                Err(msg) => return throw_internal_error(ctx, msg),
+            };
+
+        let spec = get_art_method_spec(env, art_method);
+        let bridge = find_art_bridge_functions(env, spec.entry_point_offset);
+        let mut entry_point = read_entry_point(art_method, spec.entry_point_offset);
+        if is_art_quick_entrypoint(entry_point, bridge) && should_compile {
+            let compile = compile_art_method_to_quick(env, art_method, spec.entry_point_offset, bridge, compile_kind);
+            entry_point = compile.after;
+            crate::jsapi::console::output_verbose(&format!(
+                "[fastMethod] compile {}.{}{} kind={} success={} before={:#x} after={:#x} msg={}",
+                class_name,
+                method_name,
+                actual_sig,
+                compile.kind,
+                compile.success,
+                compile.before,
+                compile.after,
+                compile.message
+            ));
+        }
+        if is_art_quick_entrypoint(entry_point, bridge) {
+            return throw_internal_error(
+                ctx,
+                format!(
+                    "fastMethod rejected {}.{}{}: no independent quick entrypoint (entry={:#x})",
+                    class_name, method_name, actual_sig, entry_point
+                ),
+            );
+        }
+        (
+            art_method,
+            class_global_ref,
+            super::decode_global_jobject_raw(env, class_global_ref as *mut std::ffi::c_void).unwrap_or(0),
+            is_static,
+        )
+    };
 
     let method = FastMethod {
         art_method,
         class_global_ref,
-        class_mirror: super::decode_global_jobject_raw(env, class_global_ref as *mut std::ffi::c_void).unwrap_or(0),
+        class_mirror,
         is_static,
         param_types: parse_jni_param_types(&actual_sig),
         shorty: make_shorty(&actual_sig),
@@ -736,16 +847,66 @@ pub(crate) unsafe extern "C" fn js_java_fast_constructor(
         return throw_type_error(ctx, b"constructor signature must return void\0");
     }
 
-    let env = match ensure_jni_initialized() {
-        Ok(e) => e,
-        Err(msg) => return throw_internal_error(ctx, msg),
+    let (should_compile, compile_kind) = match parse_fast_options(ctx, argc, argv, 2) {
+        Ok(v) => v,
+        Err(e) => return e,
     };
 
-    let (art_method, _method_id, class_global_ref, is_static) =
-        match resolve_fast_method(env, &class_name, "<init>", &sig_str, false) {
-            Ok(v) => v,
+    let raw_clone = crate::is_raw_clone_js_thread();
+    let (art_method, class_global_ref, class_mirror, is_static) = if raw_clone {
+        match super::callback::resolve_fast_method_via_executor(
+            class_name.clone(),
+            "<init>".to_string(),
+            sig_str.clone(),
+            false,
+            should_compile,
+            compile_kind,
+        ) {
+            Ok((art_method, class_global_ref, class_mirror, is_static)) => {
+                (art_method, class_global_ref, class_mirror, is_static)
+            }
+            Err(msg) => return throw_internal_error(ctx, msg),
+        }
+    } else {
+        let env = match ensure_jni_initialized() {
+            Ok(e) => e,
             Err(msg) => return throw_internal_error(ctx, msg),
         };
+
+        let (art_method, _method_id, class_global_ref, is_static) =
+            match resolve_fast_method(env, &class_name, "<init>", &sig_str, false) {
+                Ok(v) => v,
+                Err(msg) => return throw_internal_error(ctx, msg),
+            };
+
+        let spec = get_art_method_spec(env, art_method);
+        let bridge = find_art_bridge_functions(env, spec.entry_point_offset);
+        let mut entry_point = read_entry_point(art_method, spec.entry_point_offset);
+        if is_art_quick_entrypoint(entry_point, bridge) && should_compile {
+            let compile = compile_art_method_to_quick(env, art_method, spec.entry_point_offset, bridge, compile_kind);
+            entry_point = compile.after;
+            crate::jsapi::console::output_verbose(&format!(
+                "[fastConstructor] compile {}.<init>{} kind={} success={} before={:#x} after={:#x} msg={}",
+                class_name, sig_str, compile.kind, compile.success, compile.before, compile.after, compile.message
+            ));
+        }
+        if is_art_quick_entrypoint(entry_point, bridge) {
+            return throw_internal_error(
+                ctx,
+                format!(
+                    "fastConstructor rejected {}.<init>{}: no independent quick entrypoint (entry={:#x})",
+                    class_name, sig_str, entry_point
+                ),
+            );
+        }
+        (
+            art_method,
+            class_global_ref,
+            super::decode_global_jobject_raw(env, class_global_ref as *mut std::ffi::c_void).unwrap_or(0),
+            is_static,
+        )
+    };
+
     if is_static {
         return throw_internal_error(
             ctx,
@@ -753,33 +914,6 @@ pub(crate) unsafe extern "C" fn js_java_fast_constructor(
         );
     }
 
-    let (should_compile, compile_kind) = match parse_fast_options(ctx, argc, argv, 2) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
-
-    let spec = get_art_method_spec(env, art_method);
-    let bridge = find_art_bridge_functions(env, spec.entry_point_offset);
-    let mut entry_point = read_entry_point(art_method, spec.entry_point_offset);
-    if is_art_quick_entrypoint(entry_point, &bridge) && should_compile {
-        let compile = compile_art_method_to_quick(env, art_method, spec.entry_point_offset, bridge, compile_kind);
-        entry_point = compile.after;
-        crate::jsapi::console::output_verbose(&format!(
-            "[fastConstructor] compile {}.<init>{} kind={} success={} before={:#x} after={:#x} msg={}",
-            class_name, sig_str, compile.kind, compile.success, compile.before, compile.after, compile.message
-        ));
-    }
-    if is_art_quick_entrypoint(entry_point, &bridge) {
-        return throw_internal_error(
-            ctx,
-            format!(
-                "fastConstructor rejected {}.<init>{}: no independent quick entrypoint (entry={:#x})",
-                class_name, sig_str, entry_point
-            ),
-        );
-    }
-
-    let class_mirror = super::decode_global_jobject_raw(env, class_global_ref as *mut std::ffi::c_void).unwrap_or(0);
     output_verbose(&format!(
         "[fastConstructor] {}.<init>{} class_global={:#x} class_mirror={:#x}",
         class_name, sig_str, class_global_ref as usize, class_mirror
@@ -828,64 +962,29 @@ pub(crate) unsafe extern "C" fn js_java_fast_field(
         None
     };
 
-    let env = match ensure_jni_initialized() {
-        Ok(e) => e,
-        Err(msg) => return throw_internal_error(ctx, msg),
-    };
-    let Some(spec) = get_art_field_spec() else {
-        return throw_internal_error(ctx, "unsupported ArtField layout".to_string());
-    };
-
-    cache_fields_for_class(env, &class_name);
-    let (jni_sig, field_id, is_static) = {
-        let guard = FIELD_CACHE.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(cache) = guard.as_ref() else {
-            return throw_internal_error(ctx, format!("field cache unavailable for {}", class_name));
-        };
-        let Some(fields) = cache.get(&class_name) else {
-            return throw_internal_error(ctx, format!("fields unavailable for {}", class_name));
-        };
-        let Some(info) = fields.get(&field_name) else {
-            return throw_internal_error(ctx, format!("field not found: {}.{}", class_name, field_name));
-        };
-        (info.jni_sig.clone(), info.field_id, info.is_static)
-    };
-
-    if let Some(sig) = requested_sig.as_ref() {
-        if sig != &jni_sig {
-            return throw_type_error(ctx, b"field signature mismatch\0");
+    let field = if crate::is_raw_clone_js_thread() {
+        match super::callback::resolve_fast_field_via_executor(class_name, field_name, requested_sig) {
+            Ok(field) => field,
+            Err(msg) => return throw_internal_error(ctx, msg),
         }
-    }
-    if is_static {
-        return throw_type_error(ctx, b"fastField only supports instance fields\0");
-    }
-    if !is_fast_field_type(&jni_sig) {
-        return throw_type_error(ctx, b"fastField only supports primitive/object instance fields\0");
-    }
-
-    let cls = find_class_safe(env, &class_name);
-    if cls.is_null() {
-        return throw_internal_error(ctx, format!("class not found: {}", class_name));
-    }
-    let art_field = decode_field_id(env, cls, field_id as u64, is_static);
-    jni_check_exc(env);
-    if art_field == 0 {
-        return throw_internal_error(ctx, format!("failed to decode field id: {}.{}", class_name, field_name));
-    }
-    refresh_mem_regions();
-    let offset = safe_read_u32(art_field + spec.offset_offset as u64);
-    if offset == 0 {
-        return throw_internal_error(ctx, format!("invalid field offset: {}.{}", class_name, field_name));
-    }
-
-    let field = FastField {
-        art_field,
-        offset,
-        is_static,
-        value_type: jni_sig.as_bytes()[0],
-        jni_sig,
-        class_name,
-        field_name,
+    } else {
+        let env = match ensure_jni_initialized() {
+            Ok(e) => e,
+            Err(msg) => return throw_internal_error(ctx, msg),
+        };
+        match resolve_fast_field(env, class_name, field_name, requested_sig) {
+            Ok(field) => field,
+            Err(msg) if msg == "field signature mismatch" => {
+                return throw_type_error(ctx, b"field signature mismatch\0")
+            }
+            Err(msg) if msg == "fastField only supports instance fields" => {
+                return throw_type_error(ctx, b"fastField only supports instance fields\0")
+            }
+            Err(msg) if msg == "fastField only supports primitive/object instance fields" => {
+                return throw_type_error(ctx, b"fastField only supports primitive/object instance fields\0")
+            }
+            Err(msg) => return throw_internal_error(ctx, msg),
+        }
     };
     let mut fields = fast_fields().lock().unwrap_or_else(|e| e.into_inner());
     fields.push(field);
@@ -935,17 +1034,28 @@ pub(crate) unsafe extern "C" fn js_java_compile_method(
         RequestedCompileKind::Auto
     };
 
-    let env = match ensure_jni_initialized() {
-        Ok(e) => e,
-        Err(msg) => return throw_internal_error(ctx, msg),
+    let (art_method, result) = if crate::is_raw_clone_js_thread() {
+        match super::callback::compile_method_via_executor(class_name, method_name, actual_sig, force_static, kind) {
+            Ok(v) => v,
+            Err(msg) => return throw_internal_error(ctx, msg),
+        }
+    } else {
+        let env = match ensure_jni_initialized() {
+            Ok(e) => e,
+            Err(msg) => return throw_internal_error(ctx, msg),
+        };
+        let (art_method, _is_static) =
+            match resolve_art_method(env, &class_name, &method_name, &actual_sig, force_static) {
+                Ok(v) => v,
+                Err(msg) => return throw_internal_error(ctx, msg),
+            };
+        let spec = get_art_method_spec(env, art_method);
+        let bridge = find_art_bridge_functions(env, spec.entry_point_offset);
+        (
+            art_method,
+            compile_art_method_to_quick(env, art_method, spec.entry_point_offset, bridge, kind),
+        )
     };
-    let (art_method, _is_static) = match resolve_art_method(env, &class_name, &method_name, &actual_sig, force_static) {
-        Ok(v) => v,
-        Err(msg) => return throw_internal_error(ctx, msg),
-    };
-    let spec = get_art_method_spec(env, art_method);
-    let bridge = find_art_bridge_functions(env, spec.entry_point_offset);
-    let result = compile_art_method_to_quick(env, art_method, spec.entry_point_offset, bridge, kind);
 
     let obj = ffi::JS_NewObject(ctx);
     let obj_v = JSValue(obj);
@@ -965,6 +1075,9 @@ pub(crate) unsafe extern "C" fn js_java_jit_info(
     _argc: i32,
     _argv: *mut ffi::JSValue,
 ) -> ffi::JSValue {
+    if crate::is_raw_clone_js_thread() {
+        return super::callback::jit_info_via_executor(ctx);
+    }
     let _env = match ensure_jni_initialized() {
         Ok(e) => e,
         Err(msg) => return throw_internal_error(ctx, msg),
@@ -1239,6 +1352,10 @@ unsafe fn invoke_fast_constructor_art_ready_raw(
 
 pub(crate) unsafe fn with_fast_art_handle_scope<R>(thread: u64, f: impl FnOnce() -> R) -> R {
     FAST_ART_HANDLE_SCOPE_ENTER.fetch_add(1, Ordering::Relaxed);
+    if crate::is_raw_clone_js_thread() {
+        FAST_ART_HANDLE_SCOPE_UNAVAILABLE.fetch_add(1, Ordering::Relaxed);
+        return f();
+    }
     let env = get_thread_env().unwrap_or(std::ptr::null_mut());
     if env.is_null() {
         FAST_ART_HANDLE_SCOPE_UNAVAILABLE.fetch_add(1, Ordering::Relaxed);

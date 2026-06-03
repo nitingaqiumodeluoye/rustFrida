@@ -202,7 +202,7 @@ int hook_engine_init(void* exec_mem, size_t size) {
     g_engine.free_list = NULL;
     g_engine.redirects = NULL;
     g_engine.exec_mem_page_size = (size_t)sysconf(_SC_PAGESIZE);
-    pthread_mutex_init(&g_engine.lock, NULL);
+    hook_lock_init(&g_engine.lock);
     g_engine.initialized = 1;
 
     return 0;
@@ -222,7 +222,7 @@ HookEntry* find_hook(void* target) {
 void hook_engine_cleanup(void) {
     if (!g_engine.initialized) return;
 
-    pthread_mutex_lock(&g_engine.lock);
+    hook_lock(&g_engine.lock);
 
     /* Count hooks on both lists for diagnostics */
     int hooks_count = 0, free_count = 0, stealth_hooks = 0, stealth_free = 0;
@@ -254,9 +254,11 @@ void hook_engine_cleanup(void) {
             /* Recomp entries are discarded below with the pool. */
         } else {
             uintptr_t page_start = (uintptr_t)entry->target & ~0xFFF;
+            int first_prot = page_prot_flags(page_start);
+            int second_prot = page_prot_flags(page_start + 0x1000);
             mprotect((void*)page_start, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC);
             memcpy(entry->target, entry->original_bytes, entry->original_size);
-            restore_page_rx(page_start);
+            restore_page_prot_span(page_start, first_prot, second_prot);
             hook_flush_cache(entry->target, entry->original_size);
         }
         entry = entry->next;
@@ -299,6 +301,6 @@ void hook_engine_cleanup(void) {
     g_engine.exec_mem_used = 0;
     g_engine.initialized = 0;
 
-    pthread_mutex_unlock(&g_engine.lock);
-    pthread_mutex_destroy(&g_engine.lock);
+    hook_unlock(&g_engine.lock);
+    hook_lock_destroy(&g_engine.lock);
 }

@@ -34,11 +34,15 @@ use clap::Parser;
 use communication::send_qbdi_helper;
 use communication::{send_command, start_socketpair_handler};
 use injection::{inject_via_bootstrapper, watch_and_inject, InjectionResult};
-use process::find_pid_by_name;
+use nix::sys::ptrace;
+use nix::unistd::Pid;
+use process::{attach_to_process, call_target_function, find_pid_by_name};
 use repl::{
-    load_script_file, load_script_file_pre_resume, print_eval_result, print_help, rewrite_jseval_for_agent,
-    run_js_repl, try_jseval_on_main_thread_if_java, try_loadjs_on_main_thread_if_java,
-    try_managedcounter_on_main_thread, CommandCompleter, PreResumeLoad,
+    ensure_java_worker_ready_after_resume, load_script_file, load_script_file_pre_resume, print_eval_result,
+    print_help, rewrite_jseval_for_agent, run_js_repl, script_uses_java_api,
+    try_jseval_on_main_thread_if_java_or_dsl, try_loadjs_on_main_thread_if_java,
+    try_managedcounter_on_main_thread, CommandCompleter, PreResumeLoad, EVAL_DEFAULT_TIMEOUT_SECS,
+    EVAL_JAVA_TIMEOUT_SECS, EVAL_RECOMP_TIMEOUT_SECS, LOAD_JAVA_TIMEOUT_SECS,
 };
 use rustyline::error::ReadlineError;
 use rustyline::Editor;
@@ -47,9 +51,56 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use types::get_string_table_names;
 
+const AGENT_SHUTDOWN_WAIT_SECS: u64 = 1;
+
 fn set_current_thread_name(name: &'static [u8]) {
     unsafe {
         let _ = libc::prctl(libc::PR_SET_NAME, name.as_ptr(), 0, 0, 0);
+    }
+}
+
+fn cleanup_remote_loader_mappings(pid: i32, injection: &InjectionResult) {
+    if pid <= 0 || injection.libc_munmap == 0 {
+        return;
+    }
+    let mut ranges = Vec::new();
+    if injection.loader_stack != 0 && injection.loader_stack_size != 0 {
+        ranges.push(("loader stack", injection.loader_stack, injection.loader_stack_size));
+    }
+    if injection.loader_alloc_base != 0 && injection.loader_alloc_size != 0 {
+        ranges.push((
+            "loader mapping",
+            injection.loader_alloc_base,
+            injection.loader_alloc_size,
+        ));
+    }
+    if ranges.is_empty() {
+        return;
+    }
+    if !std::path::Path::new(&format!("/proc/{}/status", pid)).exists() {
+        return;
+    }
+
+    let tid = injection::choose_injection_thread(pid);
+    if let Err(e) = attach_to_process(tid) {
+        log_warn!("loader 残留清理跳过: attach tid={} 失败: {}", tid, e);
+        return;
+    }
+    for (label, base, size) in ranges {
+        match call_target_function(
+            tid,
+            injection.libc_munmap as usize,
+            &[base as usize, size as usize],
+            None,
+        ) {
+            Ok(ret) if ret == 0 => log_verbose!("已清理 {}: 0x{:x}+0x{:x}", label, base, size),
+            Ok(ret) => log_verbose!("清理 {} 返回 {}: 0x{:x}+0x{:x}", label, ret, base, size),
+            Err(e) => log_warn!("清理 {} 失败: {}", label, e),
+        }
+    }
+    let _ = ptrace::detach(Pid::from_raw(tid), None);
+    unsafe {
+        libc::kill(pid, libc::SIGCONT);
     }
 }
 
@@ -313,16 +364,25 @@ fn main() {
                 spawn::cleanup_zygote_patches();
                 std::process::exit(1);
             }
+            let mut deferred_pre_resume_eval = false;
             if let Some(script_path) = &args.load_script {
                 log_info!("子进程暂停中，准备加载脚本");
                 match load_script_file_pre_resume(&session, script_path) {
                     Ok(PreResumeLoad::Loaded) => {}
+                    Ok(PreResumeLoad::DeferredEval) => deferred_pre_resume_eval = true,
                     Err(e) => log_error!("{}", e),
                 }
             }
             // resume: hook 已就位，恢复子进程
             if let Err(e) = spawn::resume_child(pid as u32) {
                 log_error!("恢复子进程失败: {}", e);
+            }
+            if deferred_pre_resume_eval {
+                log_info!("子进程已恢复，等待 Java 脚本执行完成");
+                print_eval_result(&session, LOAD_JAVA_TIMEOUT_SECS);
+            }
+            if let Err(e) = ensure_java_worker_ready_after_resume(&session) {
+                log_warn!("Java worker 启动失败，后续 Java 操作将继续依赖 raw clone executor: {}", e);
             }
         }
     }
@@ -448,7 +508,7 @@ fn main() {
                         if handled {
                             Ok(true)
                         } else {
-                            try_jseval_on_main_thread_if_java(&session, &line)
+                            try_jseval_on_main_thread_if_java_or_dsl(&session, &line)
                         }
                     }) {
                     Ok(v) => v,
@@ -468,7 +528,13 @@ fn main() {
                     }
                 }
                 if is_eval_cmd {
-                    let timeout = if is_recomp { 15 } else { 5 };
+                    let timeout = if is_recomp {
+                        EVAL_RECOMP_TIMEOUT_SECS
+                    } else if script_uses_java_api(&line) {
+                        EVAL_JAVA_TIMEOUT_SECS
+                    } else {
+                        EVAL_DEFAULT_TIMEOUT_SECS
+                    };
                     print_eval_result(&session, timeout);
                 }
             }
@@ -486,23 +552,28 @@ fn main() {
 
     let _ = rl.save_history(".rustfrida_history");
 
-    // 等待 agent 完成清理并主动关闭 socket (disconnected=true)。
-    // cleanup 里 drain thunk_in_flight 可能耗时 (HashMap.put 高频场景 1~2 分钟)。
-    // 不设硬超时：agent 清理完才算真正退出，否则 munmap pool 未完成，app 仍可能崩。
-    // 每 10s 打印一次进度，用户 Ctrl-C 可随时中断。
+    // 等待 agent 完成清理并主动关闭 socket。交互路径不能无限等：
+    // 超时后直接返回，并跳过远端 loader 残留清理，避免打断仍在清理中的 agent。
     let start = std::time::Instant::now();
-    let mut next_report = std::time::Duration::from_secs(10);
-    while !session.disconnected.load(Ordering::Acquire) {
+    let shutdown_deadline = std::time::Duration::from_secs(AGENT_SHUTDOWN_WAIT_SECS);
+    while !session.disconnected.load(Ordering::Acquire) && start.elapsed() < shutdown_deadline {
         std::thread::sleep(std::time::Duration::from_millis(100));
-        let elapsed = start.elapsed();
-        if elapsed >= next_report {
-            log_info!("等待 agent 清理中... ({}s)", elapsed.as_secs());
-            next_report += std::time::Duration::from_secs(10);
-        }
     }
     let total = start.elapsed();
-    if total.as_secs() >= 10 {
+    let agent_disconnected = session.disconnected.load(Ordering::Acquire);
+    if agent_disconnected && total.as_secs() >= 1 {
         log_info!("agent 已断开 (总耗时 {}s)", total.as_secs());
+    } else if !agent_disconnected {
+        log_warn!(
+            "agent 清理等待超过 {}s，已返回交互；目标内资源保留，跳过 loader 残留清理",
+            AGENT_SHUTDOWN_WAIT_SECS
+        );
+    }
+
+    if agent_disconnected {
+        if let Some(pid) = target_pid {
+            cleanup_remote_loader_mappings(pid, &injection);
+        }
     }
 
     // Spawn 模式：agent 完整退出后再还原 Zygote patch，避免两个清理流程交错。

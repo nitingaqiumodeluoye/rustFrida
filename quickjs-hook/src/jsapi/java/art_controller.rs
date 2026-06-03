@@ -193,6 +193,17 @@ pub(super) fn art_controller_initialized() -> bool {
     ART_CONTROLLER.lock().unwrap_or_else(|e| e.into_inner()).is_some()
 }
 
+fn maybe_install_raw_clone_executor_loop_hook(env: *mut std::ffi::c_void) {
+    if env.is_null() && !crate::is_raw_clone_js_thread() {
+        return;
+    }
+
+    let installed = unsafe { super::callback::install_raw_clone_executor_loop_hook(env as JniEnv) };
+    if installed {
+        output_verbose("[artController] raw clone executor MessageQueue hook ready");
+    }
+}
+
 /// stealth2 slot 模式 trampoline 修复：hook engine 从 slot 读到的是清零字节，
 /// 自动生成的 trampoline 无法 call original。用 recomp 页被覆盖的真正原始指令重建。
 /// 非 recomp 模式或无 slot 记录时静默返回。
@@ -530,16 +541,22 @@ pub(super) fn ensure_art_controller_initialized(
 ) {
     let mut controller = ART_CONTROLLER.lock().unwrap_or_else(|e| e.into_inner());
     if controller.is_some() {
+        drop(controller);
+        maybe_install_raw_clone_executor_loop_hook(env);
         return;
     }
 
     output_verbose("[artController] 开始安装三层拦截矩阵...");
 
     // 提前探测 ArtThreadSpec (递归防护 stack check 需要)
-    if let Some(spec) = get_art_thread_spec(env as JniEnv) {
-        unsafe {
-            install_managed_implicit_suspend_guard(spec);
+    if !env.is_null() {
+        if let Some(spec) = get_art_thread_spec(env as JniEnv) {
+            unsafe {
+                install_managed_implicit_suspend_guard(spec);
+            }
         }
+    } else {
+        output_verbose("[artController] raw/no-env init: skip ArtThreadSpec probe");
     }
     let _ = get_managed_stack_spec();
 
@@ -912,6 +929,8 @@ pub(super) fn ensure_art_controller_initialized(
         pretty_method_hook_target,
         decode_gc_masks_hook_target,
     });
+    drop(controller);
+    maybe_install_raw_clone_executor_loop_hook(env);
 }
 
 // ============================================================================
@@ -1032,6 +1051,12 @@ unsafe extern "C" fn on_do_call_enter(ctx_ptr: *mut hook_ffi::HookContext, _user
     let ctx = &mut *ctx_ptr;
     let method = ctx.x[0];
     DO_CALL_COUNT.fetch_add(1, Ordering::Relaxed);
+    if let Ok(env) = super::jni_core::get_thread_env() {
+        let drained = super::callback::drain_raw_clone_executor(env);
+        if drained != 0 {
+            output_verbose(&format!("[java executor] DoCall drained {} raw-clone task(s)", drained));
+        }
+    }
     if hook_ffi::hook_managed_reentry_guard_active() != 0 {
         ctx.intercept_leave = 0;
         return;
@@ -1043,12 +1068,11 @@ unsafe extern "C" fn on_do_call_enter(ctx_ptr: *mut hook_ffi::HookContext, _user
 
     if let Some(replacement) = get_replacement_method(method) {
         DO_CALL_HIT_COUNT.fetch_add(1, Ordering::Relaxed);
-        // 递归防护: TLS bypass (callOriginal) + managed stack check
-        ensure_bypass_key();
+        // 递归防护: per-thread bypass (callOriginal) + managed stack check
         if hook_ffi::orig_bypass_consume_current_thread(method) != 0 {
             return; // managed helper orig() bypass — one-shot, let original DoCall run
         }
-        let bypass = libc::pthread_getspecific(BYPASS_KEY) as u64;
+        let bypass = current_call_original_bypass();
         if bypass == method {
             return; // callOriginal bypass — 仍走 tail-jump (intercept_leave=0)
         }
@@ -1157,51 +1181,95 @@ unsafe fn should_replace_for_stack(replacement: u64) -> bool {
 }
 
 // ============================================================================
-// callOriginal bypass — TLS 标记防止 art_router 递归
+// callOriginal bypass — per-thread atomic stack, no libc pthread TLS
 // ============================================================================
 
-static BYPASS_KEY_INIT: std::sync::Once = std::sync::Once::new();
-static mut BYPASS_KEY: libc::pthread_key_t = 0;
+const BYPASS_THREAD_SLOTS: usize = 64;
+const BYPASS_STACK_DEPTH: usize = 8;
 
-/// TLS bypass 栈析构函数：释放 Vec<u64> 堆内存
-unsafe extern "C" fn bypass_stack_destructor(ptr: *mut std::ffi::c_void) {
-    if !ptr.is_null() {
-        let _ = Box::from_raw(ptr as *mut Vec<u64>);
+static BYPASS_THREAD_IDS: [AtomicU64; BYPASS_THREAD_SLOTS] = [const { AtomicU64::new(0) }; BYPASS_THREAD_SLOTS];
+static BYPASS_DEPTHS: [AtomicUsize; BYPASS_THREAD_SLOTS] = [const { AtomicUsize::new(0) }; BYPASS_THREAD_SLOTS];
+static BYPASS_VALUES: [[AtomicU64; BYPASS_STACK_DEPTH]; BYPASS_THREAD_SLOTS] =
+    [const { [const { AtomicU64::new(0) }; BYPASS_STACK_DEPTH] }; BYPASS_THREAD_SLOTS];
+
+fn bypass_slot_for_current_thread(allocate: bool) -> Option<usize> {
+    let id = crate::current_thread_id_u64();
+    for i in 0..BYPASS_THREAD_SLOTS {
+        if BYPASS_THREAD_IDS[i].load(Ordering::Acquire) == id {
+            return Some(i);
+        }
     }
+    if !allocate {
+        return None;
+    }
+    for i in 0..BYPASS_THREAD_SLOTS {
+        if BYPASS_THREAD_IDS[i]
+            .compare_exchange(0, id, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            BYPASS_DEPTHS[i].store(0, Ordering::Release);
+            return Some(i);
+        }
+    }
+    None
 }
 
-fn ensure_bypass_key() {
-    BYPASS_KEY_INIT.call_once(|| unsafe {
-        libc::pthread_key_create(&mut BYPASS_KEY as *mut _, Some(bypass_stack_destructor));
-    });
+fn current_call_original_bypass() -> u64 {
+    let Some(slot) = bypass_slot_for_current_thread(false) else {
+        return 0;
+    };
+    let depth = BYPASS_DEPTHS[slot].load(Ordering::Acquire);
+    if depth == 0 {
+        return 0;
+    }
+    let idx = (depth - 1).min(BYPASS_STACK_DEPTH - 1);
+    BYPASS_VALUES[slot][idx].load(Ordering::Acquire)
 }
 
-/// 获取当前线程的 bypass 栈（惰性创建）
-unsafe fn get_bypass_stack() -> &'static mut Vec<u64> {
-    ensure_bypass_key();
-    let ptr = libc::pthread_getspecific(BYPASS_KEY) as *mut Vec<u64>;
-    if ptr.is_null() {
-        let stack = Box::new(Vec::<u64>::with_capacity(4));
-        let raw = Box::into_raw(stack);
-        libc::pthread_setspecific(BYPASS_KEY, raw as *const _);
-        &mut *raw
-    } else {
-        &mut *ptr
+fn call_original_bypass_contains(method: u64) -> bool {
+    if method == 0 {
+        return false;
     }
+    let Some(slot) = bypass_slot_for_current_thread(false) else {
+        return false;
+    };
+    let depth = BYPASS_DEPTHS[slot].load(Ordering::Acquire).min(BYPASS_STACK_DEPTH);
+    for i in 0..depth {
+        if BYPASS_VALUES[slot][i].load(Ordering::Acquire) == method {
+            return true;
+        }
+    }
+    false
 }
 
 /// callOriginal 前调用：将 original ArtMethod 地址 push 到 bypass 栈
 /// 支持嵌套：callback skip fallback 期间内层方法也可能 skip 并调用 invoke_original_jni
 pub(crate) fn set_call_original_bypass(art_method: u64) {
-    unsafe {
-        get_bypass_stack().push(art_method);
+    let Some(slot) = bypass_slot_for_current_thread(true) else {
+        return;
+    };
+    let depth = BYPASS_DEPTHS[slot].load(Ordering::Acquire);
+    let idx = depth.min(BYPASS_STACK_DEPTH - 1);
+    BYPASS_VALUES[slot][idx].store(art_method, Ordering::Release);
+    if depth < BYPASS_STACK_DEPTH {
+        BYPASS_DEPTHS[slot].store(depth + 1, Ordering::Release);
     }
 }
 
 /// callOriginal 后调用：从 bypass 栈 pop（恢复外层 bypass）
 pub(crate) fn clear_call_original_bypass() {
-    unsafe {
-        get_bypass_stack().pop();
+    let Some(slot) = bypass_slot_for_current_thread(false) else {
+        return;
+    };
+    let depth = BYPASS_DEPTHS[slot].load(Ordering::Acquire);
+    if depth == 0 {
+        return;
+    }
+    let next = depth - 1;
+    BYPASS_VALUES[slot][next.min(BYPASS_STACK_DEPTH - 1)].store(0, Ordering::Release);
+    BYPASS_DEPTHS[slot].store(next, Ordering::Release);
+    if next == 0 {
+        BYPASS_THREAD_IDS[slot].store(0, Ordering::Release);
     }
 }
 
@@ -1225,13 +1293,8 @@ pub unsafe extern "C" fn art_router_stack_check(replacement: u64) -> i32 {
     }
     let original_for_quick = hook_ffi::hook_art_router_table_lookup_original(replacement);
     if original_for_quick != 0 && crate::fast_hook::is_fast_hook(original_for_quick) {
-        let stack = get_bypass_stack();
-        if !stack.is_empty() {
-            for &bypassed in stack.iter() {
-                if bypassed == original_for_quick {
-                    return 0;
-                }
-            }
+        if call_original_bypass_contains(original_for_quick) {
+            return 0;
         }
         return if should_replace_for_stack(replacement) { 1 } else { 0 };
     }
@@ -1268,17 +1331,10 @@ pub unsafe extern "C" fn art_router_stack_check(replacement: u64) -> i32 {
         }
     }
 
-    // TLS bypass 栈: 检查栈中是否有任何一个 entry 匹配当前 replacement 的 original
-    let stack = get_bypass_stack();
-    if !stack.is_empty() {
-        let original = hook_ffi::hook_art_router_table_lookup_original(replacement);
-        if original != 0 {
-            for &bypassed in stack.iter() {
-                if bypassed == original {
-                    return 0; // callOriginal bypass
-                }
-            }
-        }
+    // Per-thread bypass stack: 检查栈中是否有 entry 匹配当前 replacement 的 original
+    let original = hook_ffi::hook_art_router_table_lookup_original(replacement);
+    if call_original_bypass_contains(original) {
+        return 0; // callOriginal bypass
     }
 
     // Fallback: managed stack check (对标 Frida, 覆盖其他递归场景)
@@ -2095,6 +2151,8 @@ pub(crate) unsafe fn refresh_walkstack_sigsegv_guard() {
 /// 刻意不动 OAT header / PrettyMethod / 内联 OAT patch 等 walkstack 防护 ——
 /// 它们要在 drain=0 之后、pool munmap 之前才 cut (见 cut_art_controller_walkstack_guards)。
 pub fn cut_art_controller_routing_hooks() {
+    super::callback::cut_raw_clone_executor_loop_hook();
+
     let targets: Vec<(&'static str, u64)> = {
         let guard = ART_CONTROLLER.lock().unwrap_or_else(|e| e.into_inner());
         let state = match guard.as_ref() {

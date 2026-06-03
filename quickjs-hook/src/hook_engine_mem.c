@@ -35,6 +35,29 @@ int page_has_read_perm(uintptr_t addr) {
     return readable;
 }
 
+int page_prot_flags(uintptr_t addr) {
+    FILE* f = fopen("/proc/self/maps", "r");
+    if (!f) return PROT_READ | PROT_EXEC;
+
+    char line[512];
+    int prot = PROT_READ | PROT_EXEC;
+    while (fgets(line, sizeof(line), f)) {
+        uintptr_t start = 0, end = 0;
+        char perms[8] = "";
+        if (sscanf(line, "%lx-%lx %7s", &start, &end, perms) >= 3) {
+            if (addr >= start && addr < end) {
+                prot = 0;
+                if (perms[0] == 'r') prot |= PROT_READ;
+                if (perms[1] == 'w') prot |= PROT_WRITE;
+                if (perms[2] == 'x') prot |= PROT_EXEC;
+                break;
+            }
+        }
+    }
+    fclose(f);
+    return prot;
+}
+
 /*
  * Safely read bytes from a target address.
  *
@@ -76,6 +99,18 @@ void restore_page_rx(uintptr_t page_start) {
         mprotect((void*)page_start, 0x1000, PROT_READ | PROT_EXEC);
         mprotect((void*)(page_start + 0x1000), 0x1000, PROT_READ | PROT_EXEC);
     }
+}
+
+void restore_page_prot_span(uintptr_t page_start, int first_prot, int second_prot) {
+    if (first_prot == 0) first_prot = PROT_READ | PROT_EXEC;
+    if (second_prot == 0) second_prot = PROT_READ | PROT_EXEC;
+    if (first_prot == second_prot) {
+        if (mprotect((void*)page_start, 0x2000, first_prot) == 0) {
+            return;
+        }
+    }
+    mprotect((void*)page_start, 0x1000, first_prot);
+    mprotect((void*)(page_start + 0x1000), 0x1000, second_prot);
 }
 
 /* --- Entry free list management --- */
@@ -1252,6 +1287,8 @@ int patch_target(void* target, void* jump_dest, int stealth, HookEntry* entry) {
 
     /* Fallback: mprotect + direct write */
     uintptr_t page_start = (uintptr_t)target & ~0xFFF;
+    int first_prot = page_prot_flags(page_start);
+    int second_prot = page_prot_flags(page_start + 0x1000);
     if (mprotect((void*)page_start, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
         hook_log("[patch_target] mprotect(RWX) %p failed errno=%d(%s)",
                  (void*)page_start, errno, strerror(errno));
@@ -1259,12 +1296,12 @@ int patch_target(void* target, void* jump_dest, int stealth, HookEntry* entry) {
     }
     jump_result = hook_write_jump(target, jump_dest);
     if (jump_result < 0) {
-        restore_page_rx(page_start);
+        restore_page_prot_span(page_start, first_prot, second_prot);
         return jump_result;
     }
     entry->stealth = 0;
     entry->original_size = jump_result;
-    restore_page_rx(page_start);
+    restore_page_prot_span(page_start, first_prot, second_prot);
 
     return 0;
 }
@@ -1343,4 +1380,3 @@ void hook_diag_alloc_near(void* target) {
                  (i >= prev_pool_count) ? " ★NEW" : "");
     }
 }
-

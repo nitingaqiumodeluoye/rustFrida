@@ -155,10 +155,12 @@ typedef struct {
   const char * agent_current_thread_eval;
 
   /* Runtime state (filled by loader) */
-  pthread_t worker;
+  uintptr_t worker;
   void * agent_handle;
   void * agent_entrypoint_impl;
   void * agent_current_thread_eval_impl;
+  void * loader_stack;
+  size_t loader_stack_size;
 } RustFridaLoaderContext;
 
 /*
@@ -235,6 +237,7 @@ static void rustfrida_set_error (RustFridaLinkedModule * module, const FridaLibc
 static void rustfrida_set_symbol_error (RustFridaLinkedModule * module, const FridaLibcApi * libc, const char * prefix, const char * name);
 static void rustfrida_get_fd_vma_name (int fd, char * name, size_t name_size, const FridaLibcApi * libc);
 static void rustfrida_set_vma_name (ElfW(Addr) address, size_t size, const char * name);
+static bool rustfrida_address_is_executable (ElfW(Addr) address);
 
 static void frida_main_raw (void * user_data);
 static void * frida_raw_mmap (void * addr, size_t length, int prot, int flags, int fd, off_t offset);
@@ -247,10 +250,16 @@ static ssize_t frida_raw_send (int sockfd, const void * buf, size_t len, int fla
 static int frida_raw_fcntl (int fd, int cmd, size_t arg);
 
 static size_t frida_strlen (const char * str);
+static int frida_strcmp (const char * a, const char * b);
 static bool frida_streq (const char * a, const char * b);
 static bool frida_str_has_suffix (const char * str, const char * suffix);
 static void * frida_memcpy (void * dst, const void * src, size_t n);
+static void * frida_memmove (void * dst, const void * src, size_t n);
 static void * frida_memset (void * dst, int c, size_t n);
+static int frida_memcmp (const void * a, const void * b, size_t n);
+static void * frida_memchr (const void * s, int c, size_t n);
+static char * frida_strchr (const char * s, int c);
+static bool rustfrida_resolve_builtin_symbol (const char * name, ElfW(Addr) * value);
 
 static pid_t frida_gettid (void);
 
@@ -271,10 +280,12 @@ frida_load (RustFridaLoaderContext * ctx)
   if (stack == MAP_FAILED)
     return;
 
+  ctx->loader_stack = stack;
+  ctx->loader_stack_size = stack_size;
   stack_top = (void *) (((uintptr_t) stack + stack_size) & ~(uintptr_t) 15);
   tid = frida_clone_thread (flags, stack_top, frida_main_raw, ctx);
   if (tid > 0)
-    ctx->worker = (pthread_t) (uintptr_t) tid;
+    ctx->worker = (uintptr_t) tid;
 }
 
 static void
@@ -475,6 +486,8 @@ rustfrida_export_module_init (ElfW(Addr) candidate_base, RustFridaExportModule *
   ElfW(Addr) load_bias = candidate_base;
   ElfW(Dyn) * dynamic = NULL;
   ElfW(Dyn) * dyn;
+  bool has_exec_load = false;
+  bool exec_load_is_mapped = false;
 
   if (!rustfrida_is_valid_elf (ehdr))
     return false;
@@ -495,12 +508,21 @@ rustfrida_export_module_init (ElfW(Addr) candidate_base, RustFridaExportModule *
   {
     ElfW(Phdr) * phdr = &phdrs[i];
 
+    if (phdr->p_type == PT_LOAD && (phdr->p_flags & PF_X) != 0 && phdr->p_memsz != 0)
+    {
+      has_exec_load = true;
+      if (rustfrida_address_is_executable (load_bias + phdr->p_vaddr))
+        exec_load_is_mapped = true;
+    }
+
     if (phdr->p_type == PT_DYNAMIC)
     {
       dynamic = (ElfW(Dyn) *) (load_bias + phdr->p_vaddr);
-      break;
     }
   }
+
+  if (has_exec_load && !exec_load_is_mapped)
+    return false;
 
   if (dynamic == NULL)
     return false;
@@ -549,6 +571,81 @@ rustfrida_export_module_init (ElfW(Addr) candidate_base, RustFridaExportModule *
   }
 
   return module->nsyms != 0;
+}
+
+static bool
+rustfrida_address_is_executable (ElfW(Addr) address)
+{
+  static const char maps_path[] = "/proc/self/maps";
+  char buffer[8192];
+  char line[512];
+  size_t line_len = 0;
+  int fd;
+  ssize_t n;
+  bool result = false;
+
+  fd = frida_syscall_4 (__NR_openat, AT_FDCWD, (size_t) maps_path, O_RDONLY, 0);
+  if (fd < 0)
+    return false;
+
+  while (!result && (n = frida_syscall_3 (__NR_read, fd, (size_t) buffer, sizeof (buffer))) > 0)
+  {
+    ssize_t i;
+
+    for (i = 0; i != n; i++)
+    {
+      char ch = buffer[i];
+
+      if (ch == '\n' || line_len == sizeof (line) - 1)
+      {
+        ElfW(Addr) start;
+        ElfW(Addr) end;
+        const char * cursor;
+
+        line[line_len] = '\0';
+        line_len = 0;
+
+        cursor = rustfrida_parse_hex (line, &start);
+        if (cursor == NULL || *cursor != '-')
+          continue;
+        cursor++;
+        cursor = rustfrida_parse_hex (cursor, &end);
+        if (cursor == NULL || address < start || address >= end)
+          continue;
+
+        cursor = rustfrida_skip_spaces (cursor);
+        result = cursor[2] == 'x';
+        break;
+      }
+      else
+      {
+        line[line_len++] = ch;
+      }
+    }
+  }
+
+  if (!result && line_len != 0)
+  {
+    ElfW(Addr) start;
+    ElfW(Addr) end;
+    const char * cursor;
+
+    line[line_len] = '\0';
+    cursor = rustfrida_parse_hex (line, &start);
+    if (cursor != NULL && *cursor == '-')
+    {
+      cursor++;
+      cursor = rustfrida_parse_hex (cursor, &end);
+      if (cursor != NULL && address >= start && address < end)
+      {
+        cursor = rustfrida_skip_spaces (cursor);
+        result = cursor[2] == 'x';
+      }
+    }
+  }
+
+  frida_syscall_1 (__NR_close, fd);
+  return result;
 }
 
 static bool
@@ -710,7 +807,13 @@ rustfrida_resolver_lookup (const RustFridaSymbolResolver * resolver, const char 
         ElfW(Addr) resolved = (sym->st_shndx == SHN_ABS) ? sym->st_value : module->base + sym->st_value;
 
         if (type == STT_GNU_IFUNC)
+        {
+          if (!rustfrida_address_is_executable (resolved))
+            continue;
           resolved = ((ElfW(Addr) (*) (void)) resolved) ();
+          if (resolved == 0 || !rustfrida_address_is_executable (resolved))
+            continue;
+        }
         *value = resolved;
         return true;
       }
@@ -848,6 +951,8 @@ rustfrida_resolve_symbol (RustFridaLinkedModule * module, size_t sym_index, cons
 
   name = module->strtab + sym->st_name;
   bind = ELF64_ST_BIND (sym->st_info);
+  if (rustfrida_resolve_builtin_symbol (name, value))
+    return true;
   if (rustfrida_resolver_lookup (&module->resolver, name, value))
     return true;
 
@@ -1184,11 +1289,6 @@ rustfrida_link_agent (int fd, const FridaLibcApi * libc, RustFridaLinkedModule *
       goto fail;
     }
 
-    /*
-     * The host pads the memfd so the file covers each LOAD segment's full
-     * p_memsz. Mapping the complete segment from that fd avoids separate
-     * anonymous BSS VMAs, which hardened apps may flag as synthetic ELF tails.
-     */
     {
       void * mapped = frida_raw_mmap ((void *) target, map_size, prot,
           MAP_PRIVATE | MAP_FIXED, fd, file_page_start);
@@ -1757,6 +1857,18 @@ frida_strlen (const char * str)
   return n;
 }
 
+static int
+frida_strcmp (const char * a, const char * b)
+{
+  while (*a != '\0' && *a == *b)
+  {
+    a++;
+    b++;
+  }
+
+  return ((unsigned char) *a) - ((unsigned char) *b);
+}
+
 static bool
 frida_streq (const char * a, const char * b)
 {
@@ -1807,6 +1919,37 @@ frida_memcpy (void * dst, const void * src, size_t n)
 }
 
 static void *
+frida_memmove (void * dst, const void * src, size_t n)
+{
+  uint8_t * d = dst;
+  const uint8_t * s = src;
+
+  if (d == s || n == 0)
+    return dst;
+
+  if (d < s)
+  {
+    while (n != 0)
+    {
+      *d++ = *s++;
+      n--;
+    }
+  }
+  else
+  {
+    d += n;
+    s += n;
+    while (n != 0)
+    {
+      *--d = *--s;
+      n--;
+    }
+  }
+
+  return dst;
+}
+
+static void *
 frida_memset (void * dst, int c, size_t n)
 {
   uint8_t * d = dst;
@@ -1818,6 +1961,81 @@ frida_memset (void * dst, int c, size_t n)
   }
 
   return dst;
+}
+
+static int
+frida_memcmp (const void * a, const void * b, size_t n)
+{
+  const uint8_t * ap = a;
+  const uint8_t * bp = b;
+
+  while (n != 0)
+  {
+    if (*ap != *bp)
+      return ((int) *ap) - ((int) *bp);
+    ap++;
+    bp++;
+    n--;
+  }
+
+  return 0;
+}
+
+static void *
+frida_memchr (const void * s, int c, size_t n)
+{
+  const uint8_t * cursor = s;
+  uint8_t needle = (uint8_t) c;
+
+  while (n != 0)
+  {
+    if (*cursor == needle)
+      return (void *) cursor;
+    cursor++;
+    n--;
+  }
+
+  return NULL;
+}
+
+static char *
+frida_strchr (const char * s, int c)
+{
+  char needle = (char) c;
+
+  for (;;)
+  {
+    if (*s == needle)
+      return (char *) s;
+    if (*s == '\0')
+      return NULL;
+    s++;
+  }
+}
+
+static bool
+rustfrida_resolve_builtin_symbol (const char * name, ElfW(Addr) * value)
+{
+  if (frida_streq (name, "memcpy"))
+    *value = (ElfW(Addr)) (uintptr_t) frida_memcpy;
+  else if (frida_streq (name, "memmove"))
+    *value = (ElfW(Addr)) (uintptr_t) frida_memmove;
+  else if (frida_streq (name, "memset"))
+    *value = (ElfW(Addr)) (uintptr_t) frida_memset;
+  else if (frida_streq (name, "memcmp"))
+    *value = (ElfW(Addr)) (uintptr_t) frida_memcmp;
+  else if (frida_streq (name, "memchr"))
+    *value = (ElfW(Addr)) (uintptr_t) frida_memchr;
+  else if (frida_streq (name, "strlen"))
+    *value = (ElfW(Addr)) (uintptr_t) frida_strlen;
+  else if (frida_streq (name, "strcmp"))
+    *value = (ElfW(Addr)) (uintptr_t) frida_strcmp;
+  else if (frida_streq (name, "strchr"))
+    *value = (ElfW(Addr)) (uintptr_t) frida_strchr;
+  else
+    return false;
+
+  return true;
 }
 
 static pid_t

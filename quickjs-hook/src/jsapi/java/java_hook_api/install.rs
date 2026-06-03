@@ -115,14 +115,31 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook(
         (sig_str.clone(), false)
     };
 
-    let env = match ensure_jni_initialized() {
-        Ok(e) => e,
-        Err(msg) => return throw_internal_error(ctx, msg),
+    let raw_clone = crate::is_raw_clone_js_thread();
+    let env = if raw_clone {
+        std::ptr::null_mut()
+    } else {
+        match ensure_jni_initialized() {
+            Ok(e) => e,
+            Err(msg) => return throw_internal_error(ctx, msg),
+        }
     };
 
-    let (art_method, is_static) = match resolve_art_method(env, &class_name, &method_name, &actual_sig, force_static) {
-        Ok(r) => r,
-        Err(msg) => return throw_internal_error(ctx, msg),
+    let (art_method, is_static) = if raw_clone {
+        match resolve_method_via_executor(
+            class_name.clone(),
+            method_name.clone(),
+            actual_sig.clone(),
+            force_static,
+        ) {
+            Ok(r) => r,
+            Err(msg) => return throw_internal_error(ctx, msg),
+        }
+    } else {
+        match resolve_art_method(env, &class_name, &method_name, &actual_sig, force_static) {
+            Ok(r) => r,
+            Err(msg) => return throw_internal_error(ctx, msg),
+        }
     };
 
     init_java_registry();
@@ -268,45 +285,7 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook(
     // B1: 确保 artController 已初始化 (Layer 1 + Layer 2 全局 hook)
     ensure_art_controller_initialized(&bridge, ep_offset, env as *mut std::ffi::c_void);
 
-    // B2: 注册 replacement 到 replacedMethods 映射 (art_router 查表用)
-    set_replacement_method(art_method, replacement_addr as u64);
-    install_guard.set_replacement_registered();
-
-    // B3: 修改原始 ArtMethod flags (对标 Frida android.js:3732-3741)
-    // 不设 kAccNative! 仅 deopt + 清除快速路径标志
-    update_original_method_flags_for_hook(art_method, spec.access_flags_offset, original_access_flags);
-    install_guard.set_original_method_mutated();
-
-    // B4: nterp → interpreter_bridge 降级 (对标 Frida android.js:3747-3750)
-    if bridge.nterp_entry_point != 0 && original_entry_point == bridge.nterp_entry_point {
-        let interp_bridge = bridge.quick_to_interpreter_bridge;
-        if interp_bridge != 0 {
-            std::ptr::write_volatile((art_method as usize + ep_offset) as *mut u64, interp_bridge);
-            hook_ffi::hook_flush_cache((art_method as usize + ep_offset) as *mut std::ffi::c_void, 8);
-            output_verbose(&format!(
-                "[java hook] nterp → interpreter_bridge: {:#x} → {:#x}",
-                original_entry_point, interp_bridge
-            ));
-        }
-    }
-
-    // B5: Layer 3 per-method router hook (对标 Frida ArtQuickCodeInterceptor)
-    let (per_method_hook_target, quick_trampoline, use_blr, _router_thunk_body) = match install_per_method_router_hook(
-        has_independent_code,
-        original_entry_point,
-        &bridge,
-        ep_offset,
-        env,
-        art_method,
-        force_standalone_stub,
-        enable_fast_orig,
-    ) {
-        Ok(v) => v,
-        Err(msg) => return throw_internal_error(ctx, msg),
-    };
-
     let callback_bytes = dup_callback_to_bytes(ctx, callback_arg.raw());
-
     with_registry_mut(&JAVA_HOOK_REGISTRY, |registry| {
         registry.insert(
             art_method,
@@ -317,7 +296,7 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook(
                 original_data,
                 hook_type: HookType::Replaced {
                     replacement_addr,
-                    per_method_hook_target,
+                    per_method_hook_target: None,
                 },
                 clone_addr,
                 class_global_ref,
@@ -330,14 +309,71 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook(
                 param_count,
                 param_types: param_types.clone(),
                 class_name: class_name.clone(),
-                quick_trampoline,
-                use_blr,
+                quick_trampoline: 0,
+                use_blr: false,
                 native_entry_hook_target: 0,
                 native_entry_trampoline: 0,
                 native_entry_critical: false,
             },
         );
     });
+
+    // B2: nterp → interpreter_bridge 降级 (对标 Frida android.js:3747-3750)
+    if bridge.nterp_entry_point != 0 && original_entry_point == bridge.nterp_entry_point {
+        let interp_bridge = bridge.quick_to_interpreter_bridge;
+        if interp_bridge != 0 {
+            std::ptr::write_volatile((art_method as usize + ep_offset) as *mut u64, interp_bridge);
+            hook_ffi::hook_flush_cache((art_method as usize + ep_offset) as *mut std::ffi::c_void, 8);
+            output_verbose(&format!(
+                "[java hook] nterp → interpreter_bridge: {:#x} → {:#x}",
+                original_entry_point, interp_bridge
+            ));
+        }
+    }
+
+    // B3: Layer 3 per-method router hook (对标 Frida ArtQuickCodeInterceptor)。
+    // 此时 replacement 尚未加入 art_router 表；若其他线程打到 quickCode，会继续走原始方法，
+    // 避免热点方法在半安装窗口进入 JS callback。
+    let (per_method_hook_target, quick_trampoline, use_blr, _router_thunk_body) = match install_per_method_router_hook(
+        has_independent_code,
+        original_entry_point,
+        &bridge,
+        ep_offset,
+        env,
+        art_method,
+        force_standalone_stub,
+        enable_fast_orig,
+    ) {
+        Ok(v) => v,
+        Err(msg) => {
+            if let Some(removed) =
+                with_registry_mut(&JAVA_HOOK_REGISTRY, |registry| registry.remove(&art_method)).flatten()
+            {
+                free_callback_bytes(ctx, removed.callback_bytes);
+            }
+            return throw_internal_error(ctx, msg);
+        }
+    };
+
+    with_registry_mut(&JAVA_HOOK_REGISTRY, |registry| {
+        if let Some(hook_data) = registry.get_mut(&art_method) {
+            hook_data.hook_type = HookType::Replaced {
+                replacement_addr,
+                per_method_hook_target,
+            };
+            hook_data.quick_trampoline = quick_trampoline;
+            hook_data.use_blr = use_blr;
+        }
+    });
+
+    // B4: 注册 replacement 到 replacedMethods 映射 (art_router 查表用)
+    set_replacement_method(art_method, replacement_addr as u64);
+    install_guard.set_replacement_registered();
+
+    // B5: 修改原始 ArtMethod flags (对标 Frida android.js:3732-3741)
+    // 不设 kAccNative! 仅 deopt + 清除快速路径标志。放到最后，避免半安装状态暴露给其他线程。
+    update_original_method_flags_for_hook(art_method, spec.access_flags_offset, original_access_flags);
+    install_guard.set_original_method_mutated();
 
     if (original_access_flags & K_ACC_NATIVE) != 0
         && original_data != 0
@@ -395,9 +431,18 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook(
         ));
     }
 
-    cache_fields_for_class(env, &class_name);
+    if crate::is_raw_clone_js_thread() {
+        output_verbose(&format!(
+            "[java hook] raw clone: skip post-install field cache for {}",
+            class_name
+        ));
+    } else {
+        cache_fields_for_class(env, &class_name);
+    }
 
-    let strategy = if has_independent_code {
+    let strategy = if has_independent_code && quick_trampoline == 0 && per_method_hook_target.is_some() {
+        "compiled+entry_stub"
+    } else if has_independent_code {
         "compiled+router"
     } else {
         "shared_stub"
@@ -468,14 +513,31 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook_quick(
         (sig_str.clone(), false)
     };
 
-    let env = match ensure_jni_initialized() {
-        Ok(e) => e,
-        Err(msg) => return throw_internal_error(ctx, msg),
+    let raw_clone = crate::is_raw_clone_js_thread();
+    let env = if raw_clone {
+        std::ptr::null_mut()
+    } else {
+        match ensure_jni_initialized() {
+            Ok(e) => e,
+            Err(msg) => return throw_internal_error(ctx, msg),
+        }
     };
 
-    let (art_method, is_static) = match resolve_art_method(env, &class_name, &method_name, &actual_sig, force_static) {
-        Ok(r) => r,
-        Err(msg) => return throw_internal_error(ctx, msg),
+    let (art_method, is_static) = if raw_clone {
+        match resolve_method_via_executor(
+            class_name.clone(),
+            method_name.clone(),
+            actual_sig.clone(),
+            force_static,
+        ) {
+            Ok(r) => r,
+            Err(msg) => return throw_internal_error(ctx, msg),
+        }
+    } else {
+        match resolve_art_method(env, &class_name, &method_name, &actual_sig, force_static) {
+            Ok(r) => r,
+            Err(msg) => return throw_internal_error(ctx, msg),
+        }
     };
 
     init_java_registry();

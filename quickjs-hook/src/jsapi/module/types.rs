@@ -147,8 +147,8 @@ struct UnrestrictedLinkerApi {
     ) -> *mut std::ffi::c_void,
     /// Trusted caller address (linker64 内部地址，dlopen_addr)
     trusted_caller: *const std::ffi::c_void,
-    /// dl_mutex — __dl__ZL10g_dl_mutex
-    dl_mutex: *mut libc::pthread_mutex_t,
+    /// dl_mutex address, kept only for diagnostics. We never call pthread mutex APIs.
+    dl_mutex: *mut std::ffi::c_void,
     /// solist_get_head() — __dl__Z15solist_get_headv
     solist_get_head: Option<unsafe extern "C" fn() -> *mut std::ffi::c_void>,
     /// solist global variable (fallback) — __dl__ZL6solist

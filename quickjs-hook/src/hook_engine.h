@@ -10,7 +10,6 @@
 
 #include <stdint.h>
 #include <stddef.h>
-#include <pthread.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -75,6 +74,10 @@ typedef struct HookRedirectEntry {
 #define EXEC_POOL_SIZE (64 * 1024)  /* 每个 pool 64KB */
 
 typedef struct {
+    volatile int state;             /* 0=unlocked, 1=locked */
+} HookLock;
+
+typedef struct {
     void* base;
     size_t size;
     size_t used;
@@ -90,7 +93,7 @@ typedef struct {
     HookEntry* hooks;               /* Linked list of hooks */
     HookEntry* free_list;           /* Freed entries for reuse */
     HookRedirectEntry* redirects;   /* Linked list of redirect hooks */
-    pthread_mutex_t lock;           /* Thread safety lock */
+    HookLock lock;                  /* Thread safety lock without libc pthread */
     size_t exec_mem_page_size;      /* Page size for mprotect */
     int initialized;                /* Initialization flag */
 } HookEngine;
@@ -543,6 +546,14 @@ void* hook_install_count_orig_router(void* target,
                                      void** out_hooked_target,
                                      volatile uint64_t** counters,
                                      uint32_t counter_count);
+
+/*
+ * Create a standalone count+orig stub for methods whose entry_point_ is a
+ * shared ART bridge and therefore cannot be safely inline-patched.
+ */
+void* hook_create_count_orig_stub(uint64_t fallback_target,
+                                  volatile uint64_t** counters,
+                                  uint32_t counter_count);
 
 void* hook_install_managed_direct_entrypoint(void* target,
                                              void* jni_env,

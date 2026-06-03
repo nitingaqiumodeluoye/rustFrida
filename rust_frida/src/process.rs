@@ -69,7 +69,7 @@ fn find_map_line_for_addr(pid: i32, addr: u64) -> Option<String> {
 
 /// 解冻 cgroup v2 freezer（Android 12+ 会冻结后台进程）
 /// 冻结状态下 ptrace attach 的 SIGSTOP 无法送达，waitpid 会永远阻塞。
-fn thaw_cgroup_freezer(pid: i32) {
+pub(crate) fn thaw_cgroup_freezer(pid: i32) {
     // cgroup v2 freezer 路径格式：/sys/fs/cgroup/<slice>/uid_<uid>/pid_<pid>/cgroup.freeze
     let cgroup_path = format!("/proc/{}/cgroup", pid);
     let content = match std::fs::read_to_string(&cgroup_path) {
@@ -92,11 +92,30 @@ fn thaw_cgroup_freezer(pid: i32) {
     }
 }
 
+pub(crate) fn read_tracer_pid(pid: i32) -> Option<i32> {
+    let status = std::fs::read_to_string(format!("/proc/{}/status", pid)).ok()?;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("TracerPid:") {
+            return rest.trim().parse::<i32>().ok();
+        }
+    }
+    None
+}
+
 pub(crate) fn attach_to_process(pid: i32) -> Result<(), String> {
     let target_pid = Pid::from_raw(pid);
 
     // 解冻 cgroup freezer（Android 12+ 后台进程可能被冻结）
     thaw_cgroup_freezer(pid);
+
+    if let Some(tracer_pid) = read_tracer_pid(pid) {
+        if tracer_pid != 0 {
+            return Err(format!(
+                "目标线程 {} 已被 ptrace 占用 (TracerPid={})，无法二次 attach",
+                pid, tracer_pid
+            ));
+        }
+    }
 
     // 尝试附加到目标进程
     match ptrace::attach(target_pid) {
@@ -112,11 +131,16 @@ pub(crate) fn attach_to_process(pid: i32) -> Result<(), String> {
         }
         Err(errno) => {
             let err_msg = match errno {
-                Errno::EPERM => "权限不足，请使用root权限运行",
-                Errno::ESRCH => "目标进程不存在",
-                _ => "附加失败，未知错误",
+                Errno::EPERM => format!(
+                    "ptrace attach({}) EPERM: 权限不足、目标已被保护或被 tracer 占用 (euid={}, TracerPid={:?})",
+                    pid,
+                    unsafe { libc::geteuid() },
+                    read_tracer_pid(pid)
+                ),
+                Errno::ESRCH => "目标进程不存在".to_string(),
+                _ => format!("附加失败: {}", errno),
             };
-            Err(err_msg.to_string())
+            Err(err_msg)
         }
     }
 }
@@ -220,6 +244,23 @@ fn set_fp_registers(pid: i32, regs: &UserFpRegs) -> Result<(), String> {
     Ok(())
 }
 
+fn restore_remote_call_registers(pid: i32, regs: &UserRegs, fp_regs: Option<&UserFpRegs>) -> Result<(), String> {
+    set_registers(pid, regs)?;
+    if let Some(fp) = fp_regs {
+        if let Err(e) = set_fp_registers(pid, fp) {
+            log_warn!("恢复 FP/SIMD 寄存器失败: {}", e);
+        }
+    }
+    Ok(())
+}
+
+fn append_restore_status(message: String, restore_result: Result<(), String>) -> String {
+    match restore_result {
+        Ok(()) => message,
+        Err(e) => format!("{}；恢复原始寄存器失败: {}", message, e),
+    }
+}
+
 /// 调用目标进程的 libc 函数
 ///
 /// # 参数
@@ -293,13 +334,23 @@ pub(crate) fn call_target_function(
         let result = unsafe { libc::ptrace(PTRACE_CONT as c_int, pid as pid_t, 0, 0) };
 
         if result == -1 {
-            return Err(format!("继续执行失败，错误码: {}", unsafe {
-                *libc::__errno()
-            }));
+            let errno = unsafe { *libc::__errno() };
+            let restore_result = restore_remote_call_registers(pid, &orig_regs, orig_fp_regs.as_ref());
+            return Err(append_restore_status(
+                format!("继续执行失败，错误码: {}", errno),
+                restore_result,
+            ));
         }
 
         // 等待进程停止（可能收到其他线程的信号，需要过滤）
-        match waitpid(target_pid, None).map_err(|e| format!("等待进程失败: {}", e))? {
+        let wait_status = match waitpid(target_pid, None) {
+            Ok(status) => status,
+            Err(e) => {
+                let restore_result = restore_remote_call_registers(pid, &orig_regs, orig_fp_regs.as_ref());
+                return Err(append_restore_status(format!("等待进程失败: {}", e), restore_result));
+            }
+        };
+        match wait_status {
             WaitStatus::Stopped(stopped_pid, Signal::SIGSEGV) if stopped_pid.as_raw() != pid => {
                 // 其他线程的 SIGSEGV，转发信号并继续等待
                 log_warn!("其他线程 {} 收到 SIGSEGV，转发并继续", stopped_pid);
@@ -321,10 +372,7 @@ pub(crate) fn call_target_function(
                     let return_value = regs.regs[0] as usize;
 
                     // 恢复原始寄存器状态（GP + FP/SIMD）
-                    set_registers(pid, &orig_regs)?;
-                    if let Some(ref fp) = orig_fp_regs {
-                        let _ = set_fp_registers(pid, fp);
-                    }
+                    restore_remote_call_registers(pid, &orig_regs, orig_fp_regs.as_ref())?;
 
                     // 验证恢复后的寄存器
                     let verify = get_registers(pid)?;
@@ -348,7 +396,7 @@ pub(crate) fn call_target_function(
                         find_map_line_for_addr(pid, regs.pc).unwrap_or_else(|| "<unknown mapping>".to_string());
                     let lr_map =
                         find_map_line_for_addr(pid, regs.regs[30]).unwrap_or_else(|| "<unknown mapping>".to_string());
-                    return Err(format!(
+                    let message = format!(
                         concat!(
                             "函数执行异常，",
                             "PC=0x{:x} [{}], ",
@@ -371,7 +419,9 @@ pub(crate) fn call_target_function(
                         regs.regs[21],
                         regs.regs[22],
                         regs.regs[29]
-                    ));
+                    );
+                    let restore_result = restore_remote_call_registers(pid, &orig_regs, orig_fp_regs.as_ref());
+                    return Err(append_restore_status(message, restore_result));
                 }
             }
             WaitStatus::Stopped(_, Signal::SIGSTOP) => {
@@ -380,7 +430,11 @@ pub(crate) fn call_target_function(
                     log_warn!("检测到 pending SIGSTOP (第{}次)，跳过并重试", attempt + 1);
                     continue;
                 } else {
-                    return Err("多次 SIGSTOP 中断，无法执行目标函数".to_string());
+                    let restore_result = restore_remote_call_registers(pid, &orig_regs, orig_fp_regs.as_ref());
+                    return Err(append_restore_status(
+                        "多次 SIGSTOP 中断，无法执行目标函数".to_string(),
+                        restore_result,
+                    ));
                 }
             }
             WaitStatus::Stopped(_, Signal::SIGCHLD) => {
@@ -394,12 +448,26 @@ pub(crate) fn call_target_function(
                 } else {
                     "regs unavailable".into()
                 };
-                return Err(format!("进程异常停止: {:?} {}", sig, info));
+                let restore_result = restore_remote_call_registers(pid, &orig_regs, orig_fp_regs.as_ref());
+                return Err(append_restore_status(
+                    format!("进程异常停止: {:?} {}", sig, info),
+                    restore_result,
+                ));
             }
-            status => return Err(format!("进程异常停止: {:?}", status)),
+            status => {
+                let restore_result = restore_remote_call_registers(pid, &orig_regs, orig_fp_regs.as_ref());
+                return Err(append_restore_status(
+                    format!("进程异常停止: {:?}", status),
+                    restore_result,
+                ));
+            }
         }
     }
-    Err("call_target_function: 超出重试次数".to_string())
+    let restore_result = restore_remote_call_registers(pid, &orig_regs, orig_fp_regs.as_ref());
+    Err(append_restore_status(
+        "call_target_function: 超出重试次数".to_string(),
+        restore_result,
+    ))
 }
 
 /// 向远程进程内存写入任意类型的数据

@@ -22,20 +22,7 @@ struct FastHookInvokeBypass {
 }
 
 impl FastHookInvokeBypass {
-    unsafe fn for_method(env: JniEnv, cls: *mut std::ffi::c_void, method_id: *mut std::ffi::c_void, is_static: bool) -> Self {
-        if method_id.is_null() {
-            return Self {
-                active: false,
-                c_thread_id: 0,
-                c_active: false,
-            };
-        }
-        let raw_method_id = method_id as u64;
-        let art_method = if fast_hook_invoke_meta(raw_method_id).is_some() {
-            raw_method_id
-        } else {
-            decode_method_id(env, cls, raw_method_id, is_static)
-        };
+    unsafe fn for_art_method(art_method: u64) -> Self {
         if let Some((quick_trampoline, _use_blr)) = fast_hook_invoke_meta(art_method) {
             crate::jsapi::java::art_controller::set_call_original_bypass(art_method);
             let c_thread_id = crate::current_thread_id_u64();
@@ -57,6 +44,23 @@ impl FastHookInvokeBypass {
             c_active: false,
         }
     }
+
+    unsafe fn for_method(env: JniEnv, cls: *mut std::ffi::c_void, method_id: *mut std::ffi::c_void, is_static: bool) -> Self {
+        if method_id.is_null() {
+            return Self {
+                active: false,
+                c_thread_id: 0,
+                c_active: false,
+            };
+        }
+        let raw_method_id = method_id as u64;
+        let art_method = if fast_hook_invoke_meta(raw_method_id).is_some() {
+            raw_method_id
+        } else {
+            decode_method_id(env, cls, raw_method_id, is_static)
+        };
+        Self::for_art_method(art_method)
+    }
 }
 
 impl Drop for FastHookInvokeBypass {
@@ -69,6 +73,20 @@ impl Drop for FastHookInvokeBypass {
             }
             crate::jsapi::java::art_controller::clear_call_original_bypass();
         }
+    }
+}
+
+#[inline]
+unsafe fn jni_check_if_safe(env: JniEnv) -> bool {
+    !crate::is_raw_clone_js_thread() && jni_check_exc(env)
+}
+
+#[inline]
+unsafe fn take_jni_exception_if_safe(env: JniEnv) -> Option<String> {
+    if crate::is_raw_clone_js_thread() {
+        None
+    } else {
+        jni_take_exception(env)
     }
 }
 
@@ -94,6 +112,7 @@ pub(super) unsafe extern "C" fn js_java_invoke_method(
         Ok(ptr) => ptr,
         Err(err) => return err,
     };
+    let obj_is_global = read_invoke_target_is_global(ctx, obj_arg);
     let class_name = match read_string_arg(
         ctx,
         class_arg,
@@ -132,6 +151,18 @@ pub(super) unsafe extern "C" fn js_java_invoke_method(
     let return_type = get_return_type_from_sig(&method_sig);
     let return_type_sig = get_return_type_sig(&method_sig);
 
+    let raw_clone = crate::is_raw_clone_js_thread();
+    if raw_clone {
+        return invoke_instance_via_executor(
+            ctx,
+            obj_ptr,
+            obj_is_global,
+            class_name,
+            method_name,
+            method_sig,
+            argv,
+        );
+    }
     // Get JNIEnv* for current thread
     let env = match get_thread_env() {
         Ok(e) => e,
@@ -140,14 +171,21 @@ pub(super) unsafe extern "C" fn js_java_invoke_method(
     let registered_target = registered_invoke_target_for_key(&class_name, &method_name, &method_sig, false);
     let delete_local_ref: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
     let new_local_ref: NewLocalRefFn = jni_fn!(env, NewLocalRefFn, JNI_NEW_LOCAL_REF);
+    let raw_resolved_art_method = None;
 
     // Resolve declaring class
-    let cls = if let Some((_, class_global_ref)) = registered_target {
-        new_local_ref(env, class_global_ref as *mut std::ffi::c_void)
+    let cls = if let Some(art_method) = raw_resolved_art_method {
+        local_class_ref_for_art_method(env, art_method)
+    } else if let Some((art_method, class_global_ref)) = registered_target {
+        if class_global_ref != 0 {
+            new_local_ref(env, class_global_ref as *mut std::ffi::c_void)
+        } else {
+            local_class_ref_for_art_method(env, art_method)
+        }
     } else {
         find_class_safe(env, &class_name)
     };
-    if cls.is_null() || jni_check_exc(env) {
+    if cls.is_null() || jni_check_if_safe(env) {
         return js_throw_internal_error(
             ctx,
             format!("Java._invokeMethod: FindClass('{}') failed", class_name),
@@ -155,9 +193,17 @@ pub(super) unsafe extern "C" fn js_java_invoke_method(
     }
 
     // Wrap raw mirror pointer as a proper local ref
-    let local_obj = new_local_ref(env, obj_ptr as *mut std::ffi::c_void);
-    if local_obj.is_null() || jni_check_exc(env) {
-        delete_local_ref(env, cls);
+    let local_obj = if raw_clone {
+        raw_mirror_to_local_ref(env, obj_ptr)
+    } else {
+        new_local_ref(env, obj_ptr as *mut std::ffi::c_void)
+    };
+    if local_obj.is_null() || jni_check_if_safe(env) {
+        if raw_clone {
+            raw_delete_local_ref(env, cls);
+        } else {
+            delete_local_ref(env, cls);
+        }
         return js_throw_internal_error(ctx, "Java._invokeMethod: NewLocalRef failed for objPtr");
     }
 
@@ -188,12 +234,14 @@ pub(super) unsafe extern "C" fn js_java_invoke_method(
         }
     };
 
-    let mid = if let Some((art_method, _)) = registered_target {
+    let mid = if let Some(art_method) = raw_resolved_art_method {
+        art_method as *mut std::ffi::c_void
+    } else if let Some((art_method, _)) = registered_target {
         art_method as *mut std::ffi::c_void
     } else {
         get_mid(env, cls, c_name.as_ptr(), c_sig.as_ptr())
     };
-    if mid.is_null() || jni_check_exc(env) {
+    if mid.is_null() || jni_check_if_safe(env) {
         return cleanup_and_throw_internal(
             ctx,
             env,
@@ -205,7 +253,11 @@ pub(super) unsafe extern "C" fn js_java_invoke_method(
             ),
         );
     }
-    let _fast_hook_bypass = FastHookInvokeBypass::for_method(env, cls, mid, false);
+    let _fast_hook_bypass = if raw_clone {
+        FastHookInvokeBypass::for_art_method(mid as u64)
+    } else {
+        FastHookInvokeBypass::for_method(env, cls, mid, false)
+    };
 
     // Build jvalue args from JS values
     let jargs = build_invoke_jargs(ctx, env, argv, &param_types);
@@ -233,7 +285,7 @@ pub(super) unsafe extern "C" fn js_java_invoke_method(
             );
             let f: F = jni_fn!(env, F, JNI_CALL_NONVIRTUAL_VOID_METHOD_A);
             f(env, local_obj, cls, mid, jargs_ptr);
-            if let Some(exc_msg) = jni_take_exception(env) {
+            if let Some(exc_msg) = take_jni_exception_if_safe(env) {
                 return cleanup_and_throw_internal(
                     ctx,
                     env,
@@ -254,7 +306,7 @@ pub(super) unsafe extern "C" fn js_java_invoke_method(
             ) -> u8;
             let f: F = jni_fn!(env, F, JNI_CALL_NONVIRTUAL_BOOLEAN_METHOD_A);
             let ret = f(env, local_obj, cls, mid, jargs_ptr);
-            if let Some(exc_msg) = jni_take_exception(env) {
+            if let Some(exc_msg) = take_jni_exception_if_safe(env) {
                 return cleanup_and_throw_internal(
                     ctx,
                     env,
@@ -275,7 +327,7 @@ pub(super) unsafe extern "C" fn js_java_invoke_method(
             ) -> i32;
             let f: F = jni_fn!(env, F, JNI_CALL_NONVIRTUAL_INT_METHOD_A);
             let ret = f(env, local_obj, cls, mid, jargs_ptr);
-            if let Some(exc_msg) = jni_take_exception(env) {
+            if let Some(exc_msg) = take_jni_exception_if_safe(env) {
                 return cleanup_and_throw_internal(
                     ctx,
                     env,
@@ -305,7 +357,7 @@ pub(super) unsafe extern "C" fn js_java_invoke_method(
             ) -> i64;
             let f: F = jni_fn!(env, F, JNI_CALL_NONVIRTUAL_LONG_METHOD_A);
             let ret = f(env, local_obj, cls, mid, jargs_ptr);
-            if let Some(exc_msg) = jni_take_exception(env) {
+            if let Some(exc_msg) = take_jni_exception_if_safe(env) {
                 return cleanup_and_throw_internal(
                     ctx,
                     env,
@@ -326,7 +378,7 @@ pub(super) unsafe extern "C" fn js_java_invoke_method(
             ) -> f32;
             let f: F = jni_fn!(env, F, JNI_CALL_NONVIRTUAL_FLOAT_METHOD_A);
             let ret = f(env, local_obj, cls, mid, jargs_ptr);
-            if let Some(exc_msg) = jni_take_exception(env) {
+            if let Some(exc_msg) = take_jni_exception_if_safe(env) {
                 return cleanup_and_throw_internal(
                     ctx,
                     env,
@@ -347,7 +399,7 @@ pub(super) unsafe extern "C" fn js_java_invoke_method(
             ) -> f64;
             let f: F = jni_fn!(env, F, JNI_CALL_NONVIRTUAL_DOUBLE_METHOD_A);
             let ret = f(env, local_obj, cls, mid, jargs_ptr);
-            if let Some(exc_msg) = jni_take_exception(env) {
+            if let Some(exc_msg) = take_jni_exception_if_safe(env) {
                 return cleanup_and_throw_internal(
                     ctx,
                     env,
@@ -369,7 +421,7 @@ pub(super) unsafe extern "C" fn js_java_invoke_method(
             ) -> *mut std::ffi::c_void;
             let f: F = jni_fn!(env, F, JNI_CALL_NONVIRTUAL_OBJECT_METHOD_A);
             let obj = f(env, local_obj, cls, mid, jargs_ptr);
-            if let Some(exc_msg) = jni_take_exception(env) {
+            if let Some(exc_msg) = take_jni_exception_if_safe(env) {
                 if !obj.is_null() {
                     delete_local_ref(env, obj);
                 }
@@ -459,19 +511,29 @@ pub(super) unsafe extern "C" fn js_java_invoke_static_method(
     let return_type = get_return_type_from_sig(&method_sig);
     let return_type_sig = get_return_type_sig(&method_sig);
 
+    let raw_clone = crate::is_raw_clone_js_thread();
+    if raw_clone {
+        return invoke_static_via_executor(ctx, class_name, method_name, method_sig, argv);
+    }
     let env = match get_thread_env() {
         Ok(e) => e,
         Err(msg) => return js_throw_internal_error(ctx, msg),
     };
-
     let registered_target = registered_invoke_target_for_key(&class_name, &method_name, &method_sig, true);
     let new_local_ref: NewLocalRefFn = jni_fn!(env, NewLocalRefFn, JNI_NEW_LOCAL_REF);
-    let cls = if let Some((_, class_global_ref)) = registered_target {
-        new_local_ref(env, class_global_ref as *mut std::ffi::c_void)
+    let raw_resolved_art_method = None;
+    let cls = if let Some(art_method) = raw_resolved_art_method {
+        local_class_ref_for_art_method(env, art_method)
+    } else if let Some((art_method, class_global_ref)) = registered_target {
+        if class_global_ref != 0 {
+            new_local_ref(env, class_global_ref as *mut std::ffi::c_void)
+        } else {
+            local_class_ref_for_art_method(env, art_method)
+        }
     } else {
         find_class_safe(env, &class_name)
     };
-    if cls.is_null() || jni_check_exc(env) {
+    if cls.is_null() || jni_check_if_safe(env) {
         return js_throw_internal_error(
             ctx,
             format!("Java._invokeStaticMethod: FindClass('{}') failed", class_name),
@@ -504,12 +566,14 @@ pub(super) unsafe extern "C" fn js_java_invoke_static_method(
         }
     };
 
-    let mid = if let Some((art_method, _)) = registered_target {
+    let mid = if let Some(art_method) = raw_resolved_art_method {
+        art_method as *mut std::ffi::c_void
+    } else if let Some((art_method, _)) = registered_target {
         art_method as *mut std::ffi::c_void
     } else {
         get_mid(env, cls, c_name.as_ptr(), c_sig.as_ptr())
     };
-    if mid.is_null() || jni_check_exc(env) {
+    if mid.is_null() || jni_check_if_safe(env) {
         return cleanup_and_throw_internal(
             ctx,
             env,
@@ -521,7 +585,11 @@ pub(super) unsafe extern "C" fn js_java_invoke_static_method(
             ),
         );
     }
-    let _fast_hook_bypass = FastHookInvokeBypass::for_method(env, cls, mid, true);
+    let _fast_hook_bypass = if raw_clone {
+        FastHookInvokeBypass::for_art_method(mid as u64)
+    } else {
+        FastHookInvokeBypass::for_method(env, cls, mid, true)
+    };
 
     let jargs = build_jargs_from_argv(ctx, env, argv, 3, &param_types);
     let jargs_ptr = if param_count > 0 {
@@ -546,7 +614,7 @@ pub(super) unsafe extern "C" fn js_java_invoke_static_method(
             );
             let f: F = jni_fn!(env, F, JNI_CALL_STATIC_VOID_METHOD_A);
             f(env, cls, mid, jargs_ptr);
-            if let Some(exc_msg) = jni_take_exception(env) {
+            if let Some(exc_msg) = take_jni_exception_if_safe(env) {
                 return cleanup_and_throw_internal(
                     ctx,
                     env,
@@ -576,7 +644,7 @@ pub(super) unsafe extern "C" fn js_java_invoke_static_method(
             ) -> i8;
             let f: F = jni_fn!(env, F, JNI_CALL_STATIC_BYTE_METHOD_A);
             let ret = f(env, cls, mid, jargs_ptr);
-            if let Some(exc_msg) = jni_take_exception(env) {
+            if let Some(exc_msg) = take_jni_exception_if_safe(env) {
                 return cleanup_and_throw_internal(
                     ctx,
                     env,
@@ -596,7 +664,7 @@ pub(super) unsafe extern "C" fn js_java_invoke_static_method(
             ) -> u16;
             let f: F = jni_fn!(env, F, JNI_CALL_STATIC_CHAR_METHOD_A);
             let ret = f(env, cls, mid, jargs_ptr);
-            if let Some(exc_msg) = jni_take_exception(env) {
+            if let Some(exc_msg) = take_jni_exception_if_safe(env) {
                 return cleanup_and_throw_internal(
                     ctx,
                     env,
@@ -617,7 +685,7 @@ pub(super) unsafe extern "C" fn js_java_invoke_static_method(
             ) -> i16;
             let f: F = jni_fn!(env, F, JNI_CALL_STATIC_SHORT_METHOD_A);
             let ret = f(env, cls, mid, jargs_ptr);
-            if let Some(exc_msg) = jni_take_exception(env) {
+            if let Some(exc_msg) = take_jni_exception_if_safe(env) {
                 return cleanup_and_throw_internal(
                     ctx,
                     env,
@@ -637,7 +705,7 @@ pub(super) unsafe extern "C" fn js_java_invoke_static_method(
             ) -> i32;
             let f: F = jni_fn!(env, F, JNI_CALL_STATIC_INT_METHOD_A);
             let ret = f(env, cls, mid, jargs_ptr);
-            if let Some(exc_msg) = jni_take_exception(env) {
+            if let Some(exc_msg) = take_jni_exception_if_safe(env) {
                 return cleanup_and_throw_internal(
                     ctx,
                     env,
@@ -657,7 +725,7 @@ pub(super) unsafe extern "C" fn js_java_invoke_static_method(
             ) -> i64;
             let f: F = jni_fn!(env, F, JNI_CALL_STATIC_LONG_METHOD_A);
             let ret = f(env, cls, mid, jargs_ptr);
-            if let Some(exc_msg) = jni_take_exception(env) {
+            if let Some(exc_msg) = take_jni_exception_if_safe(env) {
                 return cleanup_and_throw_internal(
                     ctx,
                     env,
@@ -677,7 +745,7 @@ pub(super) unsafe extern "C" fn js_java_invoke_static_method(
             ) -> f32;
             let f: F = jni_fn!(env, F, JNI_CALL_STATIC_FLOAT_METHOD_A);
             let ret = f(env, cls, mid, jargs_ptr);
-            if let Some(exc_msg) = jni_take_exception(env) {
+            if let Some(exc_msg) = take_jni_exception_if_safe(env) {
                 return cleanup_and_throw_internal(
                     ctx,
                     env,
@@ -697,7 +765,7 @@ pub(super) unsafe extern "C" fn js_java_invoke_static_method(
             ) -> f64;
             let f: F = jni_fn!(env, F, JNI_CALL_STATIC_DOUBLE_METHOD_A);
             let ret = f(env, cls, mid, jargs_ptr);
-            if let Some(exc_msg) = jni_take_exception(env) {
+            if let Some(exc_msg) = take_jni_exception_if_safe(env) {
                 return cleanup_and_throw_internal(
                     ctx,
                     env,
@@ -717,7 +785,7 @@ pub(super) unsafe extern "C" fn js_java_invoke_static_method(
             ) -> *mut std::ffi::c_void;
             let f: F = jni_fn!(env, F, JNI_CALL_STATIC_OBJECT_METHOD_A);
             let obj = f(env, cls, mid, jargs_ptr);
-            if let Some(exc_msg) = jni_take_exception(env) {
+            if let Some(exc_msg) = take_jni_exception_if_safe(env) {
                 if !obj.is_null() {
                     let delete_local_ref: DeleteLocalRefFn =
                         jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
@@ -748,7 +816,7 @@ pub(super) unsafe extern "C" fn js_java_invoke_static_method(
     };
 
     if matches!(return_type, b'Z' | b'B' | b'C' | b'S' | b'I' | b'J' | b'F' | b'D')
-        && jni_check_exc(env)
+        && jni_check_if_safe(env)
     {
         return cleanup_and_throw_internal(ctx, env, std::ptr::null_mut(), cls, invoke_exception());
     }
@@ -817,19 +885,29 @@ pub(super) unsafe extern "C" fn js_java_new_object(
         );
     }
 
+    let raw_clone = crate::is_raw_clone_js_thread();
+    if raw_clone {
+        return new_object_via_executor(ctx, class_name, ctor_sig, argv);
+    }
     let env = match get_thread_env() {
         Ok(e) => e,
         Err(msg) => return js_throw_internal_error(ctx, msg),
     };
-
     let registered_target = registered_invoke_target_for_key(&class_name, "<init>", &ctor_sig, false);
     let new_local_ref: NewLocalRefFn = jni_fn!(env, NewLocalRefFn, JNI_NEW_LOCAL_REF);
-    let cls = if let Some((_, class_global_ref)) = registered_target {
-        new_local_ref(env, class_global_ref as *mut std::ffi::c_void)
+    let raw_resolved_art_method = None;
+    let cls = if let Some(art_method) = raw_resolved_art_method {
+        local_class_ref_for_art_method(env, art_method)
+    } else if let Some((art_method, class_global_ref)) = registered_target {
+        if class_global_ref != 0 {
+            new_local_ref(env, class_global_ref as *mut std::ffi::c_void)
+        } else {
+            local_class_ref_for_art_method(env, art_method)
+        }
     } else {
         find_class_safe(env, &class_name)
     };
-    if cls.is_null() || jni_check_exc(env) {
+    if cls.is_null() || jni_check_if_safe(env) {
         return js_throw_internal_error(
             ctx,
             format!("Java._newObject: FindClass('{}') failed", class_name),
@@ -853,12 +931,14 @@ pub(super) unsafe extern "C" fn js_java_new_object(
         }
     };
 
-    let mid = if let Some((art_method, _)) = registered_target {
+    let mid = if let Some(art_method) = raw_resolved_art_method {
+        art_method as *mut std::ffi::c_void
+    } else if let Some((art_method, _)) = registered_target {
         art_method as *mut std::ffi::c_void
     } else {
         get_mid(env, cls, c_ctor_name.as_ptr(), c_sig.as_ptr())
     };
-    if mid.is_null() || jni_check_exc(env) {
+    if mid.is_null() || jni_check_if_safe(env) {
         return cleanup_and_throw_internal(
             ctx,
             env,
@@ -867,7 +947,11 @@ pub(super) unsafe extern "C" fn js_java_new_object(
             format!("Java._newObject: GetMethodID failed: {}.<init>{}", class_name, ctor_sig),
         );
     }
-    let _fast_hook_bypass = FastHookInvokeBypass::for_method(env, cls, mid, false);
+    let _fast_hook_bypass = if raw_clone {
+        FastHookInvokeBypass::for_art_method(mid as u64)
+    } else {
+        FastHookInvokeBypass::for_method(env, cls, mid, false)
+    };
 
     let jargs = build_jargs_from_argv(ctx, env, argv, 2, &param_types);
     let jargs_ptr = if param_count > 0 {
@@ -877,7 +961,7 @@ pub(super) unsafe extern "C" fn js_java_new_object(
     };
 
     let obj = new_object_a(env, cls, mid, jargs_ptr);
-    if obj.is_null() || jni_check_exc(env) {
+    if obj.is_null() || jni_check_if_safe(env) {
         return cleanup_and_throw_internal(
             ctx,
             env,
