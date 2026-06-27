@@ -46,6 +46,13 @@
 - 工作分支：`master`
 - 远程：`origin https://github.com/nitingaqiumodeluoye/rustFrida.git`
 
+## 提交结果
+
+- 新提交：`d389820 quickjs-hook: force minimal wxshadow replace thunk diagnosis`
+- 提交内容只包含：
+  - `quickjs-hook/src/hook_engine_inline.c`
+  - `doc/wxshadow-min-thunk-diagnosis-2026-06-27.md`
+
 ## 后续验证点
 
 服务器基于本次提交重新编译后，需要重点确认：
