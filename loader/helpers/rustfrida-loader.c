@@ -87,6 +87,24 @@
 #ifndef R_AARCH64_RELATIVE
 # define R_AARCH64_RELATIVE 1027
 #endif
+#ifndef DT_RELRSZ
+# define DT_RELRSZ 35
+#endif
+#ifndef DT_RELR
+# define DT_RELR 36
+#endif
+#ifndef DT_RELRENT
+# define DT_RELRENT 37
+#endif
+#ifndef DT_ANDROID_RELR
+# define DT_ANDROID_RELR 0x6fffe000
+#endif
+#ifndef DT_ANDROID_RELRSZ
+# define DT_ANDROID_RELRSZ 0x6fffe001
+#endif
+#ifndef DT_ANDROID_RELRENT
+# define DT_ANDROID_RELRENT 0x6fffe003
+#endif
 #ifndef STT_GNU_IFUNC
 # define STT_GNU_IFUNC 10
 #endif
@@ -242,6 +260,8 @@ static void rustfrida_set_symbol_error (RustFridaLinkedModule * module, const Fr
 static void rustfrida_get_fd_vma_name (int fd, char * name, size_t name_size, const FridaLibcApi * libc);
 static void rustfrida_set_vma_name (ElfW(Addr) address, size_t size, const char * name);
 static bool rustfrida_address_is_executable (ElfW(Addr) address);
+static bool rustfrida_apply_relr_relocations (RustFridaLinkedModule * module, ElfW(Addr) * relr,
+    size_t relrsz, size_t relrent, const FridaLibcApi * libc);
 
 static void frida_main_raw (void * user_data);
 static void * frida_raw_mmap (void * addr, size_t length, int prot, int flags, int fd, off_t offset);
@@ -1026,6 +1046,61 @@ rustfrida_apply_relocations (RustFridaLinkedModule * module, ElfW(Rela) * rela, 
 }
 
 static bool
+rustfrida_apply_relr_relocations (RustFridaLinkedModule * module, ElfW(Addr) * relr,
+    size_t relrsz, size_t relrent, const FridaLibcApi * libc)
+{
+  size_t count, i;
+  ElfW(Addr) offset = 0;
+  const size_t bitmap_bits = (sizeof (ElfW(Addr)) * 8) - 1;
+
+  if (relr == NULL || relrsz == 0)
+    return true;
+
+  if (relrent != 0 && relrent != sizeof (ElfW(Addr)))
+  {
+    rustfrida_set_error (module, libc, "unsupported RELR entry size");
+    return false;
+  }
+  if ((relrsz % sizeof (ElfW(Addr))) != 0)
+  {
+    rustfrida_set_error (module, libc, "corrupt RELR table size");
+    return false;
+  }
+
+  count = relrsz / sizeof (ElfW(Addr));
+  for (i = 0; i != count; i++)
+  {
+    ElfW(Addr) entry = relr[i];
+
+    if ((entry & 1) == 0)
+    {
+      ElfW(Addr) * target = (ElfW(Addr) *) (module->base + entry);
+      *target += module->base;
+      offset = entry + sizeof (ElfW(Addr));
+      continue;
+    }
+
+    {
+      ElfW(Addr) bitmap = entry >> 1;
+      size_t bit;
+
+      for (bit = 0; bit != bitmap_bits; bit++)
+      {
+        if ((bitmap & (((ElfW(Addr)) 1) << bit)) != 0)
+        {
+          ElfW(Addr) * target = (ElfW(Addr) *) (module->base + offset + (bit * sizeof (ElfW(Addr))));
+          *target += module->base;
+        }
+      }
+    }
+
+    offset += bitmap_bits * sizeof (ElfW(Addr));
+  }
+
+  return true;
+}
+
+static bool
 rustfrida_protect_relro (RustFridaLinkedModule * module, const FridaLibcApi * libc)
 {
   ElfW(Half) i;
@@ -1207,6 +1282,9 @@ rustfrida_link_agent (int fd, const FridaLibcApi * libc, RustFridaLinkedModule *
   ElfW(Half) i;
   ElfW(Rela) * rela = NULL;
   size_t relasz = 0;
+  ElfW(Addr) * relr = NULL;
+  size_t relrsz = 0;
+  size_t relrent = 0;
   ElfW(Rela) * jmprel = NULL;
   size_t pltrelsz = 0;
   ElfW(Dyn) * dyn;
@@ -1374,6 +1452,18 @@ rustfrida_link_agent (int fd, const FridaLibcApi * libc, RustFridaLinkedModule *
       case DT_RELASZ:
         relasz = dyn->d_un.d_val;
         break;
+      case DT_RELR:
+      case DT_ANDROID_RELR:
+        relr = (ElfW(Addr) *) (module->base + dyn->d_un.d_ptr);
+        break;
+      case DT_RELRSZ:
+      case DT_ANDROID_RELRSZ:
+        relrsz = dyn->d_un.d_val;
+        break;
+      case DT_RELRENT:
+      case DT_ANDROID_RELRENT:
+        relrent = dyn->d_un.d_val;
+        break;
       case DT_JMPREL:
         jmprel = (ElfW(Rela) *) (module->base + dyn->d_un.d_ptr);
         break;
@@ -1395,6 +1485,10 @@ rustfrida_link_agent (int fd, const FridaLibcApi * libc, RustFridaLinkedModule *
   if (rela != NULL && !rustfrida_apply_relocations (module, rela, relasz, libc))
     goto fail;
   frida_send_log (diagfd, "link: rela applied", libc);
+  if (relr != NULL && !rustfrida_apply_relr_relocations (module, relr, relrsz, relrent, libc))
+    goto fail;
+  if (relr != NULL)
+    frida_send_log (diagfd, "link: relr applied", libc);
   if (jmprel != NULL && !rustfrida_apply_relocations (module, jmprel, pltrelsz, libc))
     goto fail;
   frida_send_log (diagfd, "link: plt rela applied", libc);
