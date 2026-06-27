@@ -33,10 +33,23 @@ volatile uint64_t g_art_router_last_do_call_x0 = 0;
 volatile uint64_t g_managed_backup_stub_hit_count = 0;
 volatile uint64_t g_managed_direct_hit_count = 0;
 
+typedef struct {
+    uint64_t thread;
+    uint32_t depth;
+} ManagedReentryGuardSlot;
+
+typedef struct {
+    uint64_t thread;
+    uint64_t _pad;
+    HookContext ctx;
+} ArtRouterTlsSlot;
+
+static ManagedReentryGuardSlot g_managed_reentry_guard_slots[64] = {{0}};
+static ArtRouterTlsSlot g_art_router_tls_slots[32] = {{0}};
+
 /* Managed helper reentrancy guard.  Generated managed helpers enter this
  * guard before executing DSL code; ART routing checks it to bypass nested Java
  * calls made from inside the helper on the same thread. */
-static __thread uint32_t g_managed_reentry_guard_depth = 0;
 volatile uint32_t g_managed_reentry_guard_enabled = 1;
 volatile uint64_t g_managed_reentry_guard_enter = 0;
 volatile uint64_t g_managed_reentry_guard_bypass = 0;
@@ -47,6 +60,62 @@ volatile uint64_t g_orig_bypass_active = 0;
 volatile uint64_t g_orig_bypass_hit = 0;
 volatile uint64_t g_orig_bypass_set_success = 0;
 volatile uint64_t g_orig_bypass_set_fail = 0;
+
+static uint64_t hook_current_tpidr_el0(void);
+
+static ManagedReentryGuardSlot* hook_get_managed_reentry_guard_slot(uint64_t thread, int create) {
+    ManagedReentryGuardSlot* free_slot = NULL;
+
+    for (int i = 0; i < (int)(sizeof(g_managed_reentry_guard_slots) / sizeof(g_managed_reentry_guard_slots[0])); i++) {
+        ManagedReentryGuardSlot* slot = &g_managed_reentry_guard_slots[i];
+        uint64_t slot_thread = __atomic_load_n(&slot->thread, __ATOMIC_ACQUIRE);
+        if (slot_thread == thread) {
+            return slot;
+        }
+        if (create && slot_thread == 0 && free_slot == NULL) {
+            free_slot = slot;
+        }
+    }
+
+    if (!create || free_slot == NULL) {
+        return NULL;
+    }
+
+    uint64_t expected = 0;
+    if (__atomic_compare_exchange_n(&free_slot->thread, &expected, thread, 0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+        free_slot->depth = 0;
+        return free_slot;
+    }
+
+    return hook_get_managed_reentry_guard_slot(thread, 0);
+}
+
+static ArtRouterTlsSlot* hook_get_art_router_tls_slot(uint64_t thread) {
+    ArtRouterTlsSlot* free_slot = NULL;
+
+    for (int i = 0; i < (int)(sizeof(g_art_router_tls_slots) / sizeof(g_art_router_tls_slots[0])); i++) {
+        ArtRouterTlsSlot* slot = &g_art_router_tls_slots[i];
+        uint64_t slot_thread = __atomic_load_n(&slot->thread, __ATOMIC_ACQUIRE);
+        if (slot_thread == thread) {
+            return slot;
+        }
+        if (slot_thread == 0 && free_slot == NULL) {
+            free_slot = slot;
+        }
+    }
+
+    if (free_slot == NULL) {
+        return &g_art_router_tls_slots[0];
+    }
+
+    uint64_t expected = 0;
+    if (__atomic_compare_exchange_n(&free_slot->thread, &expected, thread, 0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+        memset(&free_slot->ctx, 0, sizeof(free_slot->ctx));
+        return free_slot;
+    }
+
+    return hook_get_art_router_tls_slot(thread);
+}
 
 /* ============================================================================
  * ART router table management
@@ -271,26 +340,32 @@ int hook_managed_reentry_guard_enabled(void) {
 }
 
 void hook_managed_reentry_guard_enter(void) {
+    uint64_t thread = hook_current_tpidr_el0();
+    ManagedReentryGuardSlot* slot;
     if (__atomic_load_n(&g_managed_reentry_guard_enabled, __ATOMIC_RELAXED) == 0) {
         return;
     }
-    if (g_managed_reentry_guard_depth != UINT32_MAX) {
-        g_managed_reentry_guard_depth++;
+    slot = hook_get_managed_reentry_guard_slot(thread, 1);
+    if (slot != NULL && slot->depth != UINT32_MAX) {
+        slot->depth++;
     }
     __atomic_add_fetch(&g_managed_reentry_guard_enter, 1, __ATOMIC_RELAXED);
 }
 
 void hook_managed_reentry_guard_leave(void) {
-    if (g_managed_reentry_guard_depth > 0) {
-        g_managed_reentry_guard_depth--;
+    ManagedReentryGuardSlot* slot = hook_get_managed_reentry_guard_slot(hook_current_tpidr_el0(), 0);
+    if (slot != NULL && slot->depth > 0) {
+        slot->depth--;
     }
 }
 
 int hook_managed_reentry_guard_active(void) {
+    ManagedReentryGuardSlot* slot;
     if (__atomic_load_n(&g_managed_reentry_guard_enabled, __ATOMIC_RELAXED) == 0) {
         return 0;
     }
-    if (g_managed_reentry_guard_depth == 0) {
+    slot = hook_get_managed_reentry_guard_slot(hook_current_tpidr_el0(), 0);
+    if (slot == NULL || slot->depth == 0) {
         return 0;
     }
     __atomic_add_fetch(&g_managed_reentry_guard_bypass, 1, __ATOMIC_RELAXED);
@@ -298,7 +373,8 @@ int hook_managed_reentry_guard_active(void) {
 }
 
 uint32_t hook_managed_reentry_guard_depth(void) {
-    return g_managed_reentry_guard_depth;
+    ManagedReentryGuardSlot* slot = hook_get_managed_reentry_guard_slot(hook_current_tpidr_el0(), 0);
+    return slot != NULL ? slot->depth : 0;
 }
 
 uint64_t hook_managed_reentry_guard_enters(void) {
@@ -527,15 +603,13 @@ volatile uint64_t g_fast_orig_active = 0;
 volatile uint64_t g_fast_orig_frame_thread = 0;
 volatile uint64_t g_fast_orig_frame_sp = 0;
 
-static __thread HookContext g_art_router_tls_ctx;
-
 static HookContext* art_router_prepare_quick_context(void* frame_sp, void* save_frame_sp) {
     uint8_t* sp = (uint8_t*)frame_sp;
-    HookContext* ctx = &g_art_router_tls_ctx;
     uint64_t thread = 0;
 #if defined(__aarch64__)
     __asm__ __volatile__("mov %0, x19" : "=r"(thread));
 #endif
+    HookContext* ctx = &hook_get_art_router_tls_slot(thread)->ctx;
     ctx->x[0] = *(uint64_t*)(sp + 0);
     for (int i = 1; i <= 7; i++) {
         ctx->x[i] = *(uint64_t*)(sp + ROUTER_X1_OFF + (i - 1) * 8);
