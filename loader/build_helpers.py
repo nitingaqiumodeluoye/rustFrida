@@ -20,18 +20,34 @@ HELPERS_DIR = os.path.join(SCRIPT_DIR, "helpers")
 BUILD_DIR = os.path.join(SCRIPT_DIR, "build")
 
 # Android NDK setup
-NDK_BASE = os.path.expanduser("~/Android/Sdk/ndk")
+DEFAULT_NDK_BASE = os.path.expanduser("~/Android/Sdk/ndk")
 
 def find_ndk():
     """Find the latest Android NDK."""
-    if not os.path.isdir(NDK_BASE):
-        print(f"错误: NDK 目录不存在: {NDK_BASE}")
+    env_ndk = os.environ.get("ANDROID_NDK_HOME") or os.environ.get("ANDROID_NDK_ROOT")
+    if env_ndk:
+        if os.path.isdir(env_ndk):
+            return env_ndk
+        print(f"错误: 环境变量指定的 NDK 目录不存在: {env_ndk}")
         sys.exit(1)
-    versions = sorted(os.listdir(NDK_BASE), reverse=True)
+
+    ndk_base = DEFAULT_NDK_BASE
+    if not os.path.isdir(ndk_base):
+        print(f"错误: NDK 目录不存在: {ndk_base}")
+        sys.exit(1)
+
+    versions = sorted(
+        (
+            entry
+            for entry in os.listdir(ndk_base)
+            if os.path.isdir(os.path.join(ndk_base, entry))
+        ),
+        reverse=True,
+    )
     if not versions:
         print("错误: 未找到 NDK 版本")
         sys.exit(1)
-    return os.path.join(NDK_BASE, versions[0])
+    return os.path.join(ndk_base, versions[0])
 
 def find_tool(ndk_path, tool):
     """Find an NDK tool in the toolchain."""

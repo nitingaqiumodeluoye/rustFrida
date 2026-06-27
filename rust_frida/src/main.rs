@@ -213,6 +213,30 @@ fn main() {
         }
     }
 
+    // 兼容 clap 约束之外的组合校验，便于 feature 裁剪 watch-so 能力。
+    let target_count = [
+        args.pid.is_some(),
+        args.watch_so.is_some(),
+        args.name.is_some(),
+        args.spawn.is_some(),
+        args.dump_props.is_some(),
+        args.set_prop.is_some(),
+        args.del_prop.is_some(),
+        args.repack_props.is_some(),
+        args.server,
+    ]
+    .into_iter()
+    .filter(|enabled| *enabled)
+    .count();
+    if target_count == 0 {
+        log_error!("必须指定 --pid、--name、--spawn、--dump-props、--set-prop、--del-prop、--repack-props 或 --server");
+        std::process::exit(1);
+    }
+    if target_count > 1 {
+        log_error!("目标模式参数互斥，请只保留一种：--pid / --name / --spawn / --watch-so / --dump-props / --set-prop / --del-prop / --repack-props / --server");
+        std::process::exit(1);
+    }
+
     // ── Server daemon 模式 ──
     if args.server {
         server::run_server(&args);
@@ -336,7 +360,7 @@ fn main() {
             }
         }
     } else {
-        log_error!("必须指定 --pid、--name、--watch-so、--spawn 或 --server");
+        log_error!("必须指定 --pid、--name、--spawn 或 --server");
         std::process::exit(1);
     };
 

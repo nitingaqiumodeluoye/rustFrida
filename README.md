@@ -68,10 +68,11 @@ cargo build -p agent --release --features qbdi  # agent 启用 qbdi feature
 cargo build -p rust_frida --release --features qbdi  # rustfrida 嵌入 qbdi-helper SO
 ```
 
-**eBPF SO 加载监控（`--watch-so`）：** ldmonitor 是 rustfrida 的编译依赖，默认构建已包含，`--watch-so` 无需额外步骤。如需独立使用 ldmonitor 命令行工具：
+**eBPF SO 加载监控（`--watch-so`）：** 默认纯 attach/spawn 构建不包含该能力；如需启用，请显式打开 `watch-so` feature。独立使用 ldmonitor 命令行工具时：
 
 ```bash
 cargo build -p ldmonitor --release    # → ldmonitor 独立二进制
+cargo build -p rust_frida --release --features watch-so
 ```
 
 ### TinyCC 子仓库维护

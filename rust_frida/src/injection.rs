@@ -310,6 +310,7 @@ fn find_data_dir_by_uid(uid: u32) -> Option<String> {
 }
 
 /// 使用 eBPF 监听 SO 加载并自动附加
+#[cfg(feature = "watch-so")]
 pub(crate) fn watch_and_inject(
     so_pattern: &str,
     timeout_secs: Option<u64>,
@@ -376,6 +377,15 @@ pub(crate) fn watch_and_inject(
         }
         None => Err("监听超时，未检测到匹配的 SO 加载".to_string()),
     }
+}
+
+#[cfg(not(feature = "watch-so"))]
+pub(crate) fn watch_and_inject(
+    _so_pattern: &str,
+    _timeout_secs: Option<u64>,
+    _string_overrides: &std::collections::HashMap<String, String>,
+) -> Result<InjectionResult, String> {
+    Err("当前构建未启用 --watch-so；如需该能力，请用 --features watch-so 重新编译 rust_frida".to_string())
 }
 
 // =============================================================================
@@ -1362,7 +1372,7 @@ fn inject_via_bootstrapper_once(
     let fallback_listener = setup_loader_fallback_listener(&fallback_socket_name)?;
 
     // 提取 ctrlfds[0] 到 host。旧内核拿不到 socketpair 对端时，后续走 abstract socket fallback。
-    let host_ctrl_fd = match extract_fd_from_target(pid, bootstrap_ctx.ctrlfds[0]) {
+    let mut host_ctrl_fd = match extract_fd_from_target(pid, bootstrap_ctx.ctrlfds[0]) {
         Ok(fd) => {
             log_verbose!("已提取 ctrl fd: target {} → host {}", bootstrap_ctx.ctrlfds[0], fd);
             Some(OwnedFd::new(fd))
@@ -1429,7 +1439,7 @@ fn inject_via_bootstrapper_once(
     // 调用 loader（执行 raw clone 后立即返回）
     log_verbose!("调用 loader...");
     let _ = call_target_function(trace_tid, alloc_base, &[loader_ctx_addr], None).map_err(|e| {
-        unsafe { close(host_ctrl_fd) };
+        drop(host_ctrl_fd.take());
         format!("loader 执行失败: {}", e)
     })?;
 

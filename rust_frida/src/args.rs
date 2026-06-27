@@ -1,6 +1,6 @@
 #![cfg(all(target_os = "android", target_arch = "aarch64"))]
 
-use clap::{ArgGroup, Parser};
+use clap::Parser;
 
 fn parse_pid(s: &str) -> std::result::Result<i32, String> {
     match s.parse::<i32>() {
@@ -22,7 +22,6 @@ inline hook、Frida Stalker 追踪等功能。
 常见用法:
   rustfrida --pid 1234                         # 注入到指定 PID
   rustfrida --name com.example.app             # 按进程名注入
-  rustfrida --watch-so libnative.so            # 等待 SO 加载后自动注入
   rustfrida --spawn com.example.app            # Spawn 模式：启动前注入
   rustfrida --pid 1234 -l script.js            # 注入并执行 JS 脚本
   rustfrida --pid 1234 --verbose               # 显示详细注入调试信息
@@ -37,8 +36,7 @@ Server daemon 模式（多 session 并发）:
   rustfrida --server                                                # 启动 server
   rustfrida --server --profile default                              # 启动 + 属性伪装持续生效
 
-注入后进入 REPL，输入 help 查看可用命令（jsinit / loadjs / jsrepl / jhook 等）。",
-    group(ArgGroup::new("target").required(true).args(["pid", "watch_so", "name", "spawn", "dump_props", "set_prop", "del_prop", "repack_props", "server"]))
+注入后进入 REPL，输入 help 查看可用命令（jsinit / loadjs / jsrepl / jhook 等）。"
 )]
 pub(crate) struct Args {
     /// 目标进程的PID（与 --watch-so、--name、--spawn 互斥）
@@ -51,7 +49,8 @@ pub(crate) struct Args {
     )]
     pub(crate) pid: Option<i32>,
 
-    /// 监听指定 SO 路径加载，自动附加到加载该 SO 的进程（需要 ldmonitor eBPF 组件：cargo build -p ldmonitor）
+    /// 监听指定 SO 路径加载，自动附加到加载该 SO 的进程（需启用 watch-so feature）
+    #[cfg_attr(not(feature = "watch-so"), arg(hide = true))]
     #[arg(short = 'w', long = "watch-so", conflicts_with_all = ["name", "spawn"])]
     pub(crate) watch_so: Option<String>,
 
