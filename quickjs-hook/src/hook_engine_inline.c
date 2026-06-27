@@ -373,6 +373,34 @@ static void* generate_replace_thunk(HookEntry* entry, HookCallback on_enter,
     return thunk_mem;
 }
 
+static void* generate_diag_const_replace_thunk(HookEntry* entry, uint64_t value,
+                                               size_t* thunk_size_out) {
+    void* thunk_mem;
+
+    if (entry->thunk && entry->thunk_alloc >= THUNK_ALLOC_SIZE) {
+        thunk_mem = entry->thunk;
+    } else {
+        thunk_mem = hook_alloc_near(THUNK_ALLOC_SIZE, entry->target);
+        if (!thunk_mem) return NULL;
+        entry->thunk = thunk_mem;
+        entry->thunk_alloc = THUNK_ALLOC_SIZE;
+    }
+
+    Arm64Writer w;
+    arm64_writer_init(&w, thunk_mem, (uint64_t)thunk_mem, THUNK_ALLOC_SIZE);
+
+    arm64_writer_put_mov_reg_imm(&w, ARM64_REG_X0, value);
+    arm64_writer_put_ret(&w);
+    arm64_writer_flush(&w);
+
+    *thunk_size_out = arm64_writer_offset(&w);
+    arm64_writer_clear(&w);
+
+    hook_log("[STEALTH1] diagnostic: generated minimal const thunk target=%p thunk=%p value=%llu size=%zu",
+             entry->target, thunk_mem, (unsigned long long)value, *thunk_size_out);
+    return thunk_mem;
+}
+
 /* --- Replace-mode hook (hook_replace) --- */
 
 void* hook_replace(void* target, HookCallback on_enter, void* user_data, int stealth) {
@@ -397,9 +425,22 @@ void* hook_replace(void* target, HookCallback on_enter, void* user_data, int ste
         return NULL;
     }
 
+    /* Diagnostic split for wxshadow:
+     * When RF_DIAG_WXSHADOW_MIN_REPLACE=1, replace-mode uses a minimal
+     * "mov x0,#123; ret" thunk instead of the full HookContext + JS callback
+     * chain. This isolates whether reboots are caused by the base jump-to-thunk
+     * path or by the richer replace thunk/callback execution path. */
+    const char* diag_min_replace = getenv("RF_DIAG_WXSHADOW_MIN_REPLACE");
+
     /* Generate replace thunk */
     size_t thunk_size = 0;
-    void* thunk_mem = generate_replace_thunk(entry, on_enter, user_data, &thunk_size);
+    void* thunk_mem = NULL;
+    if (stealth == 1 && diag_min_replace &&
+        (strcmp(diag_min_replace, "1") == 0 || strcasecmp(diag_min_replace, "true") == 0)) {
+        thunk_mem = generate_diag_const_replace_thunk(entry, 123, &thunk_size);
+    } else {
+        thunk_mem = generate_replace_thunk(entry, on_enter, user_data, &thunk_size);
+    }
     if (!thunk_mem) {
         free_entry(entry);
         hook_unlock(&g_engine.lock);
