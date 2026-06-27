@@ -264,6 +264,7 @@ static int frida_memcmp (const void * a, const void * b, size_t n);
 static void * frida_memchr (const void * s, int c, size_t n);
 static char * frida_strchr (const char * s, int c);
 static bool rustfrida_resolve_builtin_symbol (const char * name, ElfW(Addr) * value);
+static void rustfrida_builtin_clear_cache (void * start, void * end);
 
 static pid_t frida_gettid (void);
 
@@ -2058,10 +2059,23 @@ rustfrida_resolve_builtin_symbol (const char * name, ElfW(Addr) * value)
     *value = (ElfW(Addr)) (uintptr_t) frida_strchr;
   else if (frida_streq (name, "gettid"))
     *value = (ElfW(Addr)) (uintptr_t) frida_gettid;
+  else if (frida_streq (name, "__clear_cache"))
+    *value = (ElfW(Addr)) (uintptr_t) rustfrida_builtin_clear_cache;
   else
     return false;
 
   return true;
+}
+
+static void
+rustfrida_builtin_clear_cache (void * start, void * end)
+{
+  (void) start;
+  (void) end;
+#if defined(__aarch64__)
+  __asm__ __volatile__("dsb ish" ::: "memory");
+  __asm__ __volatile__("isb" ::: "memory");
+#endif
 }
 
 static pid_t
