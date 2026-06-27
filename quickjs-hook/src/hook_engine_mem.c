@@ -1291,6 +1291,25 @@ void* find_rw_sibling(void* target, size_t len) {
 
 int patch_target(void* target, void* jump_dest, int stealth, HookEntry* entry) {
     int jump_result;
+    uint8_t jump_buf[MIN_HOOK_SIZE] __attribute__((aligned(32)));
+
+    jump_result = hook_write_jump_at(jump_buf, (uint64_t)target, jump_dest);
+    if (jump_result < 0) {
+        return jump_result;
+    }
+
+    if (entry && entry->original_size != (size_t)jump_result) {
+        size_t previous_size = entry->original_size;
+        entry->original_size = (size_t)jump_result;
+        if (build_trampoline(entry, 0) < 0) {
+            entry->original_size = previous_size;
+            hook_log("[patch_target] rebuild_trampoline failed target=%p overwrite=%d",
+                     target, jump_result);
+            return HOOK_ERROR_ALLOC_FAILED;
+        }
+        hook_log("[patch_target] adjusted overwrite size target=%p old=%zu new=%d",
+                 target, previous_size, jump_result);
+    }
 
     if (stealth == 1) {
         /* Diagnostic mode:
@@ -1303,12 +1322,6 @@ int patch_target(void* target, void* jump_dest, int stealth, HookEntry* entry) {
          * 1. aligned(32) 防止 buf 跨页 (copy_from_user_via_pte 不支持跨页)
          * 2. hook_write_jump_at 用 target 的 PC 算 ADRP，而非 buf 的栈地址，
          *    使 target↔thunk 在 ±4GB 时走 ADRP+ADD+BR (12B) 而非 MOVZ (16B) */
-        uint8_t jump_buf[MIN_HOOK_SIZE] __attribute__((aligned(32)));
-        jump_result = hook_write_jump_at(jump_buf, (uint64_t)target, jump_dest);
-        if (jump_result < 0) {
-            return jump_result;
-        }
-
         uintptr_t t = (uintptr_t)target;
         int ok = 0;
 
@@ -1371,11 +1384,6 @@ int patch_target(void* target, void* jump_dest, int stealth, HookEntry* entry) {
      *   - 直接 memcpy 到 rw 地址, 再 flush icache 到 rx 地址
      *   - 完全绕开 VMA 权限 / SELinux execmod / FOLL_FORCE 限制
      * 失败 fallback 到传统 mprotect+memcpy (对普通 file-backed VMA 有效)。 */
-    uint8_t jump_buf[MIN_HOOK_SIZE] __attribute__((aligned(32)));
-    jump_result = hook_write_jump_at(jump_buf, (uint64_t)target, jump_dest);
-    if (jump_result < 0) {
-        return jump_result;
-    }
     int jump_len = jump_result;
 
     {
