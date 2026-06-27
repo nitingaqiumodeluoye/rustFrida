@@ -77,6 +77,69 @@ fn mem_read_value<T: Default>(mem: &ProcMem, addr: usize) -> Result<T, String> {
     Ok(value)
 }
 
+fn socket_addr_abstract(name: &str) -> Result<(libc::sockaddr_un, libc::socklen_t), String> {
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    addr.sun_family = libc::AF_UNIX as _;
+
+    let name_bytes = name.as_bytes();
+    if name_bytes.len() + 1 > addr.sun_path.len() {
+        return Err(format!("abstract socket 名称过长: {}", name));
+    }
+
+    addr.sun_path[0] = 0;
+    for (i, &b) in name_bytes.iter().enumerate() {
+        addr.sun_path[i + 1] = b as _;
+    }
+
+    let addrlen = std::mem::offset_of!(libc::sockaddr_un, sun_path) + 1 + name_bytes.len();
+    Ok((addr, addrlen as libc::socklen_t))
+}
+
+fn setup_loader_fallback_listener(name: &str) -> Result<OwnedFd, String> {
+    let (addr, addrlen) = socket_addr_abstract(name)?;
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        return Err(format!("创建 loader fallback socket 失败: {}", std::io::Error::last_os_error()));
+    }
+
+    let listener = OwnedFd::new(fd);
+    let bind_ret = unsafe { libc::bind(listener.raw(), &addr as *const _ as *const libc::sockaddr, addrlen) };
+    if bind_ret != 0 {
+        return Err(format!(
+            "绑定 loader fallback socket 失败 ({}): {}",
+            name,
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    let listen_ret = unsafe { libc::listen(listener.raw(), 4) };
+    if listen_ret != 0 {
+        return Err(format!(
+            "监听 loader fallback socket 失败 ({}): {}",
+            name,
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    Ok(listener)
+}
+
+fn accept_loader_fallback_connection(listener_fd: RawFd, deadline: Instant) -> Result<RawFd, String> {
+    loop {
+        poll_loader_fd(listener_fd, libc::POLLIN, deadline, "等待 loader fallback 连接")?;
+        let fd = unsafe { libc::accept4(listener_fd, std::ptr::null_mut(), std::ptr::null_mut(), libc::SOCK_CLOEXEC) };
+        if fd >= 0 {
+            return Ok(fd);
+        }
+
+        let err = std::io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(libc::EINTR) | Some(libc::EAGAIN) => continue,
+            _ => return Err(format!("accept loader fallback 连接失败: {}", err)),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct InjectionResult {
     pub(crate) host_fd: RawFd,
@@ -1295,13 +1358,20 @@ fn inject_via_bootstrapper_once(
     log_verbose!("agent linker: 自解析 ELF/重定位/外部符号，不调用 dlopen/dlsym");
     log_verbose!("loader thread: raw clone，不调用 libc pthread");
 
-    // 提取 ctrlfds[0] 到 host
-    let host_ctrl_fd = extract_fd_from_target(pid, bootstrap_ctx.ctrlfds[0])?;
-    log_verbose!(
-        "已提取 ctrl fd: target {} → host {}",
-        bootstrap_ctx.ctrlfds[0],
-        host_ctrl_fd
-    );
+    let fallback_socket_name = format!("rustfrida-{}", pid);
+    let fallback_listener = setup_loader_fallback_listener(&fallback_socket_name)?;
+
+    // 提取 ctrlfds[0] 到 host。旧内核拿不到 socketpair 对端时，后续走 abstract socket fallback。
+    let host_ctrl_fd = match extract_fd_from_target(pid, bootstrap_ctx.ctrlfds[0]) {
+        Ok(fd) => {
+            log_verbose!("已提取 ctrl fd: target {} → host {}", bootstrap_ctx.ctrlfds[0], fd);
+            Some(OwnedFd::new(fd))
+        }
+        Err(e) => {
+            log_warn!("提取 ctrl fd 失败，准备使用 abstract socket fallback: {}", e);
+            None
+        }
+    };
 
     // === 写入 StringTable ===
     let string_table_offset = size_of::<FridaLibcApi>()
@@ -1327,7 +1397,7 @@ fn inject_via_bootstrapper_once(
     let entrypoint_str = b"hello_entry\0";
     let current_thread_eval_str = b"rustfrida_loadjs_current_thread\0";
     let data_str = b"\0";
-    let fallback_str = format!("\x00rustfrida-{}\0", pid); // abstract socket: \0 prefix
+    let fallback_str = format!("{}\0", fallback_socket_name);
     mem.pwrite_all(entrypoint_str, str_base as u64)?;
     let current_thread_eval_str_addr = str_base + entrypoint_str.len();
     mem.pwrite_all(current_thread_eval_str, current_thread_eval_str_addr as u64)?;
@@ -1338,7 +1408,11 @@ fn inject_via_bootstrapper_once(
 
     // 构造 LoaderContext
     let mut loader_ctx = RustFridaLoaderContext::default();
-    loader_ctx.ctrlfds = bootstrap_ctx.ctrlfds;
+    loader_ctx.ctrlfds = if host_ctrl_fd.is_some() {
+        bootstrap_ctx.ctrlfds
+    } else {
+        [-1, -1]
+    };
     loader_ctx.agent_entrypoint = str_base as u64;
     loader_ctx.agent_data = data_str_addr as u64;
     loader_ctx.fallback_address = fallback_str_addr as u64;
@@ -1377,6 +1451,16 @@ fn inject_via_bootstrapper_once(
     // === ptrace 分离 ===
     stop_world.detach_all();
     log_success!("已分离目标进程");
+
+    let host_ctrl_fd = match host_ctrl_fd {
+        Some(fd) => fd.into_raw(),
+        None => {
+            let deadline = Instant::now() + LOADER_HANDSHAKE_TIMEOUT;
+            let fd = accept_loader_fallback_connection(fallback_listener.raw(), deadline)?;
+            log_verbose!("已接受 loader fallback 连接: host_fd={}", fd);
+            fd
+        }
+    };
 
     // === Host 端 loader IPC 握手 ===
     let result = run_loader_handshake(
