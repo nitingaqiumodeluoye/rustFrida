@@ -1293,6 +1293,12 @@ int patch_target(void* target, void* jump_dest, int stealth, HookEntry* entry) {
     int jump_result;
 
     if (stealth == 1) {
+        /* Diagnostic mode:
+         * Temporarily disable same-page LDR literal relocation and only keep the
+         * core wxshadow patch. This isolates whether device reboots are caused by
+         * the page-wide relocate pass rather than the base shadow patch itself. */
+        const int disable_wxshadow_ldr_reloc = 1;
+
         /* wxshadow 模式: shadow 页写入.
          * 1. aligned(32) 防止 buf 跨页 (copy_from_user_via_pte 不支持跨页)
          * 2. hook_write_jump_at 用 target 的 PC 算 ADRP，而非 buf 的栈地址，
@@ -1327,13 +1333,21 @@ int patch_target(void* target, void* jump_dest, int stealth, HookEntry* entry) {
                 return HOOK_ERROR_WXSHADOW_FAILED;
             }
             /* LDR literal relocate: 两页各扫一次 (shadow 页 R/X 互斥按页生效) */
-            wxshadow_relocate_same_page_ldr_literals(target, (int)first_len);
-            wxshadow_relocate_same_page_ldr_literals(second_addr, (int)second_len);
+            if (!disable_wxshadow_ldr_reloc) {
+                wxshadow_relocate_same_page_ldr_literals(target, (int)first_len);
+                wxshadow_relocate_same_page_ldr_literals(second_addr, (int)second_len);
+            } else {
+                hook_log("[STEALTH1] diagnostic: skip same-page LDR relocate for cross-page patch target=%p", target);
+            }
             ok = 1;
             hook_log("[STEALTH1] cross-page patch OK target=%p split=%zu+%zu", target, first_len, second_len);
         } else {
             if (wxshadow_patch(target, jump_buf, jump_result) == 0) {
-                wxshadow_relocate_same_page_ldr_literals(target, jump_result);
+                if (!disable_wxshadow_ldr_reloc) {
+                    wxshadow_relocate_same_page_ldr_literals(target, jump_result);
+                } else {
+                    hook_log("[STEALTH1] diagnostic: skip same-page LDR relocate target=%p len=%d", target, jump_result);
+                }
                 ok = 1;
             }
         }
