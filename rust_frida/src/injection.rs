@@ -5,6 +5,7 @@ use nix::errno::Errno;
 use nix::sys::ptrace;
 use nix::sys::wait::{waitpid, WaitStatus};
 use nix::unistd::Pid;
+use std::ffi::CString;
 use std::mem::size_of;
 use std::os::unix::io::RawFd;
 use std::sync::{
@@ -89,12 +90,38 @@ pub(crate) struct InjectionResult {
     pub(crate) libc_munmap: u64,
 }
 
+fn open_procfs_fd(pid: i32, target_fd: i32) -> Result<RawFd, String> {
+    let path = format!("/proc/{}/fd/{}", pid, target_fd);
+    let path_c = CString::new(path.clone()).map_err(|_| format!("procfs fd 路径包含 NUL: {}", path))?;
+    let host_fd = unsafe { libc::open(path_c.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
+    if host_fd >= 0 {
+        log_verbose!("procfs fd fallback: {} → host_fd={}", path, host_fd);
+        return Ok(host_fd);
+    }
+
+    let rdonly_fd = unsafe { libc::open(path_c.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+    if rdonly_fd >= 0 {
+        log_verbose!("procfs fd fallback (rdonly): {} → host_fd={}", path, rdonly_fd);
+        return Ok(rdonly_fd);
+    }
+
+    Err(format!(
+        "procfs fd fallback 打开失败: {}",
+        std::io::Error::last_os_error()
+    ))
+}
+
 /// 通过 pidfd_getfd 从目标进程提取文件描述符到 host
 fn extract_fd_from_target(pid: i32, target_fd: i32) -> Result<RawFd, String> {
     // pidfd_open(pid, flags=0)
     let pidfd = unsafe { libc::syscall(SYS_PIDFD_OPEN, pid, 0) };
     if pidfd < 0 {
-        return Err(format!("pidfd_open({}) 失败: {}", pid, std::io::Error::last_os_error()));
+        let err = std::io::Error::last_os_error();
+        if matches!(err.raw_os_error(), Some(libc::ENOSYS) | Some(libc::EINVAL)) {
+            log_warn!("pidfd_open 不可用，回退到 /proc/{}/fd/{}", pid, target_fd);
+            return open_procfs_fd(pid, target_fd);
+        }
+        return Err(format!("pidfd_open({}) 失败: {}", pid, err));
     }
 
     // pidfd_getfd(pidfd, target_fd, flags=0)
@@ -102,12 +129,17 @@ fn extract_fd_from_target(pid: i32, target_fd: i32) -> Result<RawFd, String> {
     unsafe { close(pidfd as i32) };
 
     if host_fd < 0 {
-        return Err(format!(
-            "pidfd_getfd(pid={}, fd={}) 失败: {}",
-            pid,
-            target_fd,
-            std::io::Error::last_os_error()
-        ));
+        let err = std::io::Error::last_os_error();
+        if matches!(err.raw_os_error(), Some(libc::ENOSYS) | Some(libc::EINVAL)) {
+            log_warn!(
+                "pidfd_getfd 不可用，回退到 /proc/{}/fd/{}: {}",
+                pid,
+                target_fd,
+                err
+            );
+            return open_procfs_fd(pid, target_fd);
+        }
+        return Err(format!("pidfd_getfd(pid={}, fd={}) 失败: {}", pid, target_fd, err));
     }
 
     log_verbose!("pidfd_getfd: pid={} target_fd={} → host_fd={}", pid, target_fd, host_fd);
