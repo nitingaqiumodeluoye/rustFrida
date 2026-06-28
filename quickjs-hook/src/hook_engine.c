@@ -11,6 +11,13 @@
 
 #include "hook_engine_internal.h"
 
+#ifdef ANDROID
+#include <sys/socket.h>
+#include <sys/syscall.h>
+#include <sys/un.h>
+#include <time.h>
+#endif
+
 /* Global engine state */
 HookEngine g_engine = {0};
 
@@ -186,10 +193,6 @@ static int should_force_android_hook_log(void) {
     return 1;
 }
 
-#ifdef ANDROID
-extern int __android_log_write(int prio, const char* tag, const char* text);
-#endif
-
 static void hook_trace_file_write(const char* msg, size_t msg_len) {
     if (!should_force_trace_file_hook_log()) {
         return;
@@ -223,7 +226,59 @@ static void hook_android_log_write(const char* msg) {
     }
 
 #ifdef ANDROID
-    __android_log_write(4, "RF_HOOK", msg);
+    struct rf_log_time {
+        uint32_t tv_sec;
+        uint32_t tv_nsec;
+    } __attribute__((packed));
+
+    struct rf_log_header {
+        uint8_t id;
+        uint16_t tid;
+        struct rf_log_time realtime;
+    } __attribute__((packed));
+
+    int fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) {
+        return;
+    }
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, "/dev/socket/logdw", sizeof(addr.sun_path) - 1);
+    if (connect(fd, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
+        close(fd);
+        return;
+    }
+
+    struct timespec ts;
+    memset(&ts, 0, sizeof(ts));
+    clock_gettime(CLOCK_REALTIME, &ts);
+
+    long tid = syscall(SYS_gettid);
+    if (tid <= 0) {
+        tid = (long)getpid();
+    }
+
+    struct rf_log_header header;
+    header.id = 0; /* LOG_ID_MAIN */
+    header.tid = (uint16_t)tid;
+    header.realtime.tv_sec = (uint32_t)ts.tv_sec;
+    header.realtime.tv_nsec = (uint32_t)ts.tv_nsec;
+
+    char tag_payload[] = {4, 'R', 'F', '_', 'H', 'O', 'O', 'K', '\0'};
+    char nul = '\0';
+    struct iovec iov[4];
+    iov[0].iov_base = &header;
+    iov[0].iov_len = sizeof(header);
+    iov[1].iov_base = tag_payload;
+    iov[1].iov_len = sizeof(tag_payload);
+    iov[2].iov_base = (void*)msg;
+    iov[2].iov_len = strnlen(msg, 256);
+    iov[3].iov_base = &nul;
+    iov[3].iov_len = 1;
+    writev(fd, iov, 4);
+    close(fd);
 #else
     (void)msg;
 #endif
