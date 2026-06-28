@@ -86,3 +86,28 @@
 
 - 如果这版稳定，重启原因大概率是旧顺序中的“inline jump 已发布但 thunk/trampoline I-cache 尚未同步”竞态。
 - 如果这版仍重启，再继续做下一层：让 `Hook.WXSHADOW` 直接 patch `mov x0,#123; ret` 到目标函数，不经过 near thunk，以确认问题是否在“跳到匿名 RWX thunk”。
+
+## 2026-06-28 preflush 验证结果
+
+- `e6690ce` 产物已下发并在设备侧确认 SHA-256。
+- 短运行中，`Hook.WXSHADOW` replace 日志显示：
+  - `[STEALTH1] preflush replace code before wxshadow publish ...`
+  - `wxshadow stealth patch OK: addr=... len=4`
+  - `hook result=true`
+- 短运行可以正常进入 shutdown cleanup，设备没有立即掉线。
+- 保持 hook 存活并点击 App 的“函数结果实时计算”后，设备发生整机重启。
+
+结论：
+
+- preflush 排除了“安装后立即跳到未 flush thunk”的一部分竞态，但没有解决真实执行时重启。
+- 当前疑点进一步收敛到：shadow patch 中的 inline branch 跳往 rustFrida 分配的 near thunk。
+
+## 2026-06-28 直接 patch 诊断
+
+新增下一层诊断：
+
+- `Hook.WXSHADOW` replace 在强制诊断模式下，不再生成 near thunk。
+- 直接通过 `wxshadow_patch()` 把目标函数 patch 为：
+  - `mov x0, #123`
+  - `ret`
+- 这用于确认问题是否由“branch 到匿名 thunk”触发。

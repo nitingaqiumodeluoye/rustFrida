@@ -416,6 +416,38 @@ static int should_force_minimal_wxshadow_replace(void) {
     return 1;
 }
 
+static int should_force_direct_wxshadow_const_replace(void) {
+    /* Next diagnostic layer: bypass the near thunk entirely and publish the
+     * const-return body directly into the wxshadow target page. */
+    return 1;
+}
+
+static int patch_diag_direct_const_replace(HookEntry* entry, uint64_t value) {
+    uint8_t patch_code[16] __attribute__((aligned(32)));
+    Arm64Writer w;
+
+    arm64_writer_init(&w, patch_code, (uint64_t)entry->target, sizeof(patch_code));
+    arm64_writer_put_mov_reg_imm(&w, ARM64_REG_X0, value);
+    arm64_writer_put_ret(&w);
+    arm64_writer_flush(&w);
+
+    size_t patch_size = arm64_writer_offset(&w);
+    arm64_writer_clear(&w);
+
+    hook_log("[STEALTH1] diagnostic: direct const target patch target=%p value=%llu size=%zu",
+             entry->target, (unsigned long long)value, patch_size);
+
+    if (wxshadow_patch(entry->target, patch_code, patch_size) != 0) {
+        hook_log("[STEALTH1] diagnostic: direct const target patch failed target=%p size=%zu",
+                 entry->target, patch_size);
+        return HOOK_ERROR_WXSHADOW_FAILED;
+    }
+
+    entry->stealth = 1;
+    entry->original_size = patch_size;
+    return 0;
+}
+
 /* --- Replace-mode hook (hook_replace) --- */
 
 void* hook_replace(void* target, HookCallback on_enter, void* user_data, int stealth) {
@@ -438,6 +470,23 @@ void* hook_replace(void* target, HookCallback on_enter, void* user_data, int ste
         free_entry(entry);
         hook_unlock(&g_engine.lock);
         return NULL;
+    }
+
+    if (stealth == 1 &&
+            should_force_minimal_wxshadow_replace() &&
+            should_force_direct_wxshadow_const_replace()) {
+        hook_log("[STEALTH1] diagnostic: forcing direct const target replace target=%p", target);
+        if (patch_diag_direct_const_replace(entry, 123) != 0) {
+            free_entry(entry);
+            hook_unlock(&g_engine.lock);
+            return NULL;
+        }
+
+        finalize_hook(entry, NULL, 0);
+
+        void* trampoline = entry->trampoline;
+        hook_unlock(&g_engine.lock);
+        return trampoline;
     }
 
     /* Generate replace thunk */
