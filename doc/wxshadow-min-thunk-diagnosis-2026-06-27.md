@@ -60,3 +60,29 @@
 - `Hook.WXSHADOW` replace 路径是否仍导致设备重启
 - 日志中是否出现强制最小 thunk 的诊断日志
 - `crcdemoapp` 上的行为是否对应返回值被临时固定为 `123`
+
+## 2026-06-28 补充状态
+
+- 用户确认继续使用 `123`，不再推进 `666` 变更。
+- 本地已将诊断 thunk 和 `rf_native_wxshadow.js` 的返回值恢复为 `123`。
+- 最新判断：最小 thunk 不是稳定通过。它曾在 KPM 手动加载后成功过一次，但后续 `Hook.WXSHADOW` 又触发设备掉线/重启。
+- 当前下一步是定位重启发生在：
+  - `wxshadow_patch()` / inline patch 安装阶段
+  - 还是目标函数实际跳转到最小 thunk 之后
+
+## 2026-06-28 前置 I-cache flush 诊断
+
+新增判断：`Hook.WXSHADOW` 和纯 `wxshadow_client` 的主要差异不是 KPM patch 能力，而是 rustFrida 会把目标函数改成跳到一个新分配的 thunk。旧顺序是在 shadow patch 发布后才 flush thunk/trampoline，这在目标函数被实时调用时可能产生短竞态窗口。
+
+本次本地改动：
+
+- 在 `hook_attach()` 中，`patch_target()` 之前 flush `entry->trampoline` 和 `thunk_mem`
+- 在 `hook_replace()` 中，`patch_target()` 之前 flush `entry->trampoline` 和 `thunk_mem`
+- 增加日志：
+  - `[STEALTH1] preflush attach code before wxshadow publish ...`
+  - `[STEALTH1] preflush replace code before wxshadow publish ...`
+
+验证预期：
+
+- 如果这版稳定，重启原因大概率是旧顺序中的“inline jump 已发布但 thunk/trampoline I-cache 尚未同步”竞态。
+- 如果这版仍重启，再继续做下一层：让 `Hook.WXSHADOW` 直接 patch `mov x0,#123; ret` 到目标函数，不经过 near thunk，以确认问题是否在“跳到匿名 RWX thunk”。

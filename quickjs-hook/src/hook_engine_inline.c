@@ -312,6 +312,13 @@ int hook_attach(void* target, HookCallback on_enter, HookCallback on_leave, void
         return HOOK_ERROR_ALLOC_FAILED;
     }
 
+    hook_flush_cache(entry->trampoline, TRAMPOLINE_ALLOC_SIZE);
+    hook_flush_cache(thunk_mem, thunk_size);
+    if (stealth == 1) {
+        hook_log("[STEALTH1] preflush attach code before wxshadow publish target=%p thunk=%p size=%zu",
+                 target, thunk_mem, thunk_size);
+    }
+
     int patch_result = patch_target(target, thunk_mem, stealth, entry);
     if (patch_result != 0) {
         free_entry(entry);
@@ -446,6 +453,13 @@ void* hook_replace(void* target, HookCallback on_enter, void* user_data, int ste
         free_entry(entry);
         hook_unlock(&g_engine.lock);
         return NULL;
+    }
+
+    hook_flush_cache(entry->trampoline, TRAMPOLINE_ALLOC_SIZE);
+    hook_flush_cache(thunk_mem, thunk_size);
+    if (stealth == 1) {
+        hook_log("[STEALTH1] preflush replace code before wxshadow publish target=%p thunk=%p size=%zu",
+                 target, thunk_mem, thunk_size);
     }
 
     if (patch_target(target, thunk_mem, stealth, entry) != 0) {
