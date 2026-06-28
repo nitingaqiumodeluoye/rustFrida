@@ -492,19 +492,10 @@ void* hook_replace(void* target, HookCallback on_enter, void* user_data, int ste
     /* Generate replace thunk */
     size_t thunk_size = 0;
     void* thunk_mem = NULL;
-    if (stealth == 1 && should_force_minimal_wxshadow_replace()) {
+    int diag_minimal_const_thunk = stealth == 1 && should_force_minimal_wxshadow_replace();
+    if (diag_minimal_const_thunk) {
         hook_log("[STEALTH1] diagnostic: forcing minimal const replace thunk target=%p", target);
         thunk_mem = generate_diag_const_replace_thunk(entry, 123, &thunk_size);
-        if (thunk_mem && thunk_size > 0) {
-            hook_flush_cache(thunk_mem, thunk_size);
-            if (mprotect_range_pages(thunk_mem, thunk_size, PROT_READ | PROT_EXEC) == 0) {
-                hook_log("[STEALTH1] diagnostic: protected minimal const thunk RX thunk=%p size=%zu",
-                         thunk_mem, thunk_size);
-            } else {
-                hook_log("[STEALTH1] diagnostic: protect minimal const thunk RX failed thunk=%p size=%zu errno=%d",
-                         thunk_mem, thunk_size, errno);
-            }
-        }
     } else {
         thunk_mem = generate_replace_thunk(entry, on_enter, user_data, &thunk_size);
     }
@@ -525,6 +516,16 @@ void* hook_replace(void* target, HookCallback on_enter, void* user_data, int ste
         free_entry(entry);
         hook_unlock(&g_engine.lock);
         return NULL;
+    }
+    if (diag_minimal_const_thunk && thunk_size > 0) {
+        hook_flush_cache(thunk_mem, thunk_size);
+        if (mprotect_range_pages(thunk_mem, thunk_size, PROT_READ | PROT_EXEC) == 0) {
+            hook_log("[STEALTH1] diagnostic: protected minimal const thunk RX after publish thunk=%p size=%zu",
+                     thunk_mem, thunk_size);
+        } else {
+            hook_log("[STEALTH1] diagnostic: protect minimal const thunk RX after publish failed thunk=%p size=%zu errno=%d",
+                     thunk_mem, thunk_size, errno);
+        }
     }
 
     finalize_hook(entry, thunk_mem, thunk_size);
