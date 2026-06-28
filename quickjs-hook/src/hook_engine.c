@@ -182,6 +182,14 @@ static int should_force_trace_file_hook_log(void) {
     return 1;
 }
 
+static int should_force_android_hook_log(void) {
+    return 1;
+}
+
+#ifdef ANDROID
+extern int __android_log_write(int prio, const char* tag, const char* text);
+#endif
+
 static void hook_trace_file_write(const char* msg, size_t msg_len) {
     if (!should_force_trace_file_hook_log()) {
         return;
@@ -209,6 +217,18 @@ static void hook_trace_file_write(const char* msg, size_t msg_len) {
     close(fd);
 }
 
+static void hook_android_log_write(const char* msg) {
+    if (!should_force_android_hook_log()) {
+        return;
+    }
+
+#ifdef ANDROID
+    __android_log_write(4, "RF_HOOK", msg);
+#else
+    (void)msg;
+#endif
+}
+
 void hook_log(const char* fmt, ...) {
     char buf[256];
     va_list ap;
@@ -218,6 +238,7 @@ void hook_log(const char* fmt, ...) {
     size_t len = strnlen(buf, sizeof(buf));
 
     hook_trace_file_write(buf, len);
+    hook_android_log_write(buf);
 
     if (should_force_stderr_hook_log()) {
         static const char prefix[] = "[RF_HOOK] ";

@@ -119,6 +119,7 @@ fn main() {
         // Android-specific flags
         if target.contains("android") {
             build.flag("-DANDROID");
+            println!("cargo:rustc-link-lib=log");
         }
 
         build.compile("quickjs");
