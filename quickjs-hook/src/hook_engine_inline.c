@@ -384,9 +384,16 @@ static void* generate_diag_const_replace_thunk(HookEntry* entry, uint64_t value,
                                                size_t* thunk_size_out) {
     void* thunk_mem;
 
+    hook_log("[STEALTH1] diagnostic: minimal const thunk enter target=%p entry=%p existing=%p alloc=%zu",
+             entry ? entry->target : NULL, entry, entry ? entry->thunk : NULL,
+             entry ? entry->thunk_alloc : 0);
     if (entry->thunk && entry->thunk_alloc >= THUNK_ALLOC_SIZE) {
         thunk_mem = entry->thunk;
+        hook_log("[STEALTH1] diagnostic: minimal const thunk reuse existing target=%p thunk=%p alloc=%zu",
+                 entry->target, thunk_mem, entry->thunk_alloc);
     } else {
+        hook_log("[STEALTH1] diagnostic: minimal const thunk before mmap target=%p size=%d",
+                 entry->target, THUNK_ALLOC_SIZE);
         thunk_mem = mmap(NULL, THUNK_ALLOC_SIZE,
                          PROT_READ | PROT_WRITE | PROT_EXEC,
                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -395,19 +402,35 @@ static void* generate_diag_const_replace_thunk(HookEntry* entry, uint64_t value,
                      entry->target, errno);
             return NULL;
         }
+        hook_log("[STEALTH1] diagnostic: minimal const thunk after mmap target=%p thunk=%p",
+                 entry->target, thunk_mem);
         entry->thunk = thunk_mem;
         entry->thunk_alloc = THUNK_ALLOC_SIZE;
     }
 
     Arm64Writer w;
+    hook_log("[STEALTH1] diagnostic: minimal const thunk before writer_init target=%p thunk=%p",
+             entry->target, thunk_mem);
     arm64_writer_init(&w, thunk_mem, (uint64_t)thunk_mem, THUNK_ALLOC_SIZE);
+    hook_log("[STEALTH1] diagnostic: minimal const thunk after writer_init target=%p thunk=%p",
+             entry->target, thunk_mem);
 
     arm64_writer_put_mov_reg_imm(&w, ARM64_REG_X0, value);
+    hook_log("[STEALTH1] diagnostic: minimal const thunk after mov target=%p thunk=%p value=%llu",
+             entry->target, thunk_mem, (unsigned long long)value);
     arm64_writer_put_ret(&w);
+    hook_log("[STEALTH1] diagnostic: minimal const thunk after ret target=%p thunk=%p",
+             entry->target, thunk_mem);
     arm64_writer_flush(&w);
+    hook_log("[STEALTH1] diagnostic: minimal const thunk after writer_flush target=%p thunk=%p",
+             entry->target, thunk_mem);
 
     *thunk_size_out = arm64_writer_offset(&w);
+    hook_log("[STEALTH1] diagnostic: minimal const thunk offset target=%p thunk=%p size=%zu",
+             entry->target, thunk_mem, *thunk_size_out);
     arm64_writer_clear(&w);
+    hook_log("[STEALTH1] diagnostic: minimal const thunk after writer_clear target=%p thunk=%p",
+             entry->target, thunk_mem);
 
     hook_log("[STEALTH1] diagnostic: generated mmap minimal const thunk target=%p thunk=%p value=%llu size=%zu",
              entry->target, thunk_mem, (unsigned long long)value, *thunk_size_out);
