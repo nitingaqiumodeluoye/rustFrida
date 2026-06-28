@@ -512,20 +512,26 @@ void* hook_replace(void* target, HookCallback on_enter, void* user_data, int ste
                  target, thunk_mem, thunk_size);
     }
 
-    if (patch_target(target, thunk_mem, stealth, entry) != 0) {
+    if (stealth == 1) {
+        hook_log("[STEALTH1] diagnostic: before patch_target replace target=%p thunk=%p thunk_size=%zu trampoline=%p original_size=%zu minimal=%d",
+                 target, thunk_mem, thunk_size, entry->trampoline,
+                 entry->original_size, diag_minimal_const_thunk);
+    }
+    int patch_result = patch_target(target, thunk_mem, stealth, entry);
+    if (stealth == 1) {
+        hook_log("[STEALTH1] diagnostic: after patch_target replace target=%p thunk=%p result=%d trampoline=%p original_size=%zu entry_stealth=%d",
+                 target, thunk_mem, patch_result, entry->trampoline,
+                 entry->original_size, entry->stealth);
+    }
+    if (patch_result != 0) {
         free_entry(entry);
         hook_unlock(&g_engine.lock);
         return NULL;
     }
     if (diag_minimal_const_thunk && thunk_size > 0) {
         hook_flush_cache(thunk_mem, thunk_size);
-        if (mprotect_range_pages(thunk_mem, thunk_size, PROT_READ | PROT_EXEC) == 0) {
-            hook_log("[STEALTH1] diagnostic: protected minimal const thunk RX after publish thunk=%p size=%zu",
-                     thunk_mem, thunk_size);
-        } else {
-            hook_log("[STEALTH1] diagnostic: protect minimal const thunk RX after publish failed thunk=%p size=%zu errno=%d",
-                     thunk_mem, thunk_size, errno);
-        }
+        hook_log("[STEALTH1] diagnostic: leaving minimal const thunk permissions unchanged after publish thunk=%p size=%zu",
+                 thunk_mem, thunk_size);
     }
 
     finalize_hook(entry, thunk_mem, thunk_size);
