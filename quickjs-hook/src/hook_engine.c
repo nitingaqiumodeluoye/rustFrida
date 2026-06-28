@@ -174,14 +174,27 @@ void hook_engine_set_log_fn(HookLogFn fn) {
     g_log_fn = fn;
 }
 
+static int should_force_stderr_hook_log(void) {
+    return 1;
+}
+
 void hook_log(const char* fmt, ...) {
-    if (!g_log_fn) return;
     char buf[256];
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
-    g_log_fn(buf);
+
+    if (should_force_stderr_hook_log()) {
+        static const char prefix[] = "[RF_HOOK] ";
+        write(STDERR_FILENO, prefix, sizeof(prefix) - 1);
+        write(STDERR_FILENO, buf, strnlen(buf, sizeof(buf)));
+        write(STDERR_FILENO, "\n", 1);
+    }
+
+    if (g_log_fn) {
+        g_log_fn(buf);
+    }
 }
 
 /* Initialize the hook engine */
