@@ -419,7 +419,7 @@ static int should_force_minimal_wxshadow_replace(void) {
 static int should_force_direct_wxshadow_const_replace(void) {
     /* Next diagnostic layer: bypass the near thunk entirely and publish the
      * const-return body directly into the wxshadow target page. */
-    return 1;
+    return 0;
 }
 
 static int patch_diag_direct_const_replace(HookEntry* entry, uint64_t value) {
@@ -495,6 +495,16 @@ void* hook_replace(void* target, HookCallback on_enter, void* user_data, int ste
     if (stealth == 1 && should_force_minimal_wxshadow_replace()) {
         hook_log("[STEALTH1] diagnostic: forcing minimal const replace thunk target=%p", target);
         thunk_mem = generate_diag_const_replace_thunk(entry, 123, &thunk_size);
+        if (thunk_mem && thunk_size > 0) {
+            hook_flush_cache(thunk_mem, thunk_size);
+            if (mprotect_range_pages(thunk_mem, thunk_size, PROT_READ | PROT_EXEC) == 0) {
+                hook_log("[STEALTH1] diagnostic: protected minimal const thunk RX thunk=%p size=%zu",
+                         thunk_mem, thunk_size);
+            } else {
+                hook_log("[STEALTH1] diagnostic: protect minimal const thunk RX failed thunk=%p size=%zu errno=%d",
+                         thunk_mem, thunk_size, errno);
+            }
+        }
     } else {
         thunk_mem = generate_replace_thunk(entry, on_enter, user_data, &thunk_size);
     }
