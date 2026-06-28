@@ -526,6 +526,27 @@ static int finalize_jump_writer(Arm64Writer* w) {
     return bytes_written;
 }
 
+static int should_force_wxshadow_absolute_jump(void) {
+    return 1;
+}
+
+static int hook_write_absolute_jump_at(void* dst, uint64_t exec_pc, void* target) {
+    if (!dst || !target) {
+        return HOOK_ERROR_INVALID_PARAM;
+    }
+
+    Arm64Writer w;
+    arm64_writer_init(&w, dst, exec_pc, MIN_HOOK_SIZE);
+    arm64_writer_put_branch_address(&w, (uint64_t)target);
+
+    if (arm64_writer_offset(&w) > MIN_HOOK_SIZE) {
+        arm64_writer_clear(&w);
+        return HOOK_ERROR_BUFFER_TOO_SMALL;
+    }
+
+    return finalize_jump_writer(&w);
+}
+
 /*
  * Write a trampoline jump-back using a dynamically chosen scratch register.
  *
@@ -1293,7 +1314,13 @@ int patch_target(void* target, void* jump_dest, int stealth, HookEntry* entry) {
     int jump_result;
     uint8_t jump_buf[MIN_HOOK_SIZE] __attribute__((aligned(32)));
 
-    jump_result = hook_write_jump_at(jump_buf, (uint64_t)target, jump_dest);
+    if (stealth == 1 && should_force_wxshadow_absolute_jump()) {
+        jump_result = hook_write_absolute_jump_at(jump_buf, (uint64_t)target, jump_dest);
+        hook_log("[STEALTH1] diagnostic: forced absolute inline jump target=%p dest=%p len=%d",
+                 target, jump_dest, jump_result);
+    } else {
+        jump_result = hook_write_jump_at(jump_buf, (uint64_t)target, jump_dest);
+    }
     if (jump_result < 0) {
         return jump_result;
     }
