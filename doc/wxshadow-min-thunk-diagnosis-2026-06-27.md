@@ -111,3 +111,27 @@
   - `mov x0, #123`
   - `ret`
 - 这用于确认问题是否由“branch 到匿名 thunk”触发。
+
+## 2026-06-28 direct const patch 结果
+
+第一轮验证结果：
+
+- direct patch 安装成功，日志出现：
+  - `[STEALTH1] diagnostic: direct const target patch ... value=123 size=8`
+  - `wxshadow stealth patch OK: addr=... len=8`
+- App 截图确认：
+  - `value(1) = 123`
+  - CRC 保持 `0x739945e8`
+- 设备未重启，App 进程保持在线。
+
+这说明：
+
+- `mov x0,#123; ret` 指令体本身稳定。
+- `wxshadow` 直接 patch 目标页并执行该 patch 的路径可以稳定工作。
+- 当前重启原因更接近 4 字节 inline branch 跳往 rustFrida 分配的匿名 near thunk。
+
+补充观察：
+
+- direct patch cleanup 时 `wxshadow_release()` 返回 `errno=16`。
+- dmesg 显示 release 等待 `brk_in_flight` 超时，但没有对应 `BRK handler ENTER` 记录。
+- 第二轮带并发 `uiautomator dump` 的 direct patch 探测触发设备重启，说明安装阶段仍可能有并发敏感窗口，需要单独验证。
