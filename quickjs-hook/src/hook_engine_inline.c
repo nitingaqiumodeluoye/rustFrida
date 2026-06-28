@@ -513,6 +513,18 @@ void* hook_replace(void* target, HookCallback on_enter, void* user_data, int ste
 
     hook_flush_cache(entry->trampoline, TRAMPOLINE_ALLOC_SIZE);
     hook_flush_cache(thunk_mem, thunk_size);
+    if (diag_minimal_const_thunk && thunk_size > 0) {
+        if (mprotect_range_pages(thunk_mem, thunk_size, PROT_READ | PROT_EXEC) == 0) {
+            hook_log("[STEALTH1] diagnostic: protected mmap minimal const thunk RX before publish thunk=%p size=%zu",
+                     thunk_mem, thunk_size);
+        } else {
+            hook_log("[STEALTH1] diagnostic: protect mmap minimal const thunk RX before publish failed thunk=%p size=%zu errno=%d",
+                     thunk_mem, thunk_size, errno);
+            free_entry(entry);
+            hook_unlock(&g_engine.lock);
+            return NULL;
+        }
+    }
     if (stealth == 1) {
         hook_log("[STEALTH1] preflush replace code before wxshadow publish target=%p thunk=%p size=%zu",
                  target, thunk_mem, thunk_size);
@@ -536,7 +548,7 @@ void* hook_replace(void* target, HookCallback on_enter, void* user_data, int ste
     }
     if (diag_minimal_const_thunk && thunk_size > 0) {
         hook_flush_cache(thunk_mem, thunk_size);
-        hook_log("[STEALTH1] diagnostic: leaving minimal const thunk permissions unchanged after publish thunk=%p size=%zu",
+        hook_log("[STEALTH1] diagnostic: mmap minimal const thunk remained RX after publish thunk=%p size=%zu",
                  thunk_mem, thunk_size);
     }
 
