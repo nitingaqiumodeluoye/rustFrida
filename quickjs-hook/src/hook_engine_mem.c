@@ -1200,37 +1200,61 @@ size_t hook_relocate_instructions(const void* src_buf, uint64_t src_pc, void* ds
 HookEntry* setup_hook_entry(void* target) {
     /* Caller must hold g_engine.lock */
 
+    hook_log("[setup_hook_entry] enter target=%p hooks=%p free_list=%p exec_used=%zu exec_size=%zu",
+             target, g_engine.hooks, g_engine.free_list,
+             g_engine.exec_mem_used, g_engine.exec_mem_size);
+
     /* Check if already hooked */
     if (find_hook(target)) {
+        hook_log("[setup_hook_entry] target already hooked target=%p", target);
         return NULL;
     }
+    hook_log("[setup_hook_entry] target not hooked target=%p", target);
 
     /* Allocate hook entry (reuse from free list if possible) */
+    hook_log("[setup_hook_entry] before alloc_entry target=%p free_list=%p",
+             target, g_engine.free_list);
     HookEntry* entry = alloc_entry();
     if (!entry) {
+        hook_log("[setup_hook_entry] alloc_entry failed target=%p", target);
         return NULL;
     }
+    hook_log("[setup_hook_entry] after alloc_entry target=%p entry=%p trampoline=%p trampoline_alloc=%zu thunk=%p thunk_alloc=%zu",
+             target, entry, entry->trampoline, entry->trampoline_alloc,
+             entry->thunk, entry->thunk_alloc);
 
     entry->target = target;
 
     /* trampoline 不需要 near: jump-back 用 MOVZ+MOVK 绝对跳转，
      * thunk 也通过 MOVZ+MOVK 加载 trampoline 地址。节省 nearby pool 空间。 */
     if (!entry->trampoline || entry->trampoline_alloc < TRAMPOLINE_ALLOC_SIZE) {
+        hook_log("[setup_hook_entry] before trampoline alloc target=%p entry=%p old_trampoline=%p old_alloc=%zu need=%d",
+                 target, entry, entry->trampoline, entry->trampoline_alloc,
+                 TRAMPOLINE_ALLOC_SIZE);
         entry->trampoline = hook_alloc(TRAMPOLINE_ALLOC_SIZE);
         entry->trampoline_alloc = TRAMPOLINE_ALLOC_SIZE;
+        hook_log("[setup_hook_entry] after trampoline alloc target=%p entry=%p trampoline=%p alloc=%zu exec_used=%zu",
+                 target, entry, entry->trampoline, entry->trampoline_alloc,
+                 g_engine.exec_mem_used);
     }
     if (!entry->trampoline) {
+        hook_log("[setup_hook_entry] trampoline alloc failed target=%p entry=%p",
+                 target, entry);
         free_entry(entry);
         return NULL;
     }
 
     /* Save original bytes — use XOM-safe read */
+    hook_log("[setup_hook_entry] before read_target_safe target=%p entry=%p size=%d",
+             target, entry, MIN_HOOK_SIZE);
     if (read_target_safe(target, entry->original_bytes, MIN_HOOK_SIZE) != 0) {
         hook_log("setup_hook_entry: target %p is not readable, aborting", target);
         free_entry(entry);
         return NULL;
     }
     entry->original_size = MIN_HOOK_SIZE;
+    hook_log("[setup_hook_entry] after read_target_safe target=%p entry=%p original_size=%zu",
+             target, entry, entry->original_size);
 
     return entry;
 }
