@@ -387,8 +387,14 @@ static void* generate_diag_const_replace_thunk(HookEntry* entry, uint64_t value,
     if (entry->thunk && entry->thunk_alloc >= THUNK_ALLOC_SIZE) {
         thunk_mem = entry->thunk;
     } else {
-        thunk_mem = hook_alloc_near(THUNK_ALLOC_SIZE, entry->target);
-        if (!thunk_mem) return NULL;
+        thunk_mem = mmap(NULL, THUNK_ALLOC_SIZE,
+                         PROT_READ | PROT_WRITE | PROT_EXEC,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (thunk_mem == MAP_FAILED) {
+            hook_log("[STEALTH1] diagnostic: mmap minimal const thunk failed target=%p errno=%d",
+                     entry->target, errno);
+            return NULL;
+        }
         entry->thunk = thunk_mem;
         entry->thunk_alloc = THUNK_ALLOC_SIZE;
     }
@@ -403,7 +409,7 @@ static void* generate_diag_const_replace_thunk(HookEntry* entry, uint64_t value,
     *thunk_size_out = arm64_writer_offset(&w);
     arm64_writer_clear(&w);
 
-    hook_log("[STEALTH1] diagnostic: generated minimal const thunk target=%p thunk=%p value=%llu size=%zu",
+    hook_log("[STEALTH1] diagnostic: generated mmap minimal const thunk target=%p thunk=%p value=%llu size=%zu",
              entry->target, thunk_mem, (unsigned long long)value, *thunk_size_out);
     return thunk_mem;
 }
