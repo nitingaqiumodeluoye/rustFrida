@@ -537,20 +537,36 @@ static int should_force_wxshadow_absolute_jump(void) {
 }
 
 static int hook_write_absolute_jump_at(void* dst, uint64_t exec_pc, void* target) {
+    hook_log("[abs_jump] enter dst=%p exec_pc=0x%llx target=%p",
+             dst, (unsigned long long)exec_pc, target);
     if (!dst || !target) {
+        hook_log("[abs_jump] invalid param dst=%p target=%p", dst, target);
         return HOOK_ERROR_INVALID_PARAM;
     }
 
     Arm64Writer w;
+    hook_log("[abs_jump] before writer_init dst=%p exec_pc=0x%llx target=%p",
+             dst, (unsigned long long)exec_pc, target);
     arm64_writer_init(&w, dst, exec_pc, MIN_HOOK_SIZE);
+    hook_log("[abs_jump] after writer_init dst=%p target=%p", dst, target);
+    hook_log("[abs_jump] before branch_address dst=%p target=%p", dst, target);
     arm64_writer_put_branch_address(&w, (uint64_t)target);
+    hook_log("[abs_jump] after branch_address dst=%p target=%p offset=%zu",
+             dst, target, arm64_writer_offset(&w));
 
     if (arm64_writer_offset(&w) > MIN_HOOK_SIZE) {
+        hook_log("[abs_jump] buffer too small dst=%p target=%p offset=%zu limit=%d",
+                 dst, target, arm64_writer_offset(&w), MIN_HOOK_SIZE);
         arm64_writer_clear(&w);
         return HOOK_ERROR_BUFFER_TOO_SMALL;
     }
 
-    return finalize_jump_writer(&w);
+    hook_log("[abs_jump] before finalize dst=%p target=%p offset=%zu",
+             dst, target, arm64_writer_offset(&w));
+    int bytes_written = finalize_jump_writer(&w);
+    hook_log("[abs_jump] after finalize dst=%p target=%p bytes=%d",
+             dst, target, bytes_written);
+    return bytes_written;
 }
 
 /*
@@ -1323,11 +1339,19 @@ int patch_target(void* target, void* jump_dest, int stealth, HookEntry* entry) {
     hook_log("[patch_target] enter target=%p jump_dest=%p stealth=%d entry=%p original_size=%zu",
              target, jump_dest, stealth, entry, entry ? entry->original_size : 0);
     if (stealth == 1 && should_force_wxshadow_absolute_jump()) {
+        hook_log("[patch_target] before forced absolute jump target=%p dest=%p buf=%p",
+                 target, jump_dest, jump_buf);
         jump_result = hook_write_absolute_jump_at(jump_buf, (uint64_t)target, jump_dest);
+        hook_log("[patch_target] after forced absolute jump target=%p dest=%p result=%d",
+                 target, jump_dest, jump_result);
         hook_log("[STEALTH1] diagnostic: forced absolute inline jump target=%p dest=%p len=%d",
                  target, jump_dest, jump_result);
     } else {
+        hook_log("[patch_target] before dynamic jump target=%p dest=%p buf=%p",
+                 target, jump_dest, jump_buf);
         jump_result = hook_write_jump_at(jump_buf, (uint64_t)target, jump_dest);
+        hook_log("[patch_target] after dynamic jump target=%p dest=%p result=%d",
+                 target, jump_dest, jump_result);
     }
     if (jump_result < 0) {
         hook_log("[patch_target] hook_write_jump failed target=%p dest=%p result=%d",
