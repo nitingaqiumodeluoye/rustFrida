@@ -187,8 +187,12 @@ unsafe impl Sync for ExecMemory {}
 /// This is needed by spawn-time ART pre-initialization: Java stealth mode must be
 /// selected before any ART controller patch is installed.
 pub fn init_hook_runtime() -> Result<(), String> {
-    if HOOK_RUNTIME_INITIALIZED.load(Ordering::SeqCst) {
-        return Ok(());
+    let was_initialized = HOOK_RUNTIME_INITIALIZED.load(Ordering::SeqCst);
+    if EXEC_MEM_UNMAPPED.load(Ordering::Acquire) {
+        return Err("hook runtime executable memory was already unmapped".to_string());
+    }
+    if was_initialized {
+        log_msg("[quickjs] hook runtime already marked initialized; refreshing C hook engine\n".to_string());
     }
 
     // Allocate executable memory for hooks (64KB), near libart.so for ADRP range
@@ -217,6 +221,9 @@ pub fn init_hook_runtime() -> Result<(), String> {
     });
 
     HOOK_RUNTIME_INITIALIZED.store(true, Ordering::SeqCst);
+    if was_initialized {
+        log_msg("[quickjs] hook runtime refresh complete\n".to_string());
+    }
     Ok(())
 }
 

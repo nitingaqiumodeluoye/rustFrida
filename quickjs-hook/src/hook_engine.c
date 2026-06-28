@@ -311,11 +311,16 @@ void hook_log(const char* fmt, ...) {
 
 /* Initialize the hook engine */
 int hook_engine_init(void* exec_mem, size_t size) {
+    hook_log("hook_engine_init: enter exec_mem=%p size=%zu initialized=%d",
+             exec_mem, size, g_engine.initialized);
     if (g_engine.initialized) {
+        hook_log("hook_engine_init: already initialized exec_mem=%p size=%zu used=%zu",
+                 g_engine.exec_mem, g_engine.exec_mem_size, g_engine.exec_mem_used);
         return 0; /* Already initialized */
     }
 
     if (!exec_mem || size < 4096) {
+        hook_log("hook_engine_init: invalid args exec_mem=%p size=%zu", exec_mem, size);
         return -1;
     }
 
@@ -329,6 +334,8 @@ int hook_engine_init(void* exec_mem, size_t size) {
     g_engine.exec_mem_page_size = (size_t)sysconf(_SC_PAGESIZE);
     hook_lock_init(&g_engine.lock);
     g_engine.initialized = 1;
+    hook_log("hook_engine_init: success exec_mem=%p size=%zu page=%zu",
+             g_engine.exec_mem, g_engine.exec_mem_size, g_engine.exec_mem_page_size);
 
     return 0;
 }
