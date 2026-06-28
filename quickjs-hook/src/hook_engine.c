@@ -285,6 +285,7 @@ static void hook_android_log_write(const char* msg) {
 }
 
 void hook_log(const char* fmt, ...) {
+    int saved_errno = errno;
     char buf[256];
     va_list ap;
     va_start(ap, fmt);
@@ -305,6 +306,7 @@ void hook_log(const char* fmt, ...) {
     if (g_log_fn) {
         g_log_fn(buf);
     }
+    errno = saved_errno;
 }
 
 /* Initialize the hook engine */
