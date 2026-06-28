@@ -458,25 +458,37 @@ static int patch_diag_direct_const_replace(HookEntry* entry, uint64_t value) {
 
 void* hook_replace(void* target, HookCallback on_enter, void* user_data, int stealth) {
     if (!g_engine.initialized || !target || !on_enter) {
+        hook_log("[hook_replace] reject initialized=%d target=%p on_enter=%p stealth=%d",
+                 g_engine.initialized, target, (void*)on_enter, stealth);
         return NULL;
     }
 
+    hook_log("[hook_replace] enter target=%p on_enter=%p user_data=%p stealth=%d",
+             target, (void*)on_enter, user_data, stealth);
     hook_lock(&g_engine.lock);
 
     HookEntry* entry = setup_hook_entry(target);
     if (!entry) {
+        hook_log("[hook_replace] setup_hook_entry failed target=%p stealth=%d",
+                 target, stealth);
         hook_unlock(&g_engine.lock);
         return NULL;
     }
+    hook_log("[hook_replace] setup_hook_entry OK target=%p entry=%p trampoline=%p original_size=%zu",
+             target, entry, entry->trampoline, entry->original_size);
 
     entry->on_enter = on_enter;
     entry->user_data = user_data;
 
     if (build_trampoline(entry, 0) < 0) {
+        hook_log("[hook_replace] build_trampoline failed target=%p entry=%p original_size=%zu",
+                 target, entry, entry->original_size);
         free_entry(entry);
         hook_unlock(&g_engine.lock);
         return NULL;
     }
+    hook_log("[hook_replace] build_trampoline OK target=%p entry=%p trampoline=%p original_size=%zu",
+             target, entry, entry->trampoline, entry->original_size);
 
     if (stealth == 1 &&
             should_force_minimal_wxshadow_replace() &&
@@ -553,6 +565,8 @@ void* hook_replace(void* target, HookCallback on_enter, void* user_data, int ste
     }
 
     finalize_hook(entry, thunk_mem, thunk_size);
+    hook_log("[hook_replace] finalize_hook OK target=%p entry=%p thunk=%p thunk_size=%zu trampoline=%p",
+             target, entry, thunk_mem, thunk_size, entry->trampoline);
 
     void* trampoline = entry->trampoline;
     hook_unlock(&g_engine.lock);

@@ -178,17 +178,51 @@ static int should_force_stderr_hook_log(void) {
     return 1;
 }
 
+static int should_force_trace_file_hook_log(void) {
+    return 1;
+}
+
+static void hook_trace_file_write(const char* msg, size_t msg_len) {
+    if (!should_force_trace_file_hook_log()) {
+        return;
+    }
+
+    const char* path = "/data/local/tmp/rf_hook_trace.txt";
+    int fd = open(path, O_WRONLY | O_APPEND | O_CLOEXEC);
+    if (fd < 0 && errno == ENOENT) {
+        fd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0666);
+    }
+    if (fd < 0) {
+        return;
+    }
+
+    char prefix[64];
+    int prefix_len = snprintf(prefix, sizeof(prefix), "[RF_HOOK pid=%d] ", getpid());
+    if (prefix_len > 0) {
+        size_t n = (size_t)prefix_len;
+        if (n > sizeof(prefix)) n = sizeof(prefix);
+        write(fd, prefix, n);
+    }
+    write(fd, msg, msg_len);
+    write(fd, "\n", 1);
+    fsync(fd);
+    close(fd);
+}
+
 void hook_log(const char* fmt, ...) {
     char buf[256];
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
+    size_t len = strnlen(buf, sizeof(buf));
+
+    hook_trace_file_write(buf, len);
 
     if (should_force_stderr_hook_log()) {
         static const char prefix[] = "[RF_HOOK] ";
         write(STDERR_FILENO, prefix, sizeof(prefix) - 1);
-        write(STDERR_FILENO, buf, strnlen(buf, sizeof(buf)));
+        write(STDERR_FILENO, buf, len);
         write(STDERR_FILENO, "\n", 1);
     }
 

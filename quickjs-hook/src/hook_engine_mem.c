@@ -305,9 +305,12 @@ static int pmd_split_cow(void* addr) {
 int wxshadow_patch(void* addr, const void* buf, size_t len) {
     int ret;
 
+    hook_log("[wxshadow_patch] enter addr=%p buf=%p len=%zu pid=%d", addr, buf, len, getpid());
     ret = prctl(PR_WXSHADOW_PATCH, 0, (uintptr_t)addr, (uintptr_t)buf, len);
+    hook_log("[wxshadow_patch] prctl pid=0 ret=%d errno=%d addr=%p len=%zu", ret, errno, addr, len);
     if (ret != 0) {
         ret = prctl(PR_WXSHADOW_PATCH, getpid(), (uintptr_t)addr, (uintptr_t)buf, len);
+        hook_log("[wxshadow_patch] prctl pid=self ret=%d errno=%d addr=%p len=%zu", ret, errno, addr, len);
     }
 
     if (ret != 0) {
@@ -322,9 +325,12 @@ int wxshadow_patch(void* addr, const void* buf, size_t len) {
         hook_log("wxshadow PATCH failed (errno=%d), trying PMD split + COW for addr=%p", errno, addr);
 
         if (pmd_split_cow(addr) == 0) {
+            hook_log("[wxshadow_patch] retry after PMD split addr=%p len=%zu", addr, len);
             ret = prctl(PR_WXSHADOW_PATCH, 0, (uintptr_t)addr, (uintptr_t)buf, len);
+            hook_log("[wxshadow_patch] retry prctl pid=0 ret=%d errno=%d addr=%p len=%zu", ret, errno, addr, len);
             if (ret != 0) {
                 ret = prctl(PR_WXSHADOW_PATCH, getpid(), (uintptr_t)addr, (uintptr_t)buf, len);
+                hook_log("[wxshadow_patch] retry prctl pid=self ret=%d errno=%d addr=%p len=%zu", ret, errno, addr, len);
             }
         }
 
@@ -1314,6 +1320,8 @@ int patch_target(void* target, void* jump_dest, int stealth, HookEntry* entry) {
     int jump_result;
     uint8_t jump_buf[MIN_HOOK_SIZE] __attribute__((aligned(32)));
 
+    hook_log("[patch_target] enter target=%p jump_dest=%p stealth=%d entry=%p original_size=%zu",
+             target, jump_dest, stealth, entry, entry ? entry->original_size : 0);
     if (stealth == 1 && should_force_wxshadow_absolute_jump()) {
         jump_result = hook_write_absolute_jump_at(jump_buf, (uint64_t)target, jump_dest);
         hook_log("[STEALTH1] diagnostic: forced absolute inline jump target=%p dest=%p len=%d",
@@ -1322,6 +1330,8 @@ int patch_target(void* target, void* jump_dest, int stealth, HookEntry* entry) {
         jump_result = hook_write_jump_at(jump_buf, (uint64_t)target, jump_dest);
     }
     if (jump_result < 0) {
+        hook_log("[patch_target] hook_write_jump failed target=%p dest=%p result=%d",
+                 target, jump_dest, jump_result);
         return jump_result;
     }
 
@@ -1367,11 +1377,15 @@ int patch_target(void* target, void* jump_dest, int stealth, HookEntry* entry) {
                 hook_log("[STEALTH1] cross-page second segment failed target=%p", target);
                 return HOOK_ERROR_WXSHADOW_FAILED;
             }
+            hook_log("[patch_target] cross-page second segment patched target=%p second=%p len=%zu",
+                     target, second_addr, second_len);
             if (wxshadow_patch(target, jump_buf, first_len) != 0) {
                 hook_log("[STEALTH1] cross-page first segment failed target=%p, rolling back second", target);
                 wxshadow_release(second_addr);
                 return HOOK_ERROR_WXSHADOW_FAILED;
             }
+            hook_log("[patch_target] cross-page first segment patched target=%p len=%zu",
+                     target, first_len);
             /* LDR literal relocate: 两页各扫一次 (shadow 页 R/X 互斥按页生效) */
             if (!disable_wxshadow_ldr_reloc) {
                 wxshadow_relocate_same_page_ldr_literals(target, (int)first_len);
@@ -1382,13 +1396,20 @@ int patch_target(void* target, void* jump_dest, int stealth, HookEntry* entry) {
             ok = 1;
             hook_log("[STEALTH1] cross-page patch OK target=%p split=%zu+%zu", target, first_len, second_len);
         } else {
+            hook_log("[patch_target] before wxshadow_patch single-page target=%p len=%d dest=%p",
+                     target, jump_result, jump_dest);
             if (wxshadow_patch(target, jump_buf, jump_result) == 0) {
+                hook_log("[patch_target] after wxshadow_patch single-page OK target=%p len=%d",
+                         target, jump_result);
                 if (!disable_wxshadow_ldr_reloc) {
                     wxshadow_relocate_same_page_ldr_literals(target, jump_result);
                 } else {
                     hook_log("[STEALTH1] diagnostic: skip same-page LDR relocate target=%p len=%d", target, jump_result);
                 }
                 ok = 1;
+            } else {
+                hook_log("[patch_target] after wxshadow_patch single-page FAILED target=%p len=%d",
+                         target, jump_result);
             }
         }
 
