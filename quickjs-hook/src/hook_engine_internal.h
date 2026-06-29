@@ -20,6 +20,21 @@
 #include <stdlib.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <stdbool.h>
+
+static inline bool hook_env_flag_enabled(const char* name) {
+    const char* value = getenv(name);
+    if (!value || !*value) {
+        return false;
+    }
+    return strcmp(value, "1") == 0 ||
+           strcmp(value, "true") == 0 ||
+           strcmp(value, "TRUE") == 0 ||
+           strcmp(value, "yes") == 0 ||
+           strcmp(value, "YES") == 0 ||
+           strcmp(value, "on") == 0 ||
+           strcmp(value, "ON") == 0;
+}
 
 static inline void hook_lock_init(HookLock* lock) {
     __atomic_store_n(&lock->state, 0, __ATOMIC_RELEASE);

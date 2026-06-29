@@ -533,7 +533,7 @@ static int finalize_jump_writer(Arm64Writer* w) {
 }
 
 static int should_force_wxshadow_absolute_jump(void) {
-    return 1;
+    return hook_env_flag_enabled("RF_DIAG_WXSHADOW_ABS_JUMP");
 }
 
 static int hook_write_absolute_jump_at(void* dst, uint64_t exec_pc, void* target) {

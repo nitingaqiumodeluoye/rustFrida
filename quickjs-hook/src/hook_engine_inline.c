@@ -438,17 +438,11 @@ static void* generate_diag_const_replace_thunk(HookEntry* entry, uint64_t value,
 }
 
 static int should_force_minimal_wxshadow_replace(void) {
-    /* Temporary hard switch for device-side diagnosis:
-     * force Hook.WXSHADOW replace-mode to use a minimal "mov x0,#123; ret"
-     * thunk so we can isolate "jump-to-thunk reboots" from "full callback
-     * chain reboots" without relying on target-process environment variables. */
-    return 1;
+    return hook_env_flag_enabled("RF_DIAG_WXSHADOW_MIN_REPLACE");
 }
 
 static int should_force_direct_wxshadow_const_replace(void) {
-    /* Next diagnostic layer: bypass the near thunk entirely and publish the
-     * const-return body directly into the wxshadow target page. */
-    return 0;
+    return hook_env_flag_enabled("RF_DIAG_WXSHADOW_DIRECT_CONST");
 }
 
 static int patch_diag_direct_const_replace(HookEntry* entry, uint64_t value) {
