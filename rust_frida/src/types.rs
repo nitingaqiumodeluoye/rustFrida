@@ -131,6 +131,8 @@ pub(crate) struct RustFridaLoaderContext {
     pub(crate) agent_current_thread_eval: u64, // const char *
     pub(crate) libc_base: u64,
     pub(crate) linker_base: u64,
+    pub(crate) loader_alloc_base: u64,
+    pub(crate) loader_alloc_size: u64,
     pub(crate) worker: u64,                         // raw-clone tid (runtime, zeroed)
     pub(crate) agent_handle: u64,                   // void * (runtime, zeroed)
     pub(crate) agent_entrypoint_impl: u64,          // fn ptr (runtime, zeroed)

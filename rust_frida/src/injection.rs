@@ -1431,6 +1431,8 @@ fn inject_via_bootstrapper_once(
     loader_ctx.agent_current_thread_eval = current_thread_eval_str_addr as u64;
     loader_ctx.libc_base = bootstrap_ctx.fallback_libc;
     loader_ctx.linker_base = bootstrap_ctx.rtld_base;
+    loader_ctx.loader_alloc_base = alloc_base as u64;
+    loader_ctx.loader_alloc_size = total_alloc as u64;
     mem_write_value(&mem, loader_ctx_addr, &loader_ctx)?;
 
     // 写入 LibcApi（给 loader 用）

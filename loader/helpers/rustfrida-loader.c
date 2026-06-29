@@ -173,6 +173,8 @@ typedef struct {
   const char * agent_current_thread_eval;
   void * libc_base;
   void * linker_base;
+  void * loader_alloc_base;
+  size_t loader_alloc_size;
 
   /* Runtime state (filled by loader) */
   uintptr_t worker;
@@ -300,6 +302,15 @@ frida_load (RustFridaLoaderContext * ctx)
   void * stack;
   void * stack_top;
   ssize_t tid;
+
+  /*
+   * Bootstrapper initially names this mapping with a string located in its own
+   * payload. The payload is later overwritten by this loader, and some Android
+   * kernels keep the userspace name pointer instead of copying the bytes. Rename
+   * it from the loader so /proc/<pid>/maps sees a stable string pointer.
+   */
+  rustfrida_set_vma_name ((ElfW(Addr)) ctx->loader_alloc_base,
+      ctx->loader_alloc_size, "wwb_loader");
 
   stack = frida_raw_mmap (NULL, stack_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (stack == MAP_FAILED)
