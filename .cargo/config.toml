@@ -2,11 +2,11 @@
 target = "aarch64-linux-android"
 
 [target.aarch64-linux-android]
-linker = "/root/Android/Sdk/ndk/current/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android33-clang"
-ar = "/root/Android/Sdk/ndk/current/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
+linker = "/opt/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android33-clang"
+ar = "/opt/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
 
 [env]
-ANDROID_NDK_HOME = "/root/Android/Sdk/ndk/current"
-ANDROID_NDK_ROOT = "/root/Android/Sdk/ndk/current"
-CC_aarch64-linux-android = "/root/Android/Sdk/ndk/current/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android33-clang"
-BINDGEN_EXTRA_CLANG_ARGS = "--sysroot=/root/Android/Sdk/ndk/current/toolchains/llvm/prebuilt/linux-x86_64/sysroot/"
+ANDROID_NDK_HOME = "/opt/android-ndk-r29"
+ANDROID_NDK_ROOT = "/opt/android-ndk-r29"
+CC_aarch64-linux-android = "/opt/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android33-clang"
+BINDGEN_EXTRA_CLANG_ARGS = "--sysroot=/opt/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/sysroot/"
