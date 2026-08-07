@@ -31,5 +31,5 @@ anyhow = { workspace = true }
 
 [lib]
 name = "agent"
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 path = "src/lib.rs"

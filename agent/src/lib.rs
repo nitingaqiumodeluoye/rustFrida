@@ -32,9 +32,9 @@ mod quickjs_loader;
 mod stalker;
 
 use crate::communication::{
-    flush_cached_logs, is_cmd_frame, is_qbdi_helper_frame, log_msg, log_msg_sync, register_stream_fd, send_bye,
+    clear_stream, flush_cached_logs, is_cmd_frame, is_qbdi_helper_frame, log_msg, log_msg_sync, register_stream, send_bye,
     send_complete, send_eval_err, send_eval_ok, send_hello, send_rpc_err, send_rpc_ok, shutdown_log_writer,
-    shutdown_stream, start_log_writer, write_stream, GLOBAL_STREAM,
+    shutdown_stream, start_log_writer, write_stream,
 };
 use crate::crash_handler::install_panic_hook;
 use libc::{kill, pid_t, SIGSTOP};
@@ -96,10 +96,40 @@ impl StringTable {
 static SHOULD_EXIT: AtomicBool = AtomicBool::new(false);
 static SHOULD_DETACH: AtomicBool = AtomicBool::new(false);
 pub static OUTPUT_PATH: OnceLock<String> = OnceLock::new();
+type InitialScriptReadyCallback = extern "C" fn(*mut c_void);
+static INITIAL_SCRIPT_READY_CALLBACK: AtomicUsize = AtomicUsize::new(0);
+static INITIAL_SCRIPT_READY_CONTEXT: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "quickjs")]
 static JS_TASKS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "quickjs")]
 const JS_TASK_UNLOAD_WAIT_MS: u64 = 500;
+
+/// Register a one-shot callback for the first `loadjs_init` task.
+///
+/// The embedded Gadget uses this to keep an xfinject child paused until its
+/// bootstrap script has installed early hooks. The callback is optional and
+/// remains unused by the regular loader/server paths.
+#[no_mangle]
+pub extern "C" fn rustfrida_set_initial_script_ready_callback(
+    callback: Option<InitialScriptReadyCallback>,
+    context: *mut c_void,
+) {
+    INITIAL_SCRIPT_READY_CONTEXT.store(context as usize, Ordering::Release);
+    INITIAL_SCRIPT_READY_CALLBACK.store(
+        callback.map(|value| value as usize).unwrap_or(0),
+        Ordering::Release,
+    );
+}
+
+fn notify_initial_script_ready() {
+    let callback = INITIAL_SCRIPT_READY_CALLBACK.swap(0, Ordering::AcqRel);
+    if callback == 0 {
+        return;
+    }
+    let context = INITIAL_SCRIPT_READY_CONTEXT.load(Ordering::Acquire) as *mut c_void;
+    let callback: InitialScriptReadyCallback = unsafe { std::mem::transmute(callback) };
+    callback(context);
+}
 
 fn read_exact_raw_fd(fd: i32, buf: &mut [u8]) -> std::io::Result<()> {
     let mut done = 0usize;
@@ -162,8 +192,7 @@ pub extern "C" fn hello_entry(args_ptr: *mut c_void) -> *mut c_void {
     // 使用 ctrl_fd（socketpair 的 agent 端），已通过 socketpair 连接到 host
     let sock = unsafe { UnixStream::from_raw_fd(ctrl_fd) };
     let write_half = sock.try_clone().expect("stream clone failed");
-    register_stream_fd(&write_half);
-    GLOBAL_STREAM.set(std::sync::Mutex::new(write_half)).unwrap();
+    register_stream(write_half);
     // 启动异步日志 writer 线程：write_stream() 只 push channel，此线程通过 GLOBAL_STREAM 写 socket
     start_log_writer();
     send_hello();
@@ -247,6 +276,7 @@ pub extern "C" fn hello_entry(args_ptr: *mut c_void) -> *mut c_void {
         libc::close(reader_fd);
     }
     std::mem::forget(reader);
+    clear_stream();
 
     null_mut()
 }
@@ -420,6 +450,14 @@ fn dispatch_js_task<F>(task: F)
 where
     F: FnOnce() + Send + 'static,
 {
+    dispatch_js_task_with_ready(task, false);
+}
+
+#[cfg(feature = "quickjs")]
+fn dispatch_js_task_with_ready<F>(task: F, notify_ready: bool)
+where
+    F: FnOnce() + Send + 'static,
+{
     JS_TASKS_IN_FLIGHT.fetch_add(1, Ordering::AcqRel);
     match raw_thread::spawn_detached(b"wwb-js\0", move || {
         let _raw_clone_js = quickjs_hook::mark_raw_clone_js_thread();
@@ -431,12 +469,18 @@ where
                 .unwrap_or("unknown panic");
             send_eval_err(&format!("[quickjs] JS worker panic: {}", msg));
         }
+        if notify_ready {
+            notify_initial_script_ready();
+        }
         JS_TASKS_IN_FLIGHT.fetch_sub(1, Ordering::AcqRel);
     }) {
         Ok(_) => {}
         Err(e) => {
             JS_TASKS_IN_FLIGHT.fetch_sub(1, Ordering::AcqRel);
             send_eval_err(&format!("[quickjs] JS worker 启动失败: {}", e));
+            if notify_ready {
+                notify_initial_script_ready();
+            }
         }
     }
 }
@@ -563,7 +607,10 @@ fn process_cmd(command: &str) {
             let (filename, script) = parse_loadjs_payload(rest);
             let filename = filename.to_string();
             let script = script.to_string();
-            dispatch_js_task(move || init_eval_and_respond(&script, &filename));
+            dispatch_js_task_with_ready(
+                move || init_eval_and_respond(&script, &filename),
+                true,
+            );
         }
         #[cfg(feature = "quickjs")]
         Some("javaworker_init") => dispatch_js_task(start_java_worker_and_respond),
@@ -803,7 +850,10 @@ fn process_cmd(command: &str) {
         }
         _ => {
             let cmd_name = command.split_whitespace().next().unwrap_or("(empty)");
-            log_msg(format!("无效命令 '{}'，在 REPL 中输入 help 查看可用命令\n", cmd_name));
+            let message = format!("无效命令 '{}'，在 REPL 中输入 help 查看可用命令", cmd_name);
+            log_msg(format!("{}\n", message));
+            // Unknown commands must complete the request so clients do not wait for an eval frame.
+            send_eval_err(&message);
         }
     }
 }

@@ -1,0 +1,17 @@
+[package]
+name = "rsfrida-gadget"
+version = "0.1.0"
+edition = "2021"
+description = "Embedded ARM64 Android gadget for rustFrida"
+
+[dependencies]
+agent = { path = "../agent" }
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[lib]
+name = "rsfrida_gadget"
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
