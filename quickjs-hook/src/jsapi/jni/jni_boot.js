@@ -100,6 +100,7 @@
         GetObjectRefType: 232
     });
     var _JNI_NAMES = Object.keys(_JNI_INDEX);
+    var _DIRECT_JNI_ADDRESS_CACHE = Object.create(null);
 
     delete _api._className;
     delete _api._threadEnv;
@@ -182,6 +183,49 @@
         return Memory.readPointer(table.add(index * _POINTER_SIZE));
     }
 
+    // RegisterNatives is needed while spawn keeps the child stopped. At that
+    // point the raw-clone JS worker cannot synchronously obtain a JNIEnv from
+    // the Java executor, but libart still exposes the implementation in its
+    // ELF symbol table.
+    function _findDirectJniAddress(name) {
+        if (name !== "RegisterNatives"
+            || typeof Module === "undefined"
+            || typeof Module.enumerateSymbols !== "function") {
+            return null;
+        }
+
+        if (Object.prototype.hasOwnProperty.call(_DIRECT_JNI_ADDRESS_CACHE, name)) {
+            return _DIRECT_JNI_ADDRESS_CACHE[name];
+        }
+
+        var result = null;
+        try {
+            var symbols = Module.enumerateSymbols("libart.so");
+            for (var i = 0; i < symbols.length; i++) {
+                var symbol = symbols[i];
+                if (!symbol || typeof symbol.name !== "string"
+                    || symbol.name.indexOf(name) < 0
+                    || symbol.address === null || symbol.address === undefined) {
+                    continue;
+                }
+
+                if (result === null) {
+                    result = symbol.address;
+                }
+                if (symbol.name.indexOf("CheckJNI") < 0
+                    && symbol.name.indexOf("JNIILb0EE") >= 0) {
+                    result = symbol.address;
+                    break;
+                }
+            }
+        } catch (_) {
+            result = null;
+        }
+
+        _DIRECT_JNI_ADDRESS_CACHE[name] = result;
+        return result;
+    }
+
     function _makeEntry(env, name, allowMissing) {
         var index = _getIndex(name, allowMissing);
         if (index === null) {
@@ -219,6 +263,13 @@
     }
 
     function _getAddress(envOrName, maybeName) {
+        if (arguments.length === 1) {
+            var direct = _findDirectJniAddress(envOrName);
+            if (direct !== null) {
+                return _toPtr(direct);
+            }
+        }
+
         var resolved = _resolveEnvAndName.apply(null, arguments);
         return _getAddressByIndex(resolved.env, _getIndex(resolved.name, false));
     }

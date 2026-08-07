@@ -411,7 +411,6 @@ void hook_managed_reentry_guard_enter(void) {
     }
     __atomic_add_fetch(&g_managed_reentry_guard_enter, 1, __ATOMIC_RELAXED);
 
-    uint64_t thread = hook_current_tpidr_el0();
     for (int i = 0; i < MANAGED_GUARD_SLOTS; i++) {
         ManagedGuardSlot* slot = &g_managed_guard_slots[i];
         if (__atomic_load_n(&slot->thread, __ATOMIC_ACQUIRE) == thread) {
