@@ -7,8 +7,13 @@
 //!   rustfrida#N>     — session 命令 (jsinit/loadjs/jsrepl/..., back 返回)
 
 use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::Ordering;
+use std::sync::mpsc::{channel, Sender};
 use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
 
 use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
@@ -17,8 +22,8 @@ use rustyline::hint::Hinter;
 use rustyline::validate::Validator;
 use rustyline::{Context, Editor, Helper};
 
-use crate::args::Args;
-use crate::communication::{send_command, start_socketpair_handler};
+use crate::args::{Args, DEFAULT_LISTEN_ADDR};
+use crate::communication::{read_frame, send_command, start_socketpair_handler, start_tcp_relay, FRAME_KIND_BOOTSTRAP_SCRIPT};
 use crate::injection::inject_via_bootstrapper;
 use crate::process::find_pid_by_name;
 use crate::repl::{
@@ -34,11 +39,29 @@ use crate::spawn;
 use crate::{log_error, log_info, log_success, log_warn};
 
 const SESSION_CONNECT_TIMEOUT_SECS: u64 = 10;
+const TCP_BOOTSTRAP_TIMEOUT_SECS: u64 = 15;
+/// 注入结果等待超时：注入可能含 pre-resume 脚本加载，给足余量
+const TCP_INJECT_WAIT_TIMEOUT_SECS: u64 = 60;
+const MAX_TCP_BOOTSTRAP_LINE_BYTES: usize = 8 * 1024;
+/// Optional fallback for KPM builds that still have a fork/PTE race. The normal
+/// path keeps Frida-style pre-resume script timing; set this variable only when
+/// a target kernel needs the post-resume delay.
+const WXSHADOW_SPAWN_SETTLE_MS: u64 = 1000;
+const WXSHADOW_SAFE_DELAY_ENV: &str = "RF_WXSHADOW_SAFE_DELAY";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ScriptLoadState {
     Loaded { needs_post_resume_java_worker: bool },
     Failed,
+}
+
+/// A script may originate from the device-side REPL or from the host-side
+/// rfclient. Host scripts are transferred over the control connection and are
+/// never resolved against the device filesystem.
+#[derive(Clone)]
+enum ScriptSource {
+    DevicePath(String),
+    HostText { filename: String, content: String },
 }
 
 impl ScriptLoadState {
@@ -155,22 +178,54 @@ fn parse_script_flag(parts: &[&str]) -> (Vec<String>, Option<String>) {
     (positional, script)
 }
 
+/// Detect the public WXSHADOW mode in a script before spawn resumes the child.
+/// The marker check is deliberately limited to the public API spellings used by
+/// the current scripts; it is not a general-purpose JavaScript parser.
+fn script_declares_wxshadow(source: &ScriptSource) -> bool {
+    let script = match source {
+        ScriptSource::DevicePath(path) => match std::fs::read_to_string(path) {
+            Ok(content) => content,
+            Err(_) => return false,
+        },
+        ScriptSource::HostText { content, .. } => content.clone(),
+    };
+
+    [
+        "Hook.WXSHADOW",
+        "Hook[\"WXSHADOW\"]",
+        "Hook['WXSHADOW']",
+        "Java.WXSHADOW",
+    ]
+    .iter()
+    .any(|marker| script.contains(marker))
+}
+
 /// 在目标进程暂停期间加载脚本（用于 spawn 模式）
-fn load_script_on_session(session: &Session, script_path: &str, stop_worker_after_load: bool) -> ScriptLoadState {
+fn load_script_on_session(session: &Session, source: &ScriptSource, stop_worker_after_load: bool) -> ScriptLoadState {
     if session.get_sender().is_none() {
         log_error!("[#{}] agent 未连接，无法加载脚本", session.id);
         return ScriptLoadState::Failed;
     }
-    let script = match std::fs::read_to_string(script_path) {
-        Ok(s) => s,
-        Err(e) => {
-            log_error!("[#{}] 读取脚本 '{}' 失败: {}", session.id, script_path, e);
-            return ScriptLoadState::Failed;
-        }
+    let (script_name, script) = match source {
+        ScriptSource::DevicePath(path) => match std::fs::read_to_string(path) {
+            Ok(s) => (
+                std::path::Path::new(path)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("script.js")
+                    .to_string(),
+                s,
+            ),
+            Err(e) => {
+                log_error!("[#{}] 读取脚本 '{}' 失败: {}", session.id, path, e);
+                return ScriptLoadState::Failed;
+            }
+        },
+        ScriptSource::HostText { filename, content } => (filename.clone(), content.clone()),
     };
 
     if script.is_empty() {
-        log_info!("[#{}] 脚本为空，跳过加载: {}", session.id, script_path);
+        log_info!("[#{}] 脚本为空，跳过加载: {}", session.id, script_name);
         return ScriptLoadState::Loaded {
             needs_post_resume_java_worker: false,
         };
@@ -195,11 +250,7 @@ fn load_script_on_session(session: &Session, script_path: &str, stop_worker_afte
         log_info!("[#{}] 脚本发送到 raw clone TLS JS worker 执行", session.id);
     }
     session.eval_state.clear();
-    let filename = std::path::Path::new(script_path)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("script.js")
-        .to_string();
+    let filename = script_name;
     let load_result = if uses_java_api {
         if deferred_pre_resume_java {
             match session.get_sender() {
@@ -297,8 +348,16 @@ fn shutdown_session(session: &Session) {
     if session.disconnected.load(Ordering::Acquire) {
         return;
     }
-    session.shutdown_requested.store(true, Ordering::Release);
-    let _ = send_command(sender, "shutdown");
+    let command = if session.tcp_owned.load(Ordering::Acquire) {
+        // WXSHADOW release is not safe on this KPM target. A TCP session is
+        // detached instead, leaving the target-side hook alive until the app
+        // exits or a local session performs the full cleanup.
+        "detach"
+    } else {
+        session.shutdown_requested.store(true, Ordering::Release);
+        "shutdown"
+    };
+    let _ = send_command(sender, command);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
     while !session.disconnected.load(Ordering::Acquire) {
         if std::time::Instant::now() >= deadline {
@@ -308,14 +367,303 @@ fn shutdown_session(session: &Session) {
     }
 }
 
+// ────────────────────────── TCP 控制服务器（主机端 rfclient 接入）──────────────────────────
+
+/// 启动 TCP 控制服务器：接受主机端 rfclient 连接，执行引导请求后进入帧级中继。
+///
+/// 引导协议（文本行，\n 结尾）：
+///   list                          → 每行 `id\tpid\tlabel\tstatus`，空行结束
+///   attach <pid|name> [-l script] → `OK sid=<id> pid=<pid>` / `ERR <msg>`
+///   spawn <package> [-l script]   → 同上
+///   use <session_id>              → `OK sid=<id> pid=<pid>` / `ERR <msg>`
+///   exit                          → 关闭连接
+pub(crate) fn run_tcp_server(
+    mgr: Arc<SessionManager>,
+    bind_addr: &str,
+    string_overrides: HashMap<String, String>,
+    verbose: bool,
+) -> Result<(), String> {
+    let listener = TcpListener::bind(bind_addr).map_err(|e| format!("TCP bind {} 失败: {}", bind_addr, e))?;
+    let actual = listener
+        .local_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|_| bind_addr.to_string());
+    log_success!("TCP 控制服务器监听 {}", actual);
+    log_info!("  rfclient -H {} list / attach <pid> / spawn <pkg> / use <sid>", actual);
+
+    thread::Builder::new()
+        .name("wwb-tcpacc".into())
+        .spawn(move || tcp_accept_loop(listener, mgr, string_overrides, verbose))
+        .map_err(|e| format!("spawn wwb-tcpacc 失败: {}", e))?;
+    Ok(())
+}
+
+fn tcp_accept_loop(
+    listener: TcpListener,
+    mgr: Arc<SessionManager>,
+    string_overrides: HashMap<String, String>,
+    verbose: bool,
+) {
+    for stream in listener.incoming() {
+        match stream {
+            Ok(s) => {
+                let mgr = mgr.clone();
+                let overrides = string_overrides.clone();
+                let _ = thread::Builder::new().name("wwb-tcpconn".into()).spawn(move || {
+                    if let Err(e) = handle_tcp_client(s, mgr, overrides, verbose) {
+                        log_error!("TCP 客户端处理失败: {}", e);
+                    }
+                });
+            }
+            Err(e) => {
+                log_error!("TCP accept 失败: {}", e);
+            }
+        }
+    }
+}
+
+/// 处理单个 TCP 客户端：读引导请求 → 建会话/注入 → 回复 → 进入帧级中继。
+fn handle_tcp_client(
+    mut stream: TcpStream,
+    mgr: Arc<SessionManager>,
+    string_overrides: HashMap<String, String>,
+    verbose: bool,
+) -> Result<(), String> {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(TCP_BOOTSTRAP_TIMEOUT_SECS)))
+        .map_err(|e| format!("set_read_timeout: {}", e))?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(TCP_BOOTSTRAP_TIMEOUT_SECS)))
+        .map_err(|e| format!("set_write_timeout: {}", e))?;
+
+    let write_stream = stream.try_clone().map_err(|e| format!("clone stream: {}", e))?;
+
+    // Read exactly one bootstrap line. A buffered reader is unsafe here because
+    // the following protocol is binary framed on this same TCP connection.
+    let line = match read_tcp_bootstrap_line(&mut stream)? {
+        Some(line) => line,
+        None => return Ok(()), // 客户端直接断开
+    };
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    if parts.is_empty() {
+        write_line(&write_stream, "ERR empty request")?;
+        return Ok(());
+    }
+
+    match parts[0] {
+        "list" => {
+            let sessions = mgr.list_sessions();
+            let mut out = String::new();
+            for (id, pid, label, status, _active) in &sessions {
+                out.push_str(&format!("{}\t{}\t{}\t{}\n", id, pid, label, status));
+            }
+            out.push('\n'); // 空行结束
+            write_all(&write_stream, out.as_bytes())?;
+            Ok(())
+        }
+        "attach" | "spawn" => {
+            let (positional, script) = parse_script_flag(&parts[1..]);
+            if positional.is_empty() {
+                write_line(&write_stream, "ERR 用法: attach <pid|name> [-l script] 或 spawn <package> [-l script]")?;
+                return Ok(());
+            }
+            let target = &positional[0];
+            let script = match script {
+                Some(path) if path == "-" => match read_host_script_frame(&mut stream) {
+                    Ok(source) => Some(source),
+                    Err(e) => {
+                        write_line(&write_stream, &format!("ERR {}", e))?;
+                        return Ok(());
+                    }
+                },
+                Some(path) => Some(ScriptSource::DevicePath(path)),
+                None => None,
+            };
+
+            let session = mgr.create_session(target.clone());
+            session.mark_tcp_owned();
+            // Do not emit binary frames before the client has read its textual
+            // OK response. Agent output is retained and flushed by start_tcp_relay.
+            session.prepare_relay();
+            let (tx, rx) = channel();
+            if parts[0] == "spawn" {
+                log_info!("[#{}] TCP spawn {}...", session.id, target);
+                do_spawn(session.clone(), target.clone(), script, string_overrides, verbose, Some(tx));
+            } else {
+                // attach: 数字 → PID，否则按进程名查找
+                let (pid, label) = if let Ok(p) = target.parse::<i32>() {
+                    (p, format!("PID:{}", p))
+                } else {
+                    match find_pid_by_name(target) {
+                        Ok(p) => (p, target.clone()),
+                        Err(e) => {
+                            session.clear_relay();
+                            mgr.remove_session(session.id);
+                            write_line(&write_stream, &format!("ERR {}", e))?;
+                            return Ok(());
+                        }
+                    }
+                };
+                log_info!("[#{}] TCP attach {} (PID: {})...", session.id, label, pid);
+                do_attach(session.clone(), pid, label, script, string_overrides, verbose, Some(tx));
+            }
+
+            // 等待注入结果（注入可能含 pre-resume 脚本加载，给足超时）
+            match rx.recv_timeout(Duration::from_secs(TCP_INJECT_WAIT_TIMEOUT_SECS)) {
+                Ok(Ok(pid)) => {
+                    if let Err(e) = write_line(&write_stream, &format!("OK sid={} pid={}", session.id, pid)) {
+                        session.clear_relay();
+                        log_info!(
+                            "[#{}] TCP 客户端在 bootstrap 完成前断开，session 保留；可用 use {} 重新连接",
+                            session.id,
+                            session.id
+                        );
+                        return Err(e);
+                    }
+                    // 清除超时：进入中继后 TCP 可能长时间空闲（日志/交互），不能被 15s 读超时打断
+                    let _ = stream.set_read_timeout(None);
+                    let _ = stream.set_write_timeout(None);
+                    // 进入帧级中继。TCP 连接只是控制面，断开时保留 session，
+                    // 避免把 WXSHADOW 的内核补丁释放绑定到电脑端进程退出时刻。
+                    let sid = session.id;
+                    start_tcp_relay(
+                        stream,
+                        session,
+                        Some(Box::new(move || {
+                            log_info!("[#{}] TCP 客户端断开，session 保留；可用 use {} 重新连接", sid, sid);
+                        })),
+                    );
+                    Ok(())
+                }
+                Ok(Err(e)) => {
+                    write_line(&write_stream, &format!("ERR {}", e))?;
+                    session.clear_relay();
+                    mgr.remove_session(session.id);
+                    Ok(())
+                }
+                Err(_) => {
+                    // 注入超时或通道断开
+                    write_line(&write_stream, "ERR 注入超时")?;
+                    session.clear_relay();
+                    mgr.remove_session(session.id);
+                    Ok(())
+                }
+            }
+        }
+        "use" => {
+            if parts.len() < 2 {
+                write_line(&write_stream, "ERR 用法: use <session_id>")?;
+                return Ok(());
+            }
+            let id: u32 = match parts[1].parse() {
+                Ok(id) => id,
+                Err(_) => {
+                    write_line(&write_stream, &format!("ERR 无效 session id: {}", parts[1]))?;
+                    return Ok(());
+                }
+            };
+            let session = match mgr.get_session(id) {
+                Some(s) => s,
+                None => {
+                    write_line(&write_stream, &format!("ERR session #{} 不存在", id))?;
+                    return Ok(());
+                }
+            };
+            if !session.is_connected() {
+                write_line(
+                    &write_stream,
+                    &format!("ERR session #{} 未连接 (status: {})", id, session.status()),
+                )?;
+                return Ok(());
+            }
+            if session.has_active_relay() {
+                write_line(&write_stream, &format!("ERR session #{} 已由其他 TCP 客户端控制", id))?;
+                return Ok(());
+            }
+            session.mark_tcp_owned();
+            write_line(&write_stream, &format!("OK sid={} pid={}", id, session.pid.load(Ordering::Relaxed)))?;
+            // 复用已有会话：只中继，不 shutdown（会话归属其创建者）
+            let _ = stream.set_read_timeout(None);
+            let _ = stream.set_write_timeout(None);
+            start_tcp_relay(stream, session, None);
+            Ok(())
+        }
+        "exit" | "quit" => Ok(()),
+        other => {
+            write_line(&write_stream, &format!("ERR 未知命令: {}", other))?;
+            Ok(())
+        }
+    }
+}
+
+fn read_tcp_bootstrap_line(stream: &mut TcpStream) -> Result<Option<String>, String> {
+    let mut line = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        let n = stream
+            .read(&mut byte)
+            .map_err(|e| format!("read bootstrap line: {}", e))?;
+        if n == 0 {
+            if line.is_empty() {
+                return Ok(None);
+            }
+            break;
+        }
+        if byte[0] == b'\n' {
+            break;
+        }
+        if line.len() == MAX_TCP_BOOTSTRAP_LINE_BYTES {
+            return Err(format!("bootstrap request exceeds {} bytes", MAX_TCP_BOOTSTRAP_LINE_BYTES));
+        }
+        line.push(byte[0]);
+    }
+    if line.last() == Some(&b'\r') {
+        line.pop();
+    }
+    String::from_utf8(line)
+        .map(Some)
+        .map_err(|_| "bootstrap request is not valid UTF-8".to_string())
+}
+
+fn read_host_script_frame(stream: &mut TcpStream) -> Result<ScriptSource, String> {
+    let (kind, payload) = read_frame(stream).map_err(|e| format!("read host script frame: {}", e))?;
+    if kind != FRAME_KIND_BOOTSTRAP_SCRIPT {
+        return Err(format!("unexpected bootstrap frame kind: {}", kind));
+    }
+    if payload.len() < 4 {
+        return Err("host script frame is truncated".to_string());
+    }
+    let filename_len = u32::from_le_bytes(payload[..4].try_into().unwrap()) as usize;
+    if filename_len == 0 || filename_len > 256 || 4 + filename_len > payload.len() {
+        return Err("invalid host script filename".to_string());
+    }
+    let filename = String::from_utf8(payload[4..4 + filename_len].to_vec())
+        .map_err(|_| "host script filename is not valid UTF-8".to_string())?;
+    let content = String::from_utf8(payload[4 + filename_len..].to_vec())
+        .map_err(|_| "host script is not valid UTF-8".to_string())?;
+    Ok(ScriptSource::HostText { filename, content })
+}
+
+fn write_line(stream: &TcpStream, s: &str) -> Result<(), String> {
+    let mut s = s.to_string();
+    s.push('\n');
+    write_all(stream, s.as_bytes())
+}
+
+fn write_all(stream: &TcpStream, data: &[u8]) -> Result<(), String> {
+    let mut st = stream.try_clone().map_err(|e| format!("clone stream: {}", e))?;
+    st.write_all(data).map_err(|e| format!("write: {}", e))
+}
+
 // ────────────────────────── 后台 spawn/inject ──────────────────────────
 
 fn do_spawn(
     session: Arc<Session>,
     package: String,
-    script: Option<String>,
+    script: Option<ScriptSource>,
     string_overrides: HashMap<String, String>,
     verbose: bool,
+    result: Option<Sender<Result<u32, String>>>,
 ) {
     let sid = session.id;
     std::thread::Builder::new()
@@ -333,6 +681,9 @@ fn do_spawn(
                         session.failed.store(true, Ordering::Release);
                         // 尝试恢复子进程
                         let _ = spawn::resume_child(pid as u32);
+                        if let Some(tx) = &result {
+                            let _ = tx.send(Err(format!("[#{}] 等待 agent 连接超时", sid)));
+                        }
                         return;
                     }
 
@@ -343,21 +694,54 @@ fn do_spawn(
                         }
                     }
 
-                    // 在子进程暂停期间加载脚本
+                    // 默认在 spawn 停止态完成脚本加载，保持 Frida 语义并捕获
+                    // 最早期的 RegisterNatives。KPM 已修正 fork pause 的状态竞态；
+                    // 如目标内核仍有旧版 PTE 问题，可通过环境变量显式启用延后模式。
                     let mut post_resume_java_worker_needed = false;
-                    if let Some(ref script_path) = script {
-                        let load_state = load_script_on_session(&session, script_path, true);
-                        if load_state.failed() {
-                            session.failed.store(true, Ordering::Release);
-                            spawn::abort_pending_children_and_cleanup_zygote_patches();
-                            return;
+                    let defer_wxshadow_script = script
+                        .as_ref()
+                        .map(script_declares_wxshadow)
+                        .unwrap_or(false)
+                        && std::env::var_os(WXSHADOW_SAFE_DELAY_ENV).is_some();
+                    if defer_wxshadow_script {
+                        log_warn!(
+                            "[#{}] 检测到 {}，Hook.WXSHADOW 延后到 spawn 恢复后加载（{}ms）",
+                            sid,
+                            WXSHADOW_SAFE_DELAY_ENV,
+                            WXSHADOW_SPAWN_SETTLE_MS
+                        );
+                    }
+                    if let Some(ref script_source) = script {
+                        if !defer_wxshadow_script {
+                            let load_state = load_script_on_session(&session, script_source, true);
+                            if load_state.failed() {
+                                session.failed.store(true, Ordering::Release);
+                                spawn::abort_pending_children_and_cleanup_zygote_patches();
+                                if let Some(tx) = &result {
+                                    let _ = tx.send(Err(format!("[#{}] 脚本执行失败", sid)));
+                                }
+                                return;
+                            }
+                            post_resume_java_worker_needed |= load_state.needs_post_resume_java_worker();
                         }
-                        post_resume_java_worker_needed |= load_state.needs_post_resume_java_worker();
                     }
 
                     // resume 子进程
                     if let Err(e) = spawn::resume_child(pid as u32) {
                         log_error!("[#{}] 恢复子进程失败: {}", sid, e);
+                    }
+
+                    if defer_wxshadow_script {
+                        std::thread::sleep(std::time::Duration::from_millis(WXSHADOW_SPAWN_SETTLE_MS));
+                        if let Some(ref script_source) = script {
+                            if load_script_on_session(&session, script_source, false).failed() {
+                                session.failed.store(true, Ordering::Release);
+                                if let Some(tx) = &result {
+                                    let _ = tx.send(Err(format!("[#{}] WXSHADOW 脚本执行失败", sid)));
+                                }
+                                return;
+                            }
+                        }
                     }
                     if let Err(e) = ensure_java_worker_ready_after_resume(&session, post_resume_java_worker_needed) {
                         log_warn!(
@@ -368,10 +752,16 @@ fn do_spawn(
                     }
 
                     log_success!("[#{}] {} 已就绪 (PID: {})", sid, package, pid);
+                    if let Some(tx) = &result {
+                        let _ = tx.send(Ok(pid as u32));
+                    }
                 }
                 Err(e) => {
                     log_error!("[#{}] Spawn {} 失败: {}", sid, package, e);
                     session.failed.store(true, Ordering::Release);
+                    if let Some(tx) = &result {
+                        let _ = tx.send(Err(format!("spawn {} 失败: {}", package, e)));
+                    }
                 }
             }
         })
@@ -382,9 +772,10 @@ fn do_attach(
     session: Arc<Session>,
     pid: i32,
     label: String,
-    script: Option<String>,
+    script: Option<ScriptSource>,
     string_overrides: HashMap<String, String>,
     verbose: bool,
+    result: Option<Sender<Result<u32, String>>>,
 ) {
     let sid = session.id;
     std::thread::Builder::new()
@@ -399,6 +790,9 @@ fn do_attach(
                     if !session.wait_connected(SESSION_CONNECT_TIMEOUT_SECS) {
                         log_error!("[#{}] 等待 agent 连接超时", sid);
                         session.failed.store(true, Ordering::Release);
+                        if let Some(tx) = &result {
+                            let _ = tx.send(Err(format!("[#{}] 等待 agent 连接超时", sid)));
+                        }
                         return;
                     }
 
@@ -409,18 +803,27 @@ fn do_attach(
                     }
 
                     // 非 spawn 模式：先连接再加载脚本
-                    if let Some(ref script_path) = script {
-                        if load_script_on_session(&session, script_path, false).failed() {
+                    if let Some(ref script_source) = script {
+                        if load_script_on_session(&session, script_source, false).failed() {
                             session.failed.store(true, Ordering::Release);
+                            if let Some(tx) = &result {
+                                let _ = tx.send(Err(format!("[#{}] 脚本执行失败", sid)));
+                            }
                             return;
                         }
                     }
 
                     log_success!("[#{}] {} 已就绪 (PID: {})", sid, label, pid);
+                    if let Some(tx) = &result {
+                        let _ = tx.send(Ok(pid as u32));
+                    }
                 }
                 Err(e) => {
                     log_error!("[#{}] 注入 {} 失败: {}", sid, label, e);
                     session.failed.store(true, Ordering::Release);
+                    if let Some(tx) = &result {
+                        let _ = tx.send(Err(format!("注入 {} 失败: {}", label, e)));
+                    }
                 }
             }
         })
@@ -647,6 +1050,15 @@ pub(crate) fn run_server(args: &Args) {
         map
     };
 
+    // 先绑定控制端口，再执行 zygote 预注入。这样重复启动时会立即失败，
+    // 不会对已有 server 的 zygote patch 做重复操作。
+    let listen_arg = args.listen.as_deref().unwrap_or(DEFAULT_LISTEN_ADDR);
+    let bind = crate::parse_rpc_bind(listen_arg);
+    if let Err(e) = run_tcp_server(mgr.clone(), &bind, string_overrides.clone(), args.verbose) {
+        log_error!("TCP server 启动失败: {}", e);
+        std::process::exit(1);
+    }
+
     // 预注入 zygote: daemon 启动即准备好，后续 spawn 不再等待注入
     log_info!("正在预注入 Zygote...");
     match spawn::ensure_zymbiote_loaded() {
@@ -668,6 +1080,15 @@ pub(crate) fn run_server(args: &Args) {
     }
     println!();
 
+    if args.server || args.listen.is_some() {
+        // TCP server mode is a daemon: its lifetime is controlled by signals,
+        // not by the stdin handle inherited from adb/nohup.
+        log_info!("TCP server daemon 已脱离 stdin，等待终止信号...");
+        while !spawn::signal_received() {
+            thread::sleep(Duration::from_secs(1));
+        }
+        log_info!("收到终止信号，正在退出...");
+    } else {
     let mut rl = match Editor::new() {
         Ok(e) => e,
         Err(e) => {
@@ -709,7 +1130,8 @@ pub(crate) fn run_server(args: &Args) {
                         let package = &positional[0];
                         let session = mgr.create_session(package.clone());
                         log_info!("[#{}] 正在 spawn {}...", session.id, package);
-                        do_spawn(session, package.clone(), script, string_overrides.clone(), args.verbose);
+                        let script = script.map(ScriptSource::DevicePath);
+                        do_spawn(session, package.clone(), script, string_overrides.clone(), args.verbose, None);
                     }
 
                     // ── attach <pid|name> [-l script.js] ──
@@ -741,7 +1163,8 @@ pub(crate) fn run_server(args: &Args) {
                         };
                         let session = mgr.create_session(label.clone());
                         log_info!("[#{}] 正在注入 {} (PID: {})...", session.id, label, pid);
-                        do_attach(session, pid, label, script, string_overrides.clone(), args.verbose);
+                        let script = script.map(ScriptSource::DevicePath);
+                        do_attach(session, pid, label, script, string_overrides.clone(), args.verbose, None);
                     }
 
                     // ── list / sessions ──
@@ -855,6 +1278,7 @@ pub(crate) fn run_server(args: &Args) {
     }
 
     let _ = rl.save_history(".rustfrida_server_history");
+    }
 
     // 清理所有 session
     log_info!("清理所有 session...");

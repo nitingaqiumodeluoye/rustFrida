@@ -123,6 +123,29 @@ adb push target/aarch64-linux-android/release/rustfrida /data/local/tmp/
 ./rustfrida --pid <pid> -l script.js -o /data/local/tmp/rustfrida.log
 ```
 
+### 主机通信（rfclient）
+
+设备端以 daemon 方式运行，主机端用 `rfclient`（`rfclient/` crate）经 TCP 控制，
+与本地 REPL 功能一致：
+
+```bash
+# 设备端：启动 server + TCP 控制服务器（0.0.0.0:27042）
+./rustfrida --server --listen 0.0.0.0:27042
+
+# 主机端构建 rfclient（见 rfclient/README.md）
+cargo build -p rfclient --release --target x86_64-unknown-linux-gnu
+
+# 端口转发（设备直连网段可省略）
+adb forward tcp:27042 tcp:27042
+
+# 主机端操作
+rfclient -H 127.0.0.1:27042 list                            # 列出会话
+rfclient -H 127.0.0.1:27042 attach <pid>                   # 注入已运行进程
+rfclient -H 127.0.0.1:27042 spawn com.example.app -l s.js  # spawn 模式
+rfclient -H 127.0.0.1:27042 use 1                           # 复用会话
+# 进入 REPL 后: jsinit / jseval / loadjs / rpccall / hfl / trace / stalker ...
+```
+
 ### REPL 命令
 
 ```

@@ -1,11 +1,30 @@
 #![cfg(all(target_os = "android", target_arch = "aarch64"))]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::communication::{send_command, HostToAgentMessage, SyncChannel};
+
+/// A frame produced by the agent before the TCP client finishes its bootstrap
+/// request. The relay is activated only after the textual `OK` response has
+/// been written, so binary frames never corrupt that response.
+pub(crate) struct PendingRelayFrame {
+    pub(crate) kind: u8,
+    pub(crate) payload: Vec<u8>,
+}
+
+/// The active TCP writer and the bounded bootstrap backlog are protected by
+/// one lock. This gives the agent reader a single ordered path to the client,
+/// mirroring frida-server's connection-owned outbound queue.
+pub(crate) struct RelayState {
+    pub(crate) writer: Option<Box<dyn Write + Send>>,
+    pub(crate) pending: VecDeque<PendingRelayFrame>,
+    pub(crate) pending_bytes: usize,
+    pub(crate) queue_enabled: bool,
+}
 
 /// 单个注入会话：一个目标进程对应一个 Session
 pub(crate) struct Session {
@@ -25,7 +44,14 @@ pub(crate) struct Session {
     pub(crate) connected: AtomicBool,
     pub(crate) disconnected: AtomicBool,
     pub(crate) shutdown_requested: AtomicBool,
+    /// TCP-owned sessions must use agent detach on transport teardown.
+    /// Full wxshadow release is reserved for local server sessions because
+    /// the KPM release path can reboot the device on this target.
+    pub(crate) tcp_owned: AtomicBool,
     pub(crate) failed: AtomicBool,
+    /// 远程 TCP 中继状态：agent 帧除写入 SyncChannel 外，还会转发到这里。
+    /// Spawn/attach 的 bootstrap 期间暂存帧，收到文本 OK 后再按原顺序输出。
+    pub(crate) relay: Mutex<RelayState>,
 }
 
 impl Session {
@@ -45,14 +71,52 @@ impl Session {
             connected: AtomicBool::new(false),
             disconnected: AtomicBool::new(false),
             shutdown_requested: AtomicBool::new(false),
+            tcp_owned: AtomicBool::new(false),
             failed: AtomicBool::new(false),
+            relay: Mutex::new(RelayState {
+                writer: None,
+                pending: VecDeque::new(),
+                pending_bytes: 0,
+                queue_enabled: false,
+            }),
         }
+    }
+
+    /// 在 TCP bootstrap 开始时启用有界帧缓存。完成 bootstrap 后，通信层
+    /// 会一次性安装 writer 并按接收顺序排空缓存。
+    pub(crate) fn prepare_relay(&self) {
+        let mut relay = self.relay.lock().unwrap_or_else(|e| e.into_inner());
+        relay.writer = None;
+        relay.pending.clear();
+        relay.pending_bytes = 0;
+        relay.queue_enabled = true;
+    }
+
+    /// 关闭 TCP 中继并释放 bootstrap 缓存。本地 REPL 会话不受影响。
+    pub(crate) fn clear_relay(&self) {
+        let mut relay = self.relay.lock().unwrap_or_else(|e| e.into_inner());
+        relay.writer = None;
+        relay.pending.clear();
+        relay.pending_bytes = 0;
+        relay.queue_enabled = false;
+    }
+
+    pub(crate) fn has_active_relay(&self) -> bool {
+        self.relay
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .writer
+            .is_some()
     }
 
     pub(crate) fn set_remote_agent_info(&self, loader_ctx_addr: u64, current_thread_eval_impl: u64) {
         self.loader_ctx_addr.store(loader_ctx_addr, Ordering::Release);
         self.agent_current_thread_eval_impl
             .store(current_thread_eval_impl, Ordering::Release);
+    }
+
+    pub(crate) fn mark_tcp_owned(&self) {
+        self.tcp_owned.store(true, Ordering::Release);
     }
 
     /// 向 agent 派发 RPC 调用并等待结果。

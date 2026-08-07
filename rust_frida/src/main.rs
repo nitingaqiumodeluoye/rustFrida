@@ -137,7 +137,7 @@ fn main() {
     set_current_thread_name(b"wwb-rfmain\0");
 
     // Fix #8: 先解析参数（--help/--version 在此退出），再打印 banner
-    let args = Args::parse();
+    let mut args = Args::parse();
 
     // 初始化 verbose 模式
     logger::VERBOSE.store(args.verbose, Ordering::Relaxed);
@@ -194,6 +194,25 @@ fn main() {
         }
     }
 
+    // 与 frida-server 一致：没有指定单进程目标或属性独立操作时，
+    // 直接进入 server daemon；--server 仍保留作为显式写法。
+    let has_explicit_mode = [
+        args.pid.is_some(),
+        args.watch_so.is_some(),
+        args.name.is_some(),
+        args.spawn.is_some(),
+        args.dump_props.is_some(),
+        args.set_prop.is_some(),
+        args.del_prop.is_some(),
+        args.repack_props.is_some(),
+        args.server,
+    ]
+    .into_iter()
+    .any(|enabled| enabled);
+    if !has_explicit_mode {
+        args.server = true;
+    }
+
     // --profile 校验: 仅 --spawn 或 --server 可用
     if args.profile.is_some() && args.spawn.is_none() && !args.server {
         log_error!("--profile 仅在 --spawn 或 --server 模式下可用");
@@ -234,6 +253,10 @@ fn main() {
     }
     if target_count > 1 {
         log_error!("目标模式参数互斥，请只保留一种：--pid / --name / --spawn / --watch-so / --dump-props / --set-prop / --del-prop / --repack-props / --server");
+        std::process::exit(1);
+    }
+    if args.listen.is_some() && !args.server {
+        log_error!("--listen 仅在 server 模式下可用");
         std::process::exit(1);
     }
 

@@ -2,6 +2,9 @@
 
 use clap::Parser;
 
+/// Frida-server compatible default control endpoint.
+pub(crate) const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:15819";
+
 fn parse_pid(s: &str) -> std::result::Result<i32, String> {
     match s.parse::<i32>() {
         Ok(n) if n > 0 => Ok(n),
@@ -33,8 +36,10 @@ inline hook、Frida Stalker 追踪等功能。
   rustfrida --spawn com.app --profile default                       # Spawn 并应用
 
 Server daemon 模式（多 session 并发）:
-  rustfrida --server                                                # 启动 server
-  rustfrida --server --profile default                              # 启动 + 属性伪装持续生效
+  rustfrida                                                        # 默认监听 0.0.0.0:15819
+  rustfrida --server                                               # 同上，显式 server 模式
+  rustfrida --server --listen 27047                                # 覆盖监听端口
+  rustfrida --server --profile default                             # 启动 + 属性伪装持续生效
 
 注入后进入 REPL，输入 help 查看可用命令（jsinit / loadjs / jsrepl / jhook 等）。"
 )]
@@ -140,7 +145,8 @@ pub(crate) struct Args {
     #[arg(long = "profile", value_name = "NAME")]
     pub(crate) profile: Option<String>,
 
-    /// Server daemon 模式：多 session 并发 spawn/inject，profile 持续生效
+    /// Server daemon 模式：多 session 并发 spawn/inject，profile 持续生效。
+    /// 未指定任何目标时也会默认进入此模式。
     ///
     /// 启动后进入 server REPL，支持同时管理多个注入 session。
     /// 配合 --profile 使用可在整个 server 生命周期内持续生效。
@@ -157,4 +163,16 @@ pub(crate) struct Args {
     /// 在 legacy 模式下 session_id 为 0，在 --server 模式下为 list 命令显示的 id。
     #[arg(long = "rpc-port", value_name = "PORT_OR_ADDR")]
     pub(crate) rpc_port: Option<String>,
+
+    /// 覆盖 TCP 监听地址，允许主机端 rfclient 连接。
+    ///
+    /// 格式: --listen <PORT> 或 --listen <HOST:PORT>（默认绑定 0.0.0.0）。
+    /// 主机端客户端连接后发送引导请求:
+    ///   list                         列出所有 session
+    ///   attach <pid|name>            注入已运行进程
+    ///   spawn <package> [-l script]  启动应用并注入
+    ///   use <session_id>             复用已有 session
+    /// 之后进入帧级中继，主机端 REPL 与本地 REPL 功能一致。
+    #[arg(long = "listen", value_name = "PORT_OR_ADDR")]
+    pub(crate) listen: Option<String>,
 }

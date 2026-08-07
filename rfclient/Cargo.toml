@@ -1,0 +1,13 @@
+[package]
+name = "rfclient"
+version = "0.1.0"
+edition = "2021"
+description = "rustFrida 主机端客户端：连接设备上 rustfrida --server --listen 的 TCP 控制服务器"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+rustyline = "15"
+
+[[bin]]
+name = "rfclient"
+path = "src/main.rs"
