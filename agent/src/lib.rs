@@ -356,13 +356,34 @@ fn start_java_worker_and_respond() {
     match quickjs_loader::start_java_worker() {
         Ok(()) => {
             if quickjs_loader::is_initialized() {
-                let script = "if (globalThis.Java && typeof Java._flushReadyCallbacks === 'function') Java._flushReadyCallbacks();";
-                if let Err(e) = quickjs_loader::eval_on_java_worker(
+                let script = r#"
+(function () {
+    if (!globalThis.Java || typeof Java._flushReadyCallbacks !== "function") {
+        return "java-unavailable";
+    }
+
+    var Thread = Java.use("java.lang.Thread");
+    for (var attempt = 0; attempt < 200 && !Java._isClassLoaderReady(); attempt++) {
+        if (Java._reprobeClassLoaderOnce && Java._reprobeClassLoaderOnce()) {
+            break;
+        }
+        Thread.sleep(50);
+    }
+
+    Java._flushReadyCallbacks();
+    return Java._isClassLoaderReady() ? "ready" : "timeout";
+})()
+"#;
+                match quickjs_loader::eval_on_java_worker(
                     script.to_string(),
-                    "<java_ready_flush>".to_string(),
-                    false,
+                    "<java_ready_bootstrap>".to_string(),
+                    true,
                 ) {
-                    log_msg(format!("[java worker] Java.ready flush failed: {}\n", e));
+                    Ok(result) => log_msg(format!(
+                        "[java worker] Java.ready bootstrap: {}\n",
+                        result
+                    )),
+                    Err(e) => log_msg(format!("[java worker] Java.ready bootstrap failed: {}\n", e)),
                 }
             }
             send_eval_ok("java-worker-ready");
