@@ -1684,12 +1684,8 @@
         } catch(e) {
             console.log("[Java.ready] gate hook install failed: " + e);
             if (_isRawCloneJsThread()) {
-                try {
-                    if (Java._cutRawCloneExecutorHook) {
-                        Java._cutRawCloneExecutorHook();
-                    }
-                } catch (_) {}
-                throw e;
+                console.log("[Java.ready] gate unavailable, falling back to Java worker ClassLoader probe");
+                return;
             }
         }
     };
