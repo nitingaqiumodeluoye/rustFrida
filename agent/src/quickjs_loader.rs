@@ -27,6 +27,7 @@ use crate::communication::{log_msg, write_stream};
 
 const JAVA_WORKER_EVAL_TIMEOUT_MS: u64 = 60_000;
 const JAVA_WORKER_BUSY_FAST_FAIL_MS: u64 = 500;
+const JAVA_WORKER_QUEUE_WAIT_TIMEOUT_MS: u64 = 15_000;
 const JAVA_WORKER_LOOP_READY_TIMEOUT_MS: u64 = 1_500;
 
 static ENGINE_INITIALIZED: AtomicBool = AtomicBool::new(false);
@@ -269,8 +270,20 @@ unsafe extern "C" fn java_worker_native_loop(
             init_engine,
             reply,
         } => {
+            write_stream(
+                format!(
+                    "[java worker] eval dequeued: tid={} file={} init={}",
+                    JAVA_WORKER_TID.load(Ordering::Acquire),
+                    filename,
+                    init_engine
+                )
+                .as_bytes(),
+            );
             let result = run_eval_task(&script, &filename, init_engine);
             JAVA_WORKER_EVAL_IN_FLIGHT.store(false, Ordering::Release);
+            write_stream(
+                format!("[java worker] eval completed: file={} ok={}", filename, result.is_ok()).as_bytes(),
+            );
             let _ = reply.send(result);
             true
         }
@@ -343,6 +356,10 @@ pub fn start_java_worker() -> Result<(), String> {
     set_console_callback(|msg| {
         write_stream(format!("[JS] {}", msg).as_bytes());
     });
+    // A newly created ART worker cannot have an eval in flight. Clear any
+    // state left by the pre-resume raw-clone executor before accepting its
+    // first task.
+    JAVA_WORKER_EVAL_IN_FLIGHT.store(false, Ordering::Release);
     write_stream(b"[java worker] starting");
     JAVA_WORKER_LOOP_ENTERED.store(false, Ordering::Release);
     JAVA_WORKER_NATIVE_RELEASED.store(false, Ordering::Release);
@@ -416,17 +433,41 @@ fn wait_java_worker_stopped(had_worker: bool, timeout_ms: u64) -> bool {
 }
 
 pub fn eval_on_java_worker(script: String, filename: String, init_engine: bool) -> Result<String, String> {
+    write_stream(
+        format!(
+            "[java worker] eval requested: caller_tid={} file={} init={} started={} in_flight={}",
+            unsafe { libc::syscall(libc::SYS_gettid) },
+            filename,
+            init_engine,
+            JAVA_WORKER_STARTED.load(Ordering::Acquire),
+            JAVA_WORKER_EVAL_IN_FLIGHT.load(Ordering::Acquire)
+        )
+        .as_bytes(),
+    );
     start_java_worker()?;
     if !JAVA_WORKER_LOOP_RUNNING.load(Ordering::Acquire) {
         return Err("Java worker loop is not running".to_string());
     }
-    let queue = JavaWorkerQueue::get();
-    if JAVA_WORKER_EVAL_IN_FLIGHT
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        return Err("Java worker busy: previous Java eval is still running".to_string());
+    let queue_wait_started = std::time::Instant::now();
+    loop {
+        if JAVA_WORKER_EVAL_IN_FLIGHT
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            write_stream(format!("[java worker] eval acquired: file={}", filename).as_bytes());
+            break;
+        }
+        if queue_wait_started.elapsed()
+            >= std::time::Duration::from_millis(JAVA_WORKER_QUEUE_WAIT_TIMEOUT_MS)
+        {
+            return Err(format!(
+                "Java worker busy for more than {}ms",
+                JAVA_WORKER_QUEUE_WAIT_TIMEOUT_MS
+            ));
+        }
+        crate::raw_thread::sleep_ms(5);
     }
+    let queue = JavaWorkerQueue::get();
     let (tx, rx) = mpsc::channel();
     queue.push(JavaWorkerTask::Eval {
         script,
