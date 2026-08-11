@@ -649,6 +649,28 @@ fn selected_executor_message_queue() -> u64 {
     }
 }
 
+const NATIVE_POINTER_ADDRESS_MASK: u64 = 0x00ff_ffff_ffff_ffff;
+
+#[inline]
+fn untag_native_pointer(ptr: u64) -> u64 {
+    ptr & NATIVE_POINTER_ADDRESS_MASK
+}
+
+#[cfg(test)]
+mod tagged_pointer_tests {
+    use super::untag_native_pointer;
+
+    #[test]
+    fn strips_android_top_byte_tag() {
+        assert_eq!(untag_native_pointer(0xb400_007d_2962_a400), 0x0000_007d_2962_a400);
+    }
+
+    #[test]
+    fn preserves_untagged_pointer() {
+        assert_eq!(untag_native_pointer(0x0000_007d_2962_a400), 0x0000_007d_2962_a400);
+    }
+}
+
 fn clear_executor_message_queue(queue_ptr: u64) {
     let _ = EXECUTOR_MAIN_MESSAGE_QUEUE.compare_exchange(
         queue_ptr,
@@ -674,10 +696,11 @@ fn log_invalid_message_queue(queue_ptr: u64, where_: &str) {
 }
 
 fn is_valid_native_message_queue(queue_ptr: u64) -> bool {
+    let queue_ptr = untag_native_pointer(queue_ptr);
     if queue_ptr < 0x10000 || !crate::jsapi::util::is_addr_accessible(queue_ptr, 16) {
         return false;
     }
-    let looper = unsafe { std::ptr::read_volatile(queue_ptr as *const u64) };
+    let looper = untag_native_pointer(unsafe { std::ptr::read_volatile(queue_ptr as *const u64) });
     if looper < 0x10000 || !crate::jsapi::util::is_addr_accessible(looper, 8) {
         return false;
     }
@@ -697,10 +720,11 @@ fn safe_write_looper_wake_fd(queue_ptr: u64) -> Option<bool> {
     if fd_offset == 0 {
         return None;
     }
+    let queue_ptr = untag_native_pointer(queue_ptr);
     if queue_ptr < 0x10000 || !crate::jsapi::util::is_addr_accessible(queue_ptr, 8) {
         return Some(false);
     }
-    let looper = unsafe { std::ptr::read_volatile(queue_ptr as *const u64) };
+    let looper = untag_native_pointer(unsafe { std::ptr::read_volatile(queue_ptr as *const u64) });
     if looper < 0x10000 || !crate::jsapi::util::is_addr_accessible(looper + fd_offset as u64, 4) {
         return Some(false);
     }
@@ -1245,7 +1269,7 @@ unsafe extern "C" fn on_message_queue_native_poll_once_enter(
     ctx.intercept_leave = 0;
 
     let env = ctx.x[0] as JniEnv;
-    let queue_ptr = ctx.x[2];
+    let queue_ptr = untag_native_pointer(ctx.x[2]);
     if queue_ptr != 0 {
         if !is_valid_native_message_queue(queue_ptr) {
             log_invalid_message_queue(queue_ptr, "poll");

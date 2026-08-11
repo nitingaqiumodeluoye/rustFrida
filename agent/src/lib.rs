@@ -354,7 +354,19 @@ fn eval_on_java_worker_and_respond(script: String, filename: String, init_engine
 #[cfg(feature = "quickjs")]
 fn start_java_worker_and_respond() {
     match quickjs_loader::start_java_worker() {
-        Ok(()) => send_eval_ok("java-worker-ready"),
+        Ok(()) => {
+            if quickjs_loader::is_initialized() {
+                let script = "if (globalThis.Java && typeof Java._flushReadyCallbacks === 'function') Java._flushReadyCallbacks();";
+                if let Err(e) = quickjs_loader::eval_on_java_worker(
+                    script.to_string(),
+                    "<java_ready_flush>".to_string(),
+                    false,
+                ) {
+                    log_msg(format!("[java worker] Java.ready flush failed: {}\n", e));
+                }
+            }
+            send_eval_ok("java-worker-ready");
+        }
         Err(e) => send_eval_err(&format!("java worker start failed: {}", e)),
     }
 }
