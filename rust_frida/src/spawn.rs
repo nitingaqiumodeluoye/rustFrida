@@ -17,8 +17,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::injection::{inject_via_bootstrapper, InjectionResult};
 use crate::proc_mem::ProcMem;
-use crate::process::{parse_proc_maps, wait_until_stopped, MapEntry};
+use crate::process::{attach_to_process, call_target_function, parse_proc_maps, wait_until_stopped, MapEntry};
 use crate::{log_error, log_info, log_step, log_success, log_verbose, log_warn};
+use nix::sys::ptrace;
+use nix::unistd::Pid;
 
 /// 嵌入编译好的 zymbiote ELF
 const ZYMBIOTE_ELF: &[u8] = include_bytes!("../../zymbiote/build/zymbiote.elf");
@@ -52,6 +54,8 @@ struct ZygotePatch {
     payload_path: String,
     #[allow(dead_code)]
     payload_file_offset: u64,
+    /// 目标 libc.madvise 地址，用于 payload 恢复后丢弃 COW 页
+    libc_madvise: u64,
     /// setArgV0 指针位置和原始值（None = 三层扫描均 miss，走 setcontext-only 降级）
     setargv0_slot: Option<(u64, [u8; 8])>,
     /// setcontext GOT slot（可选）
@@ -927,6 +931,63 @@ fn revert_child_patch_by_ppid(pid: u32, ppid: u32) -> Result<(), String> {
         mem.pwrite_all(backup, *addr)?;
     }
 
+    // 写回原始 payload 只恢复字节内容；对文件-backed 私有可执行页还要丢弃
+    // 本进程的 COW 副本，否则后续 smaps 仍可能看到 Anonymous/Dirty。
+    discard_payload_cow(pid, patch, "子进程")?;
+
+    Ok(())
+}
+
+/// 在已停止的目标进程中调用其 libc.madvise，丢弃 payload 覆盖页的 COW 副本。
+///
+/// 调用者通常只有 SIGSTOP，而没有 ptrace 控制权，因此这里临时 attach，完成
+/// 远程调用后立即 detach；调用者随后负责 SIGCONT。只处理 payload 所在的页，
+/// 不触碰 GOT、heap 等其他恢复区域。
+fn discard_payload_cow(pid: u32, patch: &ZygotePatch, label: &str) -> Result<(), String> {
+    if patch.libc_madvise == 0 {
+        return Err(format!("{} payload 缺少 libc.madvise 地址", label));
+    }
+
+    let raw_page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if raw_page_size <= 0 {
+        return Err(format!("{} payload 无法获取 page_size", label));
+    }
+    let page_size = raw_page_size as u64;
+    if (page_size & (page_size - 1)) != 0 {
+        return Err(format!("{} payload page_size 非 2 的幂: {}", label, page_size));
+    }
+
+    let page_start = patch.payload_base & !(page_size - 1);
+    let payload_end = patch
+        .payload_base
+        .checked_add(patch.payload_backup.len() as u64)
+        .ok_or_else(|| format!("{} payload 地址范围溢出", label))?;
+    let page_end = payload_end
+        .checked_add(page_size - 1)
+        .ok_or_else(|| format!("{} payload 页范围溢出", label))?
+        & !(page_size - 1);
+    let page_len = page_end
+        .checked_sub(page_start)
+        .ok_or_else(|| format!("{} payload 页范围无效", label))?;
+
+    let target = pid as i32;
+    attach_to_process(target)?;
+    let call_result = call_target_function(
+        target,
+        patch.libc_madvise as usize,
+        &[page_start as usize, page_len as usize, libc::MADV_DONTNEED as usize],
+        None,
+    );
+    let detach_result = ptrace::detach(Pid::from_raw(target), None)
+        .map_err(|e| format!("{} payload COW 清理后 detach 失败: {}", label, e));
+
+    let ret = call_result?;
+    detach_result?;
+    if ret != 0 {
+        return Err(format!("{} payload madvise(MADV_DONTNEED) 返回 {}", label, ret));
+    }
+
+    log_verbose!("已清理 {} payload COW 页: 0x{:x}+0x{:x}", label, page_start, page_len);
     Ok(())
 }
 
@@ -1837,6 +1898,7 @@ fn inject_zymbiote(pid: u32, socket_name: &str) -> Result<ZygotePatch, String> {
         payload_backup,
         payload_path: loc.path,
         payload_file_offset: loc.file_offset,
+        libc_madvise: libc_funcs.madvise,
         setargv0_slot,
         setcontext_got,
         capset_got,
@@ -1969,6 +2031,7 @@ fn dump_maps_near(maps: &[MapEntry], addr: u64, radius: usize) -> String {
 /// libc 函数地址集合
 struct LibcFunctions {
     mprotect: u64,
+    madvise: u64,
     strdup: u64,
     free: u64,
     socket: u64,
@@ -2000,6 +2063,7 @@ fn resolve_libc_functions(maps: &[MapEntry]) -> Result<LibcFunctions, String> {
 
     Ok(LibcFunctions {
         mprotect: resolve("mprotect")?,
+        madvise: resolve("madvise")?,
         strdup: resolve("strdup")?,
         free: resolve("free")?,
         socket: resolve("socket")?,
@@ -2557,6 +2621,12 @@ fn cleanup_zygote_patches_with_pending_mode(mode: PendingConnectionCleanup) {
                     if let Err(e) = mem.pwrite_all(backup, *addr) {
                         log_error!("还原 zygote {} capset GOT 失败: {}", patch.pid, e);
                     }
+                }
+
+                // payload 位于文件-backed 可执行页；写回原始字节后继续丢弃
+                // zygote 自己的 COW 副本，避免 patch 生命周期结束后留下脏页。
+                if let Err(e) = discard_payload_cow(patch.pid, patch, "zygote") {
+                    log_error!("清理 zygote {} payload COW 失败: {}", patch.pid, e);
                 }
 
                 log_success!("Zygote {} patch 已还原", patch.pid);

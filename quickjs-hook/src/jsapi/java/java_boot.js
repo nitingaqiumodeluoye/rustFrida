@@ -1649,9 +1649,25 @@
 
     Java._installGateHook = function() {
         if (_gateInstalled) return;
+
+        // In spawn mode this script runs on the raw-clone thread while the
+        // child is still stopped before ActivityThread has attached to AMS.
+        // Installing Instrumentation hooks here forces the ART routing matrix
+        // into the pre-attach path and can leave the main thread stuck until
+        // ActivityManager kills it for start_timeout.  The post-resume Java
+        // worker probes the app ClassLoader and flushes the same callbacks,
+        // so defer the gate instead of touching Instrumentation pre-resume.
+        if (_isRawCloneJsThread()) {
+            console.log("[Java.ready] spawn raw clone: defer gate to post-resume Java worker");
+            return;
+        }
+
+        var newApplicationGate = null;
+        var callApplicationOnCreateGate = null;
         try {
             var Inst = Java.use("android.app.Instrumentation");
-            Inst.newApplication.overload(_readyGateSig).impl = function(classLoader, className, context) {
+            newApplicationGate = Inst.newApplication.overload(_readyGateSig);
+            newApplicationGate.impl = function(classLoader, className, context) {
                 var app = this.$orig(classLoader, className, context);
 
                 if (classLoader !== null && classLoader !== undefined) {
@@ -1666,7 +1682,8 @@
 
                 return app;
             };
-            Inst.callApplicationOnCreate.overload(_readyCallAppSig).impl = function(app) {
+            callApplicationOnCreateGate = Inst.callApplicationOnCreate.overload(_readyCallAppSig);
+            callApplicationOnCreateGate.impl = function(app) {
                 if (app !== null && app !== undefined) {
                     try {
                         var cl = app.getClass().getClassLoader();
@@ -1683,6 +1700,21 @@
             _gateInstalled = true;
         } catch(e) {
             console.log("[Java.ready] gate hook install failed: " + e);
+            if (callApplicationOnCreateGate !== null) {
+                try {
+                    callApplicationOnCreateGate.impl = null;
+                } catch (rollbackCallAppError) {
+                    console.log("[Java.ready] callApplicationOnCreate rollback failed: " + rollbackCallAppError);
+                }
+            }
+            if (newApplicationGate !== null) {
+                try {
+                    newApplicationGate.impl = null;
+                } catch (rollbackNewAppError) {
+                    console.log("[Java.ready] newApplication rollback failed: " + rollbackNewAppError);
+                }
+            }
+            _gateInstalled = false;
             if (_isRawCloneJsThread()) {
                 console.log("[Java.ready] gate unavailable, falling back to Java worker ClassLoader probe");
                 return;

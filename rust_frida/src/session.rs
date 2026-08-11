@@ -2,11 +2,13 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io::Write;
+use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::communication::{send_command, HostToAgentMessage, SyncChannel};
+use crate::injection::LoaderCleanupInfo;
 
 /// A frame produced by the agent before the TCP client finishes its bootstrap
 /// request. The relay is activated only after the textual `OK` response has
@@ -21,6 +23,10 @@ pub(crate) struct PendingRelayFrame {
 /// mirroring frida-server's connection-owned outbound queue.
 pub(crate) struct RelayState {
     pub(crate) writer: Option<Box<dyn Write + Send>>,
+    /// A clone used to interrupt the relay reader when the agent disappears.
+    /// Dropping the writer alone is not enough because the relay owns another
+    /// clone of the same TCP socket for inbound frames.
+    pub(crate) closer: Option<TcpStream>,
     pub(crate) pending: VecDeque<PendingRelayFrame>,
     pub(crate) pending_bytes: usize,
     pub(crate) queue_enabled: bool,
@@ -40,13 +46,14 @@ pub(crate) struct Session {
     pub(crate) rpc_lock: Mutex<()>,
     pub(crate) loader_ctx_addr: std::sync::atomic::AtomicU64,
     pub(crate) agent_current_thread_eval_impl: std::sync::atomic::AtomicU64,
+    pub(crate) loader_cleanup: Mutex<LoaderCleanupInfo>,
     pub(crate) java_worker_ready: AtomicBool,
     pub(crate) connected: AtomicBool,
     pub(crate) disconnected: AtomicBool,
     pub(crate) shutdown_requested: AtomicBool,
-    /// TCP-owned sessions must use agent detach on transport teardown.
-    /// Full wxshadow release is reserved for local server sessions because
-    /// the KPM release path can reboot the device on this target.
+    /// Marks sessions created through the TCP control plane. Transport
+    /// ownership is separate from target cleanup: closing the server still
+    /// performs the normal agent shutdown before releasing loader mappings.
     pub(crate) tcp_owned: AtomicBool,
     pub(crate) failed: AtomicBool,
     /// 远程 TCP 中继状态：agent 帧除写入 SyncChannel 外，还会转发到这里。
@@ -67,6 +74,7 @@ impl Session {
             rpc_lock: Mutex::new(()),
             loader_ctx_addr: std::sync::atomic::AtomicU64::new(0),
             agent_current_thread_eval_impl: std::sync::atomic::AtomicU64::new(0),
+            loader_cleanup: Mutex::new(LoaderCleanupInfo::default()),
             java_worker_ready: AtomicBool::new(false),
             connected: AtomicBool::new(false),
             disconnected: AtomicBool::new(false),
@@ -75,6 +83,7 @@ impl Session {
             failed: AtomicBool::new(false),
             relay: Mutex::new(RelayState {
                 writer: None,
+                closer: None,
                 pending: VecDeque::new(),
                 pending_bytes: 0,
                 queue_enabled: false,
@@ -87,6 +96,7 @@ impl Session {
     pub(crate) fn prepare_relay(&self) {
         let mut relay = self.relay.lock().unwrap_or_else(|e| e.into_inner());
         relay.writer = None;
+        relay.closer = None;
         relay.pending.clear();
         relay.pending_bytes = 0;
         relay.queue_enabled = true;
@@ -96,23 +106,28 @@ impl Session {
     pub(crate) fn clear_relay(&self) {
         let mut relay = self.relay.lock().unwrap_or_else(|e| e.into_inner());
         relay.writer = None;
+        relay.closer = None;
         relay.pending.clear();
         relay.pending_bytes = 0;
         relay.queue_enabled = false;
     }
 
     pub(crate) fn has_active_relay(&self) -> bool {
-        self.relay
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .writer
-            .is_some()
+        self.relay.lock().unwrap_or_else(|e| e.into_inner()).writer.is_some()
     }
 
     pub(crate) fn set_remote_agent_info(&self, loader_ctx_addr: u64, current_thread_eval_impl: u64) {
         self.loader_ctx_addr.store(loader_ctx_addr, Ordering::Release);
         self.agent_current_thread_eval_impl
             .store(current_thread_eval_impl, Ordering::Release);
+    }
+
+    pub(crate) fn set_loader_cleanup_info(&self, info: LoaderCleanupInfo) {
+        *self.loader_cleanup.lock().unwrap_or_else(|e| e.into_inner()) = info;
+    }
+
+    pub(crate) fn loader_cleanup_info(&self) -> LoaderCleanupInfo {
+        *self.loader_cleanup.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     pub(crate) fn mark_tcp_owned(&self) {

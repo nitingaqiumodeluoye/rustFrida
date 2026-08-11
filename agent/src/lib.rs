@@ -32,8 +32,8 @@ mod quickjs_loader;
 mod stalker;
 
 use crate::communication::{
-    clear_stream, flush_cached_logs, is_cmd_frame, is_qbdi_helper_frame, log_msg, log_msg_sync, register_stream, send_bye,
-    send_complete, send_eval_err, send_eval_ok, send_hello, send_rpc_err, send_rpc_ok, shutdown_log_writer,
+    clear_stream, flush_cached_logs, is_cmd_frame, is_qbdi_helper_frame, log_msg, log_msg_sync, register_stream,
+    send_bye, send_complete, send_eval_err, send_eval_ok, send_hello, send_rpc_err, send_rpc_ok, shutdown_log_writer,
     shutdown_stream, start_log_writer, write_stream,
 };
 use crate::crash_handler::install_panic_hook;
@@ -115,10 +115,7 @@ pub extern "C" fn rustfrida_set_initial_script_ready_callback(
     context: *mut c_void,
 ) {
     INITIAL_SCRIPT_READY_CONTEXT.store(context as usize, Ordering::Release);
-    INITIAL_SCRIPT_READY_CALLBACK.store(
-        callback.map(|value| value as usize).unwrap_or(0),
-        Ordering::Release,
-    );
+    INITIAL_SCRIPT_READY_CALLBACK.store(callback.map(|value| value as usize).unwrap_or(0), Ordering::Release);
 }
 
 fn notify_initial_script_ready() {
@@ -374,15 +371,13 @@ fn start_java_worker_and_respond() {
     return Java._isClassLoaderReady() ? "ready" : "timeout";
 })()
 "#;
-                match quickjs_loader::eval_on_java_worker(
+                match quickjs_loader::eval_on_java_worker_wait(
                     script.to_string(),
                     "<java_ready_bootstrap>".to_string(),
                     true,
+                    15_000,
                 ) {
-                    Ok(result) => log_msg(format!(
-                        "[java worker] Java.ready bootstrap: {}\n",
-                        result
-                    )),
+                    Ok(result) => log_msg(format!("[java worker] Java.ready bootstrap: {}\n", result)),
                     Err(e) => log_msg(format!("[java worker] Java.ready bootstrap failed: {}\n", e)),
                 }
             }
@@ -640,10 +635,7 @@ fn process_cmd(command: &str) {
             let (filename, script) = parse_loadjs_payload(rest);
             let filename = filename.to_string();
             let script = script.to_string();
-            dispatch_js_task_with_ready(
-                move || init_eval_and_respond(&script, &filename),
-                true,
-            );
+            dispatch_js_task_with_ready(move || init_eval_and_respond(&script, &filename), true);
         }
         #[cfg(feature = "quickjs")]
         Some("javaworker_init") => dispatch_js_task(start_java_worker_and_respond),

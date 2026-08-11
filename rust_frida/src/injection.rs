@@ -99,7 +99,10 @@ fn setup_loader_fallback_listener(name: &str) -> Result<OwnedFd, String> {
     let (addr, addrlen) = socket_addr_abstract(name)?;
     let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
     if fd < 0 {
-        return Err(format!("创建 loader fallback socket 失败: {}", std::io::Error::last_os_error()));
+        return Err(format!(
+            "创建 loader fallback socket 失败: {}",
+            std::io::Error::last_os_error()
+        ));
     }
 
     let listener = OwnedFd::new(fd);
@@ -127,7 +130,14 @@ fn setup_loader_fallback_listener(name: &str) -> Result<OwnedFd, String> {
 fn accept_loader_fallback_connection(listener_fd: RawFd, deadline: Instant) -> Result<RawFd, String> {
     loop {
         poll_loader_fd(listener_fd, libc::POLLIN, deadline, "等待 loader fallback 连接")?;
-        let fd = unsafe { libc::accept4(listener_fd, std::ptr::null_mut(), std::ptr::null_mut(), libc::SOCK_CLOEXEC) };
+        let fd = unsafe {
+            libc::accept4(
+                listener_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                libc::SOCK_CLOEXEC,
+            )
+        };
         if fd >= 0 {
             return Ok(fd);
         }
@@ -151,6 +161,61 @@ pub(crate) struct InjectionResult {
     pub(crate) loader_stack: u64,
     pub(crate) loader_stack_size: u64,
     pub(crate) libc_munmap: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct LoaderCleanupInfo {
+    pub(crate) loader_alloc_base: u64,
+    pub(crate) loader_alloc_size: u64,
+    pub(crate) loader_stack: u64,
+    pub(crate) loader_stack_size: u64,
+    pub(crate) libc_munmap: u64,
+}
+
+impl From<&InjectionResult> for LoaderCleanupInfo {
+    fn from(result: &InjectionResult) -> Self {
+        Self {
+            loader_alloc_base: result.loader_alloc_base,
+            loader_alloc_size: result.loader_alloc_size,
+            loader_stack: result.loader_stack,
+            loader_stack_size: result.loader_stack_size,
+            libc_munmap: result.libc_munmap,
+        }
+    }
+}
+
+pub(crate) fn cleanup_remote_loader_mappings(pid: i32, info: LoaderCleanupInfo) {
+    if pid <= 0 || info.libc_munmap == 0 {
+        return;
+    }
+
+    let mut ranges = Vec::new();
+    if info.loader_stack != 0 && info.loader_stack_size != 0 {
+        ranges.push(("loader stack", info.loader_stack, info.loader_stack_size));
+    }
+    if info.loader_alloc_base != 0 && info.loader_alloc_size != 0 {
+        ranges.push(("loader mapping", info.loader_alloc_base, info.loader_alloc_size));
+    }
+    if ranges.is_empty() || !std::path::Path::new(&format!("/proc/{}/status", pid)).exists() {
+        return;
+    }
+
+    let tid = choose_injection_thread(pid);
+    if let Err(e) = attach_to_process(tid) {
+        log_warn!("loader 残留清理跳过: attach tid={} 失败: {}", tid, e);
+        return;
+    }
+    for (label, base, size) in ranges {
+        match call_target_function(tid, info.libc_munmap as usize, &[base as usize, size as usize], None) {
+            Ok(ret) if ret == 0 => log_verbose!("已清理 {}: 0x{:x}+0x{:x}", label, base, size),
+            Ok(ret) => log_verbose!("清理 {} 返回 {}: 0x{:x}+0x{:x}", label, ret, base, size),
+            Err(e) => log_warn!("清理 {} 失败: {}", label, e),
+        }
+    }
+    let _ = ptrace::detach(Pid::from_raw(tid), None);
+    unsafe {
+        libc::kill(pid, libc::SIGCONT);
+    }
 }
 
 fn open_procfs_fd(pid: i32, target_fd: i32) -> Result<RawFd, String> {
@@ -194,12 +259,7 @@ fn extract_fd_from_target(pid: i32, target_fd: i32) -> Result<RawFd, String> {
     if host_fd < 0 {
         let err = std::io::Error::last_os_error();
         if matches!(err.raw_os_error(), Some(libc::ENOSYS) | Some(libc::EINVAL)) {
-            log_warn!(
-                "pidfd_getfd 不可用，回退到 /proc/{}/fd/{}: {}",
-                pid,
-                target_fd,
-                err
-            );
+            log_warn!("pidfd_getfd 不可用，回退到 /proc/{}/fd/{}: {}", pid, target_fd, err);
             return open_procfs_fd(pid, target_fd);
         }
         return Err(format!("pidfd_getfd(pid={}, fd={}) 失败: {}", pid, target_fd, err));
@@ -392,54 +452,111 @@ pub(crate) fn watch_and_inject(
 // Frida-style 注入：bootstrapper + loader 两阶段
 // =============================================================================
 
-/// 在目标进程中找到一个足够大的 r-xp 区域用于 code-swap
-/// 优先选择 linker64（所有 Android 进程都有），避免覆盖 libc 的热代码
+/// 在目标进程中找到一个足够大的文件-backed r-xp 区域用于 code-swap。
+///
+/// 这里不再限制必须是 App 私有映射：spawn/zygote 的早期阶段通常还没有
+/// App 自己的可执行映射。恢复原始字节后，调用方会按页执行 MADV_DONTNEED，
+/// 丢弃本次覆盖产生的 COW 私有页，因此系统库映射也可以作为临时执行区。
 fn find_executable_region(pid: i32, min_size: usize) -> Result<usize, String> {
     let maps_path = format!("/proc/{}/maps", pid);
     let raw = std::fs::read(&maps_path).map_err(|e| format!("读取 {} 失败: {}", maps_path, e))?;
     let maps = String::from_utf8_lossy(&raw);
 
-    // 优先找 linker64 的 r-xp 段
+    // 优先保持原有行为：linker 是 Android 进程中稳定存在且足够大的执行映射。
+    // 如果 linker 不可用，再优先选择非系统文件映射，最后允许系统文件映射兜底。
+    // 兜底不包含匿名映射、特殊映射或 deleted 文件，避免 MADV_DONTNEED 后无法
+    // 从原 backing file 重新建立代码页。
+    let mut non_system_candidate: Option<(usize, String)> = None;
+    let mut any_file_candidate: Option<(usize, String)> = None;
+
     for line in maps.lines() {
-        if !line.contains("r-xp") {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.get(1) != Some(&"r-xp") {
             continue;
         }
-        if !line.contains("linker64") {
+        let path = parts.get(5).copied().unwrap_or("");
+        if path.is_empty() || path.starts_with('[') || line.contains(" (deleted)") {
             continue;
         }
 
-        let parts: Vec<&str> = line.split_whitespace().collect();
         if let Some(range) = parts.first() {
             let mut it = range.split('-');
             if let (Some(start_s), Some(end_s)) = (it.next(), it.next()) {
                 let start = usize::from_str_radix(start_s, 16).unwrap_or(0);
                 let end = usize::from_str_radix(end_s, 16).unwrap_or(0);
-                if end - start >= min_size {
-                    return Ok(start);
+                if end > start && end - start >= min_size {
+                    if any_file_candidate.is_none() {
+                        any_file_candidate = Some((start, path.to_string()));
+                    }
+
+                    if path.ends_with("/linker64") || path.ends_with("/linker") {
+                        log_verbose!("选择 linker code-swap 映射: 0x{:x}-0x{:x} {}", start, end, path);
+                        return Ok(start);
+                    }
+
+                    if non_system_candidate.is_none() && !is_system_code_path(path) {
+                        non_system_candidate = Some((start, path.to_string()));
+                    }
                 }
             }
         }
     }
 
-    // fallback: 任何足够大的 r-xp 区域
-    for line in maps.lines() {
-        if !line.contains("r-xp") {
-            continue;
-        }
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if let Some(range) = parts.first() {
-            let mut it = range.split('-');
-            if let (Some(start_s), Some(end_s)) = (it.next(), it.next()) {
-                let start = usize::from_str_radix(start_s, 16).unwrap_or(0);
-                let end = usize::from_str_radix(end_s, 16).unwrap_or(0);
-                if end - start >= min_size {
-                    return Ok(start);
-                }
-            }
-        }
+    if let Some((start, path)) = non_system_candidate {
+        log_verbose!("选择非系统 code-swap 映射: 0x{:x} {}", start, path);
+        return Ok(start);
     }
 
-    Err("未找到可用的 r-xp 区域".into())
+    if let Some((start, path)) = any_file_candidate {
+        log_verbose!("选择系统文件 code-swap 映射（恢复后清理 COW）: 0x{:x} {}", start, path);
+        return Ok(start);
+    }
+
+    Err(format!(
+        "未找到足够大的文件-backed r-xp 区域（需要 {} bytes）",
+        min_size
+    ))
+}
+
+fn is_system_code_path(path: &str) -> bool {
+    path.starts_with("/system/")
+        || path.starts_with("/system_ext/")
+        || path.starts_with("/apex/")
+        || path.starts_with("/vendor/")
+        || path.starts_with("/product/")
+        || path.starts_with("/odm/")
+}
+
+/// 恢复 code-swap 字节后丢弃覆盖页，让内核重新从原文件建立干净页。
+///
+/// 仅写回原始字节不够：对 MAP_PRIVATE 的可执行文件映射做过写入后，页仍可能
+/// 保持 COW/Anonymous 状态。madvise 地址由 bootstrapper 直接从目标 libc 解析，
+/// 不在主机侧猜测目标地址，也不依赖 Android linker 的 dlsym 兼容行为。
+fn discard_code_swap_pages(tid: i32, swap_addr: usize, swap_len: usize, libc_api: FridaLibcApi) -> Result<(), String> {
+    if libc_api.madvise_fn == 0 {
+        return Err("bootstrapper 未解析到 madvise，无法清理 code-swap COW 页".into());
+    }
+
+    let page_start = align_down(swap_addr as u64, PAGE_SIZE) as usize;
+    let swap_end = swap_addr
+        .checked_add(swap_len)
+        .ok_or_else(|| "code-swap 地址范围溢出".to_string())?;
+    let page_end = align_up(swap_end as u64, PAGE_SIZE) as usize;
+    let page_len = page_end
+        .checked_sub(page_start)
+        .ok_or_else(|| "code-swap 页范围无效".to_string())?;
+    let ret = call_target_function(
+        tid,
+        libc_api.madvise_fn as usize,
+        &[page_start, page_len, libc::MADV_DONTNEED as usize],
+        None,
+    )?;
+    if ret != 0 {
+        return Err(format!("目标进程 madvise(MADV_DONTNEED) 返回 {}", ret));
+    }
+
+    log_verbose!("已丢弃 code-swap COW 页: 0x{:x}+0x{:x}", page_start, page_len);
+    Ok(())
 }
 
 pub(crate) fn choose_injection_thread(pid: i32) -> i32 {
@@ -1263,8 +1380,8 @@ fn inject_via_bootstrapper_once(
     let code_pages = ((code_size + page_size - 1) / page_size) * page_size;
     let data_size = 4 * page_size;
     let total_alloc = code_pages + data_size;
-    // === Code-swap: 临时覆盖目标进程可执行区域运行 bootstrapper ===
-    // 1. 找到目标进程的一个 r-xp 区域（linker64 最安全，所有进程都有）
+    // === Code-swap: 临时覆盖目标进程文件-backed 可执行区域运行 bootstrapper ===
+    // 1. 找到足够大的 r-xp 区域；恢复后通过 MADV_DONTNEED 清理覆盖页 COW。
     let swap_addr = find_executable_region(pid, BOOTSTRAPPER.len())?;
     log_verbose!("code-swap 区域: 0x{:x} ({} bytes)", swap_addr, BOOTSTRAPPER.len());
 
@@ -1357,6 +1474,11 @@ fn inject_via_bootstrapper_once(
     // 读回结果
     let bootstrap_ctx: FridaBootstrapContext = mem_read_value(&mem, ctx_addr)?;
     let libc_api: FridaLibcApi = mem_read_value(&mem, libc_api_addr)?;
+
+    // Phase 2 已解析目标 libc；现在丢弃 code-swap 覆盖页，清除恢复字节后仍存在的 COW 状态。
+    if let Err(e) = discard_code_swap_pages(trace_tid, swap_addr, BOOTSTRAPPER.len(), libc_api) {
+        return Err(format!("清理 code-swap COW 页失败: {}", e));
+    }
 
     log_verbose!("rtld_flavor: {}", bootstrap_ctx.rtld_flavor);
     log_verbose!(

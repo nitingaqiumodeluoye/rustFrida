@@ -220,7 +220,7 @@ frida_resolve_libc_apis (const FridaProcessLayout * layout, FridaLibcApi * libc)
   memset (libc, 0, sizeof (FridaLibcApi));
   libc->dlopen_flags = RTLD_LAZY;
 
-  ctx.total_missing = 11;
+  ctx.total_missing = 12;
   ctx.rtld_flavor = layout->rtld_flavor;
   ctx.api = libc;
   frida_elf_enumerate_exports (layout->libc, frida_collect_libc_symbol, &ctx);
@@ -270,6 +270,7 @@ frida_collect_libc_symbol (const FridaElfExportDetails * details, void * user_da
 
   FRIDA_TRY_COLLECT (mmap)
   FRIDA_TRY_COLLECT (munmap)
+  FRIDA_TRY_COLLECT (madvise)
   FRIDA_TRY_COLLECT (socket)
   FRIDA_TRY_COLLECT (socketpair)
   FRIDA_TRY_COLLECT (connect)

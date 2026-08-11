@@ -69,6 +69,7 @@ struct _FridaLibcApi
 
   void * (* mmap) (void * addr, size_t length, int prot, int flags, int fd, off_t offset);
   int (* munmap) (void * addr, size_t length);
+  int (* madvise) (void * addr, size_t length, int advice);
   int (* socket) (int domain, int type, int protocol);
   int (* socketpair) (int domain, int type, int protocol, int sv[2]);
   int (* connect) (int sockfd, const struct sockaddr * addr, socklen_t addrlen);

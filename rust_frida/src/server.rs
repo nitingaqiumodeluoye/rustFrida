@@ -23,8 +23,10 @@ use rustyline::validate::Validator;
 use rustyline::{Context, Editor, Helper};
 
 use crate::args::{Args, DEFAULT_LISTEN_ADDR};
-use crate::communication::{read_frame, send_command, start_socketpair_handler, start_tcp_relay, FRAME_KIND_BOOTSTRAP_SCRIPT};
-use crate::injection::inject_via_bootstrapper;
+use crate::communication::{
+    read_frame, send_command, start_socketpair_handler, start_tcp_relay, FRAME_KIND_BOOTSTRAP_SCRIPT,
+};
+use crate::injection::{cleanup_remote_loader_mappings, inject_via_bootstrapper, LoaderCleanupInfo};
 use crate::process::find_pid_by_name;
 use crate::repl::{
     cut_pre_resume_java_executor_hook, ensure_java_worker_ready, ensure_java_worker_ready_after_resume,
@@ -341,29 +343,26 @@ fn load_script_on_session(session: &Session, source: &ScriptSource, stop_worker_
 
 /// 发送 shutdown 并等待 agent 断连
 fn shutdown_session(session: &Session) {
-    let sender = match session.get_sender() {
-        Some(s) => s,
-        None => return,
-    };
-    if session.disconnected.load(Ordering::Acquire) {
-        return;
-    }
-    let command = if session.tcp_owned.load(Ordering::Acquire) {
-        // WXSHADOW release is not safe on this KPM target. A TCP session is
-        // detached instead, leaving the target-side hook alive until the app
-        // exits or a local session performs the full cleanup.
-        "detach"
-    } else {
+    if !session.disconnected.load(Ordering::Acquire) {
+        let sender = match session.get_sender() {
+            Some(s) => s,
+            None => return,
+        };
         session.shutdown_requested.store(true, Ordering::Release);
-        "shutdown"
-    };
-    let _ = send_command(sender, command);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-    while !session.disconnected.load(Ordering::Acquire) {
-        if std::time::Instant::now() >= deadline {
-            break;
+        let _ = send_command(sender, "shutdown");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !session.disconnected.load(Ordering::Acquire) {
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
         }
-        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    if session.disconnected.load(Ordering::Acquire) {
+        cleanup_remote_loader_mappings(session.pid.load(Ordering::Acquire), session.loader_cleanup_info());
+    } else {
+        log_warn!("[#{}] Agent 未在清理窗口内断开，保留目标资源避免并发破坏", session.id);
     }
 }
 
@@ -464,7 +463,10 @@ fn handle_tcp_client(
         "attach" | "spawn" => {
             let (positional, script) = parse_script_flag(&parts[1..]);
             if positional.is_empty() {
-                write_line(&write_stream, "ERR 用法: attach <pid|name> [-l script] 或 spawn <package> [-l script]")?;
+                write_line(
+                    &write_stream,
+                    "ERR 用法: attach <pid|name> [-l script] 或 spawn <package> [-l script]",
+                )?;
                 return Ok(());
             }
             let target = &positional[0];
@@ -488,7 +490,14 @@ fn handle_tcp_client(
             let (tx, rx) = channel();
             if parts[0] == "spawn" {
                 log_info!("[#{}] TCP spawn {}...", session.id, target);
-                do_spawn(session.clone(), target.clone(), script, string_overrides, verbose, Some(tx));
+                do_spawn(
+                    session.clone(),
+                    target.clone(),
+                    script,
+                    string_overrides,
+                    verbose,
+                    Some(tx),
+                );
             } else {
                 // attach: 数字 → PID，否则按进程名查找
                 let (pid, label) = if let Ok(p) = target.parse::<i32>() {
@@ -581,7 +590,10 @@ fn handle_tcp_client(
                 return Ok(());
             }
             session.mark_tcp_owned();
-            write_line(&write_stream, &format!("OK sid={} pid={}", id, session.pid.load(Ordering::Relaxed)))?;
+            write_line(
+                &write_stream,
+                &format!("OK sid={} pid={}", id, session.pid.load(Ordering::Relaxed)),
+            )?;
             // 复用已有会话：只中继，不 shutdown（会话归属其创建者）
             let _ = stream.set_read_timeout(None);
             let _ = stream.set_write_timeout(None);
@@ -613,7 +625,10 @@ fn read_tcp_bootstrap_line(stream: &mut TcpStream) -> Result<Option<String>, Str
             break;
         }
         if line.len() == MAX_TCP_BOOTSTRAP_LINE_BYTES {
-            return Err(format!("bootstrap request exceeds {} bytes", MAX_TCP_BOOTSTRAP_LINE_BYTES));
+            return Err(format!(
+                "bootstrap request exceeds {} bytes",
+                MAX_TCP_BOOTSTRAP_LINE_BYTES
+            ));
         }
         line.push(byte[0]);
     }
@@ -674,6 +689,7 @@ fn do_spawn(
                 Ok((pid, injection)) => {
                     session.pid.store(pid, Ordering::Relaxed);
                     session.set_remote_agent_info(injection.loader_ctx_addr, injection.agent_current_thread_eval_impl);
+                    session.set_loader_cleanup_info(LoaderCleanupInfo::from(&injection));
                     let _handle = start_socketpair_handler(injection.host_fd, session.clone());
 
                     if !session.wait_connected(SESSION_CONNECT_TIMEOUT_SECS) {
@@ -698,10 +714,7 @@ fn do_spawn(
                     // 最早期的 RegisterNatives。KPM 已修正 fork pause 的状态竞态；
                     // 如目标内核仍有旧版 PTE 问题，可通过环境变量显式启用延后模式。
                     let mut post_resume_java_worker_needed = false;
-                    let defer_wxshadow_script = script
-                        .as_ref()
-                        .map(script_declares_wxshadow)
-                        .unwrap_or(false)
+                    let defer_wxshadow_script = script.as_ref().map(script_declares_wxshadow).unwrap_or(false)
                         && std::env::var_os(WXSHADOW_SAFE_DELAY_ENV).is_some();
                     if defer_wxshadow_script {
                         log_warn!(
@@ -785,6 +798,7 @@ fn do_attach(
                 Ok(injection) => {
                     session.pid.store(pid, Ordering::Relaxed);
                     session.set_remote_agent_info(injection.loader_ctx_addr, injection.agent_current_thread_eval_impl);
+                    session.set_loader_cleanup_info(LoaderCleanupInfo::from(&injection));
                     let _handle = start_socketpair_handler(injection.host_fd, session.clone());
 
                     if !session.wait_connected(SESSION_CONNECT_TIMEOUT_SECS) {
@@ -1050,20 +1064,13 @@ pub(crate) fn run_server(args: &Args) {
         map
     };
 
-    // 先绑定控制端口，再执行 zygote 预注入。这样重复启动时会立即失败，
-    // 不会对已有 server 的 zygote patch 做重复操作。
+    // 先绑定控制端口。Zygote 只在收到实际 spawn 请求时按需注入；server 启动本身
+    // 不应修改 Zygote 的系统代码映射，否则即使没有 attach 目标也会留下 COW 页。
     let listen_arg = args.listen.as_deref().unwrap_or(DEFAULT_LISTEN_ADDR);
     let bind = crate::parse_rpc_bind(listen_arg);
     if let Err(e) = run_tcp_server(mgr.clone(), &bind, string_overrides.clone(), args.verbose) {
         log_error!("TCP server 启动失败: {}", e);
         std::process::exit(1);
-    }
-
-    // 预注入 zygote: daemon 启动即准备好，后续 spawn 不再等待注入
-    log_info!("正在预注入 Zygote...");
-    match spawn::ensure_zymbiote_loaded() {
-        Ok(()) => log_success!("Zygote 预注入完成，spawn 命令将即时生效"),
-        Err(e) => log_error!("Zygote 预注入失败: {} (spawn 命令将自动重试)", e),
     }
 
     // ── RPC HTTP 服务器（如启用）──
@@ -1089,195 +1096,210 @@ pub(crate) fn run_server(args: &Args) {
         }
         log_info!("收到终止信号，正在退出...");
     } else {
-    let mut rl = match Editor::new() {
-        Ok(e) => e,
-        Err(e) => {
-            log_error!("初始化行编辑器失败: {}", e);
-            return;
-        }
-    };
-    rl.set_helper(Some(ServerCompleter));
-    let _ = rl.load_history(".rustfrida_server_history");
+        let mut rl = match Editor::new() {
+            Ok(e) => e,
+            Err(e) => {
+                log_error!("初始化行编辑器失败: {}", e);
+                return;
+            }
+        };
+        rl.set_helper(Some(ServerCompleter));
+        let _ = rl.load_history(".rustfrida_server_history");
 
-    loop {
-        // 信号检查
-        if spawn::signal_received() {
-            log_info!("收到终止信号，正在退出...");
-            break;
-        }
+        loop {
+            // 信号检查
+            if spawn::signal_received() {
+                log_info!("收到终止信号，正在退出...");
+                break;
+            }
 
-        match rl.readline("server> ") {
-            Ok(line) => {
-                let line = line.trim().to_string();
-                if line.is_empty() {
-                    continue;
-                }
-                let _ = rl.add_history_entry(&line);
-                let parts: Vec<&str> = line.split_whitespace().collect();
-
-                match parts[0] {
-                    // ── spawn <package> [-l script.js] ──
-                    "spawn" => {
-                        if parts.len() < 2 {
-                            log_warn!("用法: spawn <package> [-l script.js]");
-                            continue;
-                        }
-                        let (positional, script) = parse_script_flag(&parts[1..]);
-                        if positional.is_empty() {
-                            log_warn!("用法: spawn <package> [-l script.js]");
-                            continue;
-                        }
-                        let package = &positional[0];
-                        let session = mgr.create_session(package.clone());
-                        log_info!("[#{}] 正在 spawn {}...", session.id, package);
-                        let script = script.map(ScriptSource::DevicePath);
-                        do_spawn(session, package.clone(), script, string_overrides.clone(), args.verbose, None);
+            match rl.readline("server> ") {
+                Ok(line) => {
+                    let line = line.trim().to_string();
+                    if line.is_empty() {
+                        continue;
                     }
+                    let _ = rl.add_history_entry(&line);
+                    let parts: Vec<&str> = line.split_whitespace().collect();
 
-                    // ── attach <pid|name> [-l script.js] ──
-                    "attach" => {
-                        if parts.len() < 2 {
-                            log_warn!("用法: attach <pid|name> [-l script.js]");
-                            continue;
-                        }
-                        let (positional, script) = parse_script_flag(&parts[1..]);
-                        if positional.is_empty() {
-                            log_warn!("用法: attach <pid|name> [-l script.js]");
-                            continue;
-                        }
-                        let target = &positional[0];
-                        // 自动判断: 纯数字 → PID，否则 → 进程名
-                        let (pid, label) = if let Ok(p) = target.parse::<i32>() {
-                            (p, format!("PID:{}", p))
-                        } else {
-                            match find_pid_by_name(target) {
-                                Ok(p) => {
-                                    log_success!("按名称 '{}' 找到进程 PID: {}", target, p);
-                                    (p, target.to_string())
-                                }
-                                Err(e) => {
-                                    log_error!("{}", e);
-                                    continue;
-                                }
-                            }
-                        };
-                        let session = mgr.create_session(label.clone());
-                        log_info!("[#{}] 正在注入 {} (PID: {})...", session.id, label, pid);
-                        let script = script.map(ScriptSource::DevicePath);
-                        do_attach(session, pid, label, script, string_overrides.clone(), args.verbose, None);
-                    }
-
-                    // ── list / sessions ──
-                    "list" | "sessions" => {
-                        print_sessions(&mgr);
-                    }
-
-                    // ── use <id> ──
-                    "use" => {
-                        if parts.len() < 2 {
-                            log_warn!("用法: use <session_id>");
-                            continue;
-                        }
-                        let id = match parts[1].parse::<u32>() {
-                            Ok(id) => id,
-                            Err(_) => {
-                                log_error!("无效的 session ID: {}", parts[1]);
+                    match parts[0] {
+                        // ── spawn <package> [-l script.js] ──
+                        "spawn" => {
+                            if parts.len() < 2 {
+                                log_warn!("用法: spawn <package> [-l script.js]");
                                 continue;
                             }
-                        };
-                        match mgr.get_session(id) {
-                            None => {
-                                log_error!("Session #{} 不存在", id);
+                            let (positional, script) = parse_script_flag(&parts[1..]);
+                            if positional.is_empty() {
+                                log_warn!("用法: spawn <package> [-l script.js]");
+                                continue;
                             }
-                            Some(session) => {
-                                if !session.is_connected() {
-                                    let status = session.status();
-                                    if status == "disconnected" || status == "failed" {
-                                        log_warn!("Session #{} 已断开，正在清理", id);
-                                        mgr.remove_session(id);
-                                    } else {
-                                        log_warn!("Session #{} 当前状态: {} — 请等待连接就绪", id, status);
+                            let package = &positional[0];
+                            let session = mgr.create_session(package.clone());
+                            log_info!("[#{}] 正在 spawn {}...", session.id, package);
+                            let script = script.map(ScriptSource::DevicePath);
+                            do_spawn(
+                                session,
+                                package.clone(),
+                                script,
+                                string_overrides.clone(),
+                                args.verbose,
+                                None,
+                            );
+                        }
+
+                        // ── attach <pid|name> [-l script.js] ──
+                        "attach" => {
+                            if parts.len() < 2 {
+                                log_warn!("用法: attach <pid|name> [-l script.js]");
+                                continue;
+                            }
+                            let (positional, script) = parse_script_flag(&parts[1..]);
+                            if positional.is_empty() {
+                                log_warn!("用法: attach <pid|name> [-l script.js]");
+                                continue;
+                            }
+                            let target = &positional[0];
+                            // 自动判断: 纯数字 → PID，否则 → 进程名
+                            let (pid, label) = if let Ok(p) = target.parse::<i32>() {
+                                (p, format!("PID:{}", p))
+                            } else {
+                                match find_pid_by_name(target) {
+                                    Ok(p) => {
+                                        log_success!("按名称 '{}' 找到进程 PID: {}", target, p);
+                                        (p, target.to_string())
                                     }
-                                    continue;
+                                    Err(e) => {
+                                        log_error!("{}", e);
+                                        continue;
+                                    }
                                 }
-                                mgr.set_active(Some(id));
-                                let should_remove = run_session_repl(&session);
-                                mgr.set_active(None);
-                                if should_remove {
-                                    mgr.remove_session(id);
-                                }
-                            }
+                            };
+                            let session = mgr.create_session(label.clone());
+                            log_info!("[#{}] 正在注入 {} (PID: {})...", session.id, label, pid);
+                            let script = script.map(ScriptSource::DevicePath);
+                            do_attach(
+                                session,
+                                pid,
+                                label,
+                                script,
+                                string_overrides.clone(),
+                                args.verbose,
+                                None,
+                            );
                         }
-                    }
 
-                    // ── detach <id> ──
-                    "detach" => {
-                        if parts.len() < 2 {
-                            log_warn!("用法: detach <session_id>");
-                            continue;
+                        // ── list / sessions ──
+                        "list" | "sessions" => {
+                            print_sessions(&mgr);
                         }
-                        let id = match parts[1].parse::<u32>() {
-                            Ok(id) => id,
-                            Err(_) => {
-                                log_error!("无效的 session ID: {}", parts[1]);
+
+                        // ── use <id> ──
+                        "use" => {
+                            if parts.len() < 2 {
+                                log_warn!("用法: use <session_id>");
                                 continue;
                             }
-                        };
-                        match mgr.remove_session(id) {
-                            None => {
-                                log_error!("Session #{} 不存在", id);
+                            let id = match parts[1].parse::<u32>() {
+                                Ok(id) => id,
+                                Err(_) => {
+                                    log_error!("无效的 session ID: {}", parts[1]);
+                                    continue;
+                                }
+                            };
+                            match mgr.get_session(id) {
+                                None => {
+                                    log_error!("Session #{} 不存在", id);
+                                }
+                                Some(session) => {
+                                    if !session.is_connected() {
+                                        let status = session.status();
+                                        if status == "disconnected" || status == "failed" {
+                                            log_warn!("Session #{} 已断开，正在清理", id);
+                                            mgr.remove_session(id);
+                                        } else {
+                                            log_warn!("Session #{} 当前状态: {} — 请等待连接就绪", id, status);
+                                        }
+                                        continue;
+                                    }
+                                    mgr.set_active(Some(id));
+                                    let should_remove = run_session_repl(&session);
+                                    mgr.set_active(None);
+                                    if should_remove {
+                                        mgr.remove_session(id);
+                                    }
+                                }
                             }
-                            Some(session) => {
-                                shutdown_session(&session);
+                        }
+
+                        // ── detach <id> ──
+                        "detach" => {
+                            if parts.len() < 2 {
+                                log_warn!("用法: detach <session_id>");
+                                continue;
+                            }
+                            let id = match parts[1].parse::<u32>() {
+                                Ok(id) => id,
+                                Err(_) => {
+                                    log_error!("无效的 session ID: {}", parts[1]);
+                                    continue;
+                                }
+                            };
+                            match mgr.remove_session(id) {
+                                None => {
+                                    log_error!("Session #{} 不存在", id);
+                                }
+                                Some(session) => {
+                                    shutdown_session(&session);
+                                    log_success!("[#{}] 已断开", id);
+                                }
+                            }
+                        }
+
+                        // ── detachall ──
+                        "detachall" => {
+                            let sessions = mgr.all_sessions();
+                            for session in &sessions {
+                                let id = session.id;
+                                shutdown_session(session);
+                                mgr.remove_session(id);
                                 log_success!("[#{}] 已断开", id);
                             }
                         }
-                    }
 
-                    // ── detachall ──
-                    "detachall" => {
-                        let sessions = mgr.all_sessions();
-                        for session in &sessions {
-                            let id = session.id;
-                            shutdown_session(session);
-                            mgr.remove_session(id);
-                            log_success!("[#{}] 已断开", id);
+                        // ── help ──
+                        "help" => {
+                            print_server_help();
+                        }
+
+                        // ── exit / quit ──
+                        "exit" | "quit" => {
+                            log_info!("正在退出 server...");
+                            break;
+                        }
+
+                        other => {
+                            log_warn!("未知命令: {} — 输入 help 查看可用命令", other);
                         }
                     }
-
-                    // ── help ──
-                    "help" => {
-                        print_server_help();
-                    }
-
-                    // ── exit / quit ──
-                    "exit" | "quit" => {
-                        log_info!("正在退出 server...");
-                        break;
-                    }
-
-                    other => {
-                        log_warn!("未知命令: {} — 输入 help 查看可用命令", other);
-                    }
+                }
+                Err(ReadlineError::Interrupted) => {
+                    // Ctrl+C: 不立即退出，提示用户
+                    println!();
+                    log_info!("按 Ctrl+C 收到中断 — 输入 exit 退出 server");
+                }
+                Err(ReadlineError::Eof) => {
+                    log_info!("正在退出 server...");
+                    break;
+                }
+                Err(e) => {
+                    log_error!("读取输入失败: {}", e);
+                    break;
                 }
             }
-            Err(ReadlineError::Interrupted) => {
-                // Ctrl+C: 不立即退出，提示用户
-                println!();
-                log_info!("按 Ctrl+C 收到中断 — 输入 exit 退出 server");
-            }
-            Err(ReadlineError::Eof) => {
-                log_info!("正在退出 server...");
-                break;
-            }
-            Err(e) => {
-                log_error!("读取输入失败: {}", e);
-                break;
-            }
         }
-    }
 
-    let _ = rl.save_history(".rustfrida_server_history");
+        let _ = rl.save_history(".rustfrida_server_history");
     }
 
     // 清理所有 session

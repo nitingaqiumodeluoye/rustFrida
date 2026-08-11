@@ -2,7 +2,7 @@
 
 use std::io::ErrorKind;
 use std::io::{self, Read, Write};
-use std::net::TcpStream;
+use std::net::{Shutdown, TcpStream};
 use std::os::unix::io::{FromRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::Ordering;
@@ -194,7 +194,9 @@ fn forward_agent_frame(session: &Session, kind: u8, payload: &[u8]) {
     while relay.pending_bytes.saturating_add(frame_bytes) > MAX_RELAY_BACKLOG_BYTES {
         match relay.pending.pop_front() {
             Some(frame) => {
-                relay.pending_bytes = relay.pending_bytes.saturating_sub(frame.payload.len().saturating_add(5));
+                relay.pending_bytes = relay
+                    .pending_bytes
+                    .saturating_sub(frame.payload.len().saturating_add(5));
             }
             None => break,
         }
@@ -208,18 +210,23 @@ fn forward_agent_frame(session: &Session, kind: u8, payload: &[u8]) {
 
 fn install_tcp_relay(stream: &TcpStream, session: &Session) -> io::Result<()> {
     let writer = Box::new(stream.try_clone()?);
+    let closer = stream.try_clone()?;
     let mut relay = session.relay.lock().unwrap_or_else(|e| e.into_inner());
     relay.writer = Some(writer);
+    relay.closer = Some(closer);
     relay.queue_enabled = false;
 
     while let Some(frame) = relay.pending.pop_front() {
-        relay.pending_bytes = relay.pending_bytes.saturating_sub(frame.payload.len().saturating_add(5));
+        relay.pending_bytes = relay
+            .pending_bytes
+            .saturating_sub(frame.payload.len().saturating_add(5));
         let write_result = match relay.writer.as_mut() {
             Some(writer) => write_frame(writer, frame.kind, &frame.payload),
             None => break,
         };
         if let Err(e) = write_result {
             relay.writer = None;
+            relay.closer = None;
             relay.pending.clear();
             relay.pending_bytes = 0;
             return Err(e);
@@ -227,6 +234,29 @@ fn install_tcp_relay(stream: &TcpStream, session: &Session) -> io::Result<()> {
     }
     relay.pending_bytes = 0;
     Ok(())
+}
+
+/// Notify the host that the agent session is gone and tear down the TCP relay.
+///
+/// The agent socket can disappear without sending a BYE frame when the target
+/// process exits. Frida closes the host transport when its agent session emits
+/// the detached event; mirror that behavior here. The dedicated closer clone
+/// is required to wake the relay reader, which otherwise remains blocked in
+/// `read_frame` on its own clone of the TCP socket.
+fn close_tcp_relay(session: &Session, send_bye: bool) {
+    let mut relay = session.relay.lock().unwrap_or_else(|e| e.into_inner());
+    if send_bye {
+        if let Some(writer) = relay.writer.as_mut() {
+            let _ = write_frame(writer, FRAME_KIND_BYE, &[]);
+        }
+    }
+    if let Some(stream) = relay.closer.take() {
+        let _ = stream.shutdown(Shutdown::Both);
+    }
+    relay.writer = None;
+    relay.pending.clear();
+    relay.pending_bytes = 0;
+    relay.queue_enabled = false;
 }
 
 fn handle_socket_connection(stream: UnixStream, session: Arc<Session>) {
@@ -337,6 +367,7 @@ fn handle_socket_connection(stream: UnixStream, session: Arc<Session>) {
                     }
                     FRAME_KIND_BYE => {
                         session.disconnected.store(true, Ordering::Release);
+                        close_tcp_relay(&session, false);
                         break;
                     }
                     other => {
@@ -351,6 +382,7 @@ fn handle_socket_connection(stream: UnixStream, session: Arc<Session>) {
                     log_error!("[#{}] Agent 连接已断开", session.id);
                 }
                 session.disconnected.store(true, Ordering::Release);
+                close_tcp_relay(&session, true);
                 break;
             }
             Err(e)
@@ -364,6 +396,7 @@ fn handle_socket_connection(stream: UnixStream, session: Arc<Session>) {
                     ) =>
             {
                 session.disconnected.store(true, Ordering::Release);
+                close_tcp_relay(&session, true);
                 break;
             }
             Err(e) => {
@@ -373,6 +406,7 @@ fn handle_socket_connection(stream: UnixStream, session: Arc<Session>) {
                     log_error!("排查: dmesg | grep -i 'deny\\|avc'  或  logcat | grep -E 'FATAL|crash'");
                 }
                 session.disconnected.store(true, Ordering::Release);
+                close_tcp_relay(&session, true);
                 break;
             }
         }
@@ -408,6 +442,11 @@ pub(crate) fn start_tcp_relay(
     if let Err(e) = install_tcp_relay(&stream, &session) {
         log_info!("[#{}] TCP relay unavailable: {}", session.id, e);
     }
+    // The agent may have disconnected between the textual OK response and
+    // relay installation. Close a relay installed after that event as well.
+    if session.disconnected.load(Ordering::Acquire) {
+        close_tcp_relay(&session, false);
+    }
 
     thread::Builder::new()
         .name("wwb-tcpin".into())
@@ -418,17 +457,8 @@ pub(crate) fn start_tcp_relay(
                     Ok((kind, payload)) => match kind {
                         FRAME_KIND_CMD => {
                             let requested = String::from_utf8_lossy(&payload).into_owned();
-                            let cmd = if session.tcp_owned.load(Ordering::Acquire)
-                                && requested.trim() == "shutdown"
-                            {
-                                // Never expose the unsafe full wxshadow release
-                                // through the TCP control plane.
-                                "detach".to_string()
-                            } else {
-                                requested
-                            };
                             if let Some(sender) = session.get_sender() {
-                                if let Err(e) = send_command(sender, cmd) {
+                                if let Err(e) = send_command(sender, requested) {
                                     log_error!("[#{}] 转发命令失败: {}", session.id, e);
                                     break;
                                 }

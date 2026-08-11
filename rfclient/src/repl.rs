@@ -4,7 +4,7 @@
 //! `jsrepl` 是设备端子 REPL（读设备 stdin），TCP 下不可用，用 jseval 逐行求值替代。
 
 use std::fs::File;
-use std::io::Write;
+use std::io::{self, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, sync_channel, Receiver, RecvTimeoutError, Sender, SyncSender};
@@ -31,7 +31,11 @@ const COMMANDS: &[(&str, &str, &str)] = &[
     ("jseval", "<expr>", "求值 JS 表达式并显示结果"),
     ("loadjs", "<file>", "加载本地 JS 脚本文件（自动初始化引擎）"),
     ("jsclean", "", "清理 QuickJS 引擎"),
-    ("rpccall", "<method> [args]", "调用 rpc.exports 方法（args 为 JSON 数组）"),
+    (
+        "rpccall",
+        "<method> [args]",
+        "调用 rpc.exports 方法（args 为 JSON 数组）",
+    ),
     ("hfl", "<module> <offset>", "Interceptor hook 指定偏移"),
     ("trace", "[tid]", "ptrace 指令追踪"),
     ("stalker", "[tid]", "Frida Stalker 追踪"),
@@ -58,6 +62,7 @@ pub fn configure_output(path: Option<&str>) -> Result<(), String> {
 pub fn print_line(s: &str) {
     let _g = PRINT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     println!("{}", s);
+    let _ = io::stdout().flush();
     if let Some(file) = OUTPUT_FILE.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
         let _ = writeln!(file, "{}", s);
         let _ = file.flush();
@@ -164,10 +169,7 @@ pub fn run(stream: &mut TcpStream, eof_linger: Duration) -> Result<(), String> {
                 }
                 if !is_known_command(&line) {
                     let name = line.split_whitespace().next().unwrap_or("(empty)");
-                    print_line(&format!(
-                        "[rfclient] 无效命令 '{}'，输入 help 查看可用命令",
-                        name
-                    ));
+                    print_line(&format!("[rfclient] 无效命令 '{}'，输入 help 查看可用命令", name));
                     continue;
                 }
 
@@ -342,11 +344,7 @@ fn is_known_command(cmd: &str) -> bool {
 }
 
 /// 等待指定类型的响应；忽略其他类型（如 LOG 已由接收线程打印，不会进 channel）。
-fn wait_response(
-    rx: &Receiver<Incoming>,
-    kind: IncomingKind,
-    timeout_secs: u64,
-) -> Option<Result<String, String>> {
+fn wait_response(rx: &Receiver<Incoming>, kind: IncomingKind, timeout_secs: u64) -> Option<Result<String, String>> {
     let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
     loop {
         let now = std::time::Instant::now();
@@ -449,4 +447,9 @@ fn receiver_loop(
             }
         }
     }
+
+    // `rustyline::readline` is synchronous and cannot be cancelled by the
+    // receiver thread. Once the server closes the transport, terminate this
+    // standalone CLI so a stale prompt cannot keep the dead session alive.
+    std::process::exit(0);
 }

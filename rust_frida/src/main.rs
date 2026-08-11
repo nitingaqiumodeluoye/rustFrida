@@ -33,10 +33,10 @@ use clap::Parser;
 #[cfg(feature = "qbdi")]
 use communication::send_qbdi_helper;
 use communication::{send_command, start_socketpair_handler};
-use injection::{inject_via_bootstrapper, watch_and_inject, InjectionResult};
-use nix::sys::ptrace;
-use nix::unistd::Pid;
-use process::{attach_to_process, call_target_function, find_pid_by_name};
+use injection::{
+    cleanup_remote_loader_mappings, inject_via_bootstrapper, watch_and_inject, InjectionResult, LoaderCleanupInfo,
+};
+use process::find_pid_by_name;
 use repl::{
     ensure_java_worker_ready_after_resume, load_script_file, load_script_file_pre_resume, print_eval_result,
     print_help, rewrite_jseval_for_agent, run_js_repl, script_uses_java_api, try_jseval_on_main_thread_if_java_or_dsl,
@@ -85,51 +85,6 @@ fn wait_process_alive(pid: i32, seconds: u64, label: &str) -> bool {
 fn set_current_thread_name(name: &'static [u8]) {
     unsafe {
         let _ = libc::prctl(libc::PR_SET_NAME, name.as_ptr(), 0, 0, 0);
-    }
-}
-
-fn cleanup_remote_loader_mappings(pid: i32, injection: &InjectionResult) {
-    if pid <= 0 || injection.libc_munmap == 0 {
-        return;
-    }
-    let mut ranges = Vec::new();
-    if injection.loader_stack != 0 && injection.loader_stack_size != 0 {
-        ranges.push(("loader stack", injection.loader_stack, injection.loader_stack_size));
-    }
-    if injection.loader_alloc_base != 0 && injection.loader_alloc_size != 0 {
-        ranges.push((
-            "loader mapping",
-            injection.loader_alloc_base,
-            injection.loader_alloc_size,
-        ));
-    }
-    if ranges.is_empty() {
-        return;
-    }
-    if !std::path::Path::new(&format!("/proc/{}/status", pid)).exists() {
-        return;
-    }
-
-    let tid = injection::choose_injection_thread(pid);
-    if let Err(e) = attach_to_process(tid) {
-        log_warn!("loader 残留清理跳过: attach tid={} 失败: {}", tid, e);
-        return;
-    }
-    for (label, base, size) in ranges {
-        match call_target_function(
-            tid,
-            injection.libc_munmap as usize,
-            &[base as usize, size as usize],
-            None,
-        ) {
-            Ok(ret) if ret == 0 => log_verbose!("已清理 {}: 0x{:x}+0x{:x}", label, base, size),
-            Ok(ret) => log_verbose!("清理 {} 返回 {}: 0x{:x}+0x{:x}", label, ret, base, size),
-            Err(e) => log_warn!("清理 {} 失败: {}", label, e),
-        }
-    }
-    let _ = ptrace::detach(Pid::from_raw(tid), None);
-    unsafe {
-        libc::kill(pid, libc::SIGCONT);
     }
 }
 
@@ -685,7 +640,7 @@ fn main() {
 
     if agent_disconnected {
         if let Some(pid) = target_pid {
-            cleanup_remote_loader_mappings(pid, &injection);
+            cleanup_remote_loader_mappings(pid, LoaderCleanupInfo::from(&injection));
         }
     }
 
