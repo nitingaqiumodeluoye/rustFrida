@@ -153,34 +153,60 @@ unsafe fn load_dynamic_managed_helper_class(
         (dex.as_ptr() as *mut std::ffi::c_void, dex.len() as i64)
     };
 
-    let find_loader_cls = find_class_safe(env, "dalvik/system/InMemoryDexClassLoader");
+    let find_loader_cls = find_class_safe(env, "dalvik/system/BaseDexClassLoader");
     if find_loader_cls.is_null() {
-        return Err("InMemoryDexClassLoader class not found".to_string());
+        return Err("BaseDexClassLoader class not found".to_string());
     }
 
     let get_mid: GetMethodIdFn = jni_fn!(env, GetMethodIdFn, JNI_GET_METHOD_ID);
+    let get_static_mid: GetStaticMethodIdFn = jni_fn!(env, GetStaticMethodIdFn, JNI_GET_STATIC_METHOD_ID);
     let new_object: NewObjectAFn = jni_fn!(env, NewObjectAFn, JNI_NEW_OBJECT_A);
+    let new_object_array: NewObjectArrayFn = jni_fn!(env, NewObjectArrayFn, JNI_NEW_OBJECT_ARRAY);
     let new_direct: NewDirectByteBufferFn = jni_fn!(env, NewDirectByteBufferFn, JNI_NEW_DIRECT_BYTE_BUFFER);
     let delete_local_ref: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
     let new_global_ref: NewGlobalRefFn = jni_fn!(env, NewGlobalRefFn, JNI_NEW_GLOBAL_REF);
+    let delete_global_ref: DeleteGlobalRefFn = jni_fn!(env, DeleteGlobalRefFn, JNI_DELETE_GLOBAL_REF);
+    let call_static_obj: CallStaticObjectMethodAFn =
+        jni_fn!(env, CallStaticObjectMethodAFn, JNI_CALL_STATIC_OBJECT_METHOD_A);
     let call_obj: CallObjectMethodAFn = jni_fn!(env, CallObjectMethodAFn, JNI_CALL_OBJECT_METHOD_A);
     let new_string_utf: NewStringUtfFn = jni_fn!(env, NewStringUtfFn, JNI_NEW_STRING_UTF);
 
+    let byte_buffer_cls = find_class_safe(env, "java/nio/ByteBuffer");
+    if byte_buffer_cls.is_null() {
+        delete_local_ref(env, find_loader_cls);
+        return Err("java.nio.ByteBuffer class not found".to_string());
+    }
+
+    let class_loader_cls = find_class_safe(env, "java/lang/ClassLoader");
+    if class_loader_cls.is_null() {
+        delete_local_ref(env, byte_buffer_cls);
+        delete_local_ref(env, find_loader_cls);
+        return Err("java.lang.ClassLoader class not found".to_string());
+    }
+
     let ctor_name = CString::new("<init>").unwrap();
-    let ctor_sig = CString::new("(Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V").unwrap();
+    let ctor_sig = if get_android_api_level() >= 29 {
+        CString::new("([Ljava/nio/ByteBuffer;Ljava/lang/String;Ljava/lang/ClassLoader;)V").unwrap()
+    } else {
+        CString::new("([Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V").unwrap()
+    };
     let ctor = get_mid(env, find_loader_cls, ctor_name.as_ptr(), ctor_sig.as_ptr());
     if ctor.is_null() {
         let err = jni_failure_with_exception(
             env,
-            "InMemoryDexClassLoader(ByteBuffer, ClassLoader) constructor not found",
+            "BaseDexClassLoader(ByteBuffer[], ClassLoader) constructor not found",
         );
+        delete_local_ref(env, class_loader_cls);
+        delete_local_ref(env, byte_buffer_cls);
         delete_local_ref(env, find_loader_cls);
         return Err(err);
     }
     if let Some(exc) = jni_take_exception(env) {
+        delete_local_ref(env, class_loader_cls);
+        delete_local_ref(env, byte_buffer_cls);
         delete_local_ref(env, find_loader_cls);
         return Err(format!(
-            "InMemoryDexClassLoader(ByteBuffer, ClassLoader) constructor lookup failed: {}",
+            "BaseDexClassLoader(ByteBuffer[], ClassLoader) constructor lookup failed: {}",
             exc
         ));
     }
@@ -188,44 +214,114 @@ unsafe fn load_dynamic_managed_helper_class(
     let dex_buf = new_direct(env, dex_ptr, dex_len);
     if dex_buf.is_null() {
         let err = jni_failure_with_exception(env, "NewDirectByteBuffer for dynamic managed dex failed");
+        delete_local_ref(env, class_loader_cls);
+        delete_local_ref(env, byte_buffer_cls);
         delete_local_ref(env, find_loader_cls);
         return Err(err);
     }
     if let Some(exc) = jni_take_exception(env) {
+        delete_local_ref(env, dex_buf);
+        delete_local_ref(env, class_loader_cls);
+        delete_local_ref(env, byte_buffer_cls);
         delete_local_ref(env, find_loader_cls);
         return Err(format!("NewDirectByteBuffer for dynamic managed dex failed: {}", exc));
     }
 
-    let parent_loader = get_app_classloader_local_ref(env);
-    let args = [dex_buf as u64, parent_loader as u64];
-    let loader = new_object(env, find_loader_cls, ctor, args.as_ptr() as *const std::ffi::c_void);
-    if loader.is_null() {
-        let err = jni_failure_with_exception(env, "new dynamic InMemoryDexClassLoader failed");
-        if !parent_loader.is_null() {
-            delete_local_ref(env, parent_loader);
-        }
+    let dex_buffers = new_object_array(env, 1, byte_buffer_cls, dex_buf);
+    if dex_buffers.is_null() {
+        let err = jni_failure_with_exception(env, "ByteBuffer[] allocation for dynamic managed dex failed");
         delete_local_ref(env, dex_buf);
+        delete_local_ref(env, class_loader_cls);
+        delete_local_ref(env, byte_buffer_cls);
         delete_local_ref(env, find_loader_cls);
         return Err(err);
     }
     if let Some(exc) = jni_take_exception(env) {
+        delete_local_ref(env, dex_buffers);
+        delete_local_ref(env, dex_buf);
+        delete_local_ref(env, class_loader_cls);
+        delete_local_ref(env, byte_buffer_cls);
+        delete_local_ref(env, find_loader_cls);
+        return Err(format!("ByteBuffer[] allocation for dynamic managed dex failed: {}", exc));
+    }
+
+    let mut parent_loader = get_app_classloader_local_ref(env);
+    if parent_loader.is_null() {
+        let get_system_name = CString::new("getSystemClassLoader").unwrap();
+        let get_system_sig = CString::new("()Ljava/lang/ClassLoader;").unwrap();
+        let get_system_mid = get_static_mid(
+            env,
+            class_loader_cls,
+            get_system_name.as_ptr(),
+            get_system_sig.as_ptr(),
+        );
+        if get_system_mid.is_null() {
+            let err = jni_failure_with_exception(env, "ClassLoader.getSystemClassLoader method not found");
+            delete_local_ref(env, dex_buffers);
+            delete_local_ref(env, dex_buf);
+            delete_local_ref(env, class_loader_cls);
+            delete_local_ref(env, byte_buffer_cls);
+            delete_local_ref(env, find_loader_cls);
+            return Err(err);
+        }
+        if let Some(exc) = jni_take_exception(env) {
+            delete_local_ref(env, dex_buffers);
+            delete_local_ref(env, dex_buf);
+            delete_local_ref(env, class_loader_cls);
+            delete_local_ref(env, byte_buffer_cls);
+            delete_local_ref(env, find_loader_cls);
+            return Err(format!("ClassLoader.getSystemClassLoader lookup failed: {}", exc));
+        }
+        parent_loader = call_static_obj(env, class_loader_cls, get_system_mid, std::ptr::null());
+        if parent_loader.is_null() {
+            let err = jni_failure_with_exception(env, "ClassLoader.getSystemClassLoader failed");
+            delete_local_ref(env, dex_buffers);
+            delete_local_ref(env, dex_buf);
+            delete_local_ref(env, class_loader_cls);
+            delete_local_ref(env, byte_buffer_cls);
+            delete_local_ref(env, find_loader_cls);
+            return Err(err);
+        }
+        if let Some(exc) = jni_take_exception(env) {
+            delete_local_ref(env, parent_loader);
+            delete_local_ref(env, dex_buffers);
+            delete_local_ref(env, dex_buf);
+            delete_local_ref(env, class_loader_cls);
+            delete_local_ref(env, byte_buffer_cls);
+            delete_local_ref(env, find_loader_cls);
+            return Err(format!("ClassLoader.getSystemClassLoader failed: {}", exc));
+        }
+    }
+
+    let args = if get_android_api_level() >= 29 {
+        [dex_buffers as u64, 0, parent_loader as u64]
+    } else {
+        [dex_buffers as u64, parent_loader as u64, 0]
+    };
+    let loader = new_object(env, find_loader_cls, ctor, args.as_ptr() as *const std::ffi::c_void);
+    if loader.is_null() {
+        let err = jni_failure_with_exception(env, "new dynamic BaseDexClassLoader failed");
         if !parent_loader.is_null() {
             delete_local_ref(env, parent_loader);
         }
+        delete_local_ref(env, dex_buffers);
         delete_local_ref(env, dex_buf);
+        delete_local_ref(env, class_loader_cls);
+        delete_local_ref(env, byte_buffer_cls);
         delete_local_ref(env, find_loader_cls);
-        return Err(format!("new dynamic InMemoryDexClassLoader failed: {}", exc));
+        return Err(err);
     }
-
-    let class_loader_cls = find_class_safe(env, "java/lang/ClassLoader");
-    if class_loader_cls.is_null() {
+    if let Some(exc) = jni_take_exception(env) {
         delete_local_ref(env, loader);
         if !parent_loader.is_null() {
             delete_local_ref(env, parent_loader);
         }
+        delete_local_ref(env, dex_buffers);
         delete_local_ref(env, dex_buf);
+        delete_local_ref(env, class_loader_cls);
+        delete_local_ref(env, byte_buffer_cls);
         delete_local_ref(env, find_loader_cls);
-        return Err("java.lang.ClassLoader class not found".to_string());
+        return Err(format!("new dynamic BaseDexClassLoader failed: {}", exc));
     }
     let load_name = CString::new("loadClass").unwrap();
     let load_sig = CString::new("(Ljava/lang/String;)Ljava/lang/Class;").unwrap();
@@ -237,7 +333,9 @@ unsafe fn load_dynamic_managed_helper_class(
         if !parent_loader.is_null() {
             delete_local_ref(env, parent_loader);
         }
+        delete_local_ref(env, dex_buffers);
         delete_local_ref(env, dex_buf);
+        delete_local_ref(env, byte_buffer_cls);
         delete_local_ref(env, find_loader_cls);
         return Err(err);
     }
@@ -247,7 +345,9 @@ unsafe fn load_dynamic_managed_helper_class(
         if !parent_loader.is_null() {
             delete_local_ref(env, parent_loader);
         }
+        delete_local_ref(env, dex_buffers);
         delete_local_ref(env, dex_buf);
+        delete_local_ref(env, byte_buffer_cls);
         delete_local_ref(env, find_loader_cls);
         return Err(format!("ClassLoader.loadClass lookup failed: {}", exc));
     }
@@ -261,17 +361,22 @@ unsafe fn load_dynamic_managed_helper_class(
         if !parent_loader.is_null() {
             delete_local_ref(env, parent_loader);
         }
+        delete_local_ref(env, dex_buffers);
         delete_local_ref(env, dex_buf);
+        delete_local_ref(env, byte_buffer_cls);
         delete_local_ref(env, find_loader_cls);
         return Err(err);
     }
     if let Some(exc) = jni_take_exception(env) {
+        delete_local_ref(env, helper_jstr);
         delete_local_ref(env, class_loader_cls);
         delete_local_ref(env, loader);
         if !parent_loader.is_null() {
             delete_local_ref(env, parent_loader);
         }
+        delete_local_ref(env, dex_buffers);
         delete_local_ref(env, dex_buf);
+        delete_local_ref(env, byte_buffer_cls);
         delete_local_ref(env, find_loader_cls);
         return Err(format!("NewStringUTF for dynamic helper class failed: {}", exc));
     }
@@ -285,17 +390,22 @@ unsafe fn load_dynamic_managed_helper_class(
         if !parent_loader.is_null() {
             delete_local_ref(env, parent_loader);
         }
+        delete_local_ref(env, dex_buffers);
         delete_local_ref(env, dex_buf);
+        delete_local_ref(env, byte_buffer_cls);
         delete_local_ref(env, find_loader_cls);
         return Err(err);
     }
     if let Some(exc) = jni_take_exception(env) {
+        delete_local_ref(env, helper_cls);
         delete_local_ref(env, class_loader_cls);
         delete_local_ref(env, loader);
         if !parent_loader.is_null() {
             delete_local_ref(env, parent_loader);
         }
+        delete_local_ref(env, dex_buffers);
         delete_local_ref(env, dex_buf);
+        delete_local_ref(env, byte_buffer_cls);
         delete_local_ref(env, find_loader_cls);
         return Err(format!("dynamic managed helper loadClass failed: {}", exc));
     }
@@ -310,7 +420,15 @@ unsafe fn load_dynamic_managed_helper_class(
         if !parent_loader.is_null() {
             delete_local_ref(env, parent_loader);
         }
+        if !helper_global.is_null() {
+            delete_global_ref(env, helper_global);
+        }
+        if !loader_global.is_null() {
+            delete_global_ref(env, loader_global);
+        }
+        delete_local_ref(env, dex_buffers);
         delete_local_ref(env, dex_buf);
+        delete_local_ref(env, byte_buffer_cls);
         delete_local_ref(env, find_loader_cls);
         return Err(err);
     }
@@ -321,7 +439,9 @@ unsafe fn load_dynamic_managed_helper_class(
         if !parent_loader.is_null() {
             delete_local_ref(env, parent_loader);
         }
+        delete_local_ref(env, dex_buffers);
         delete_local_ref(env, dex_buf);
+        delete_local_ref(env, byte_buffer_cls);
         delete_local_ref(env, find_loader_cls);
         return Err(format!("dynamic helper global ref creation failed: {}", exc));
     }
@@ -339,7 +459,9 @@ unsafe fn load_dynamic_managed_helper_class(
     if !parent_loader.is_null() {
         delete_local_ref(env, parent_loader);
     }
+    delete_local_ref(env, dex_buffers);
     delete_local_ref(env, dex_buf);
+    delete_local_ref(env, byte_buffer_cls);
     delete_local_ref(env, find_loader_cls);
 
     Ok(helper_cls)
