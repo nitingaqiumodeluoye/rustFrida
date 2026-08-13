@@ -16,11 +16,10 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::injection::{inject_via_bootstrapper, InjectionResult};
+use crate::kpm::madvise_dontneed;
 use crate::proc_mem::ProcMem;
-use crate::process::{attach_to_process, call_target_function, parse_proc_maps, wait_until_stopped, MapEntry};
+use crate::process::{parse_proc_maps, wait_until_stopped, MapEntry};
 use crate::{log_error, log_info, log_step, log_success, log_verbose, log_warn};
-use nix::sys::ptrace;
-use nix::unistd::Pid;
 
 /// 嵌入编译好的 zymbiote ELF
 const ZYMBIOTE_ELF: &[u8] = include_bytes!("../../zymbiote/build/zymbiote.elf");
@@ -54,8 +53,6 @@ struct ZygotePatch {
     payload_path: String,
     #[allow(dead_code)]
     payload_file_offset: u64,
-    /// 目标 libc.madvise 地址，用于 payload 恢复后丢弃 COW 页
-    libc_madvise: u64,
     /// setArgV0 指针位置和原始值（None = 三层扫描均 miss，走 setcontext-only 降级）
     setargv0_slot: Option<(u64, [u8; 8])>,
     /// setcontext GOT slot（可选）
@@ -790,9 +787,50 @@ fn handle_zymbiote_connection(mut stream: std::os::unix::net::UnixStream) -> Res
     Ok(())
 }
 
+struct SigcontGuard {
+    pid: i32,
+    armed: bool,
+}
+
+impl SigcontGuard {
+    fn new(pid: u32) -> Self {
+        Self {
+            pid: pid as i32,
+            armed: true,
+        }
+    }
+
+    fn continue_now(&mut self) -> Result<(), String> {
+        let ret = unsafe { libc::kill(self.pid, libc::SIGCONT) };
+        if ret == 0 {
+            self.armed = false;
+            return Ok(());
+        }
+
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ESRCH) {
+            self.armed = false;
+            return Ok(());
+        }
+        Err(format!("SIGCONT 子进程 {} 失败: {}", self.pid, err))
+    }
+}
+
+impl Drop for SigcontGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            unsafe {
+                libc::kill(self.pid, libc::SIGCONT);
+            }
+        }
+    }
+}
+
 /// 对未匹配 spawn 请求的子进程执行完整 resume 流程
 /// 与 Frida connection.resume() 一致：ACK → 等 EOF → wait SIGSTOP → revert → SIGCONT
 fn do_resume_unmatched(pid: u32, ppid: u32, mut stream: std::os::unix::net::UnixStream) {
+    let mut sigcont_guard = SigcontGuard::new(pid);
+
     // 1. 发送 ACK
     if stream.write_all(&[ACK_BYTE]).is_err() {
         return;
@@ -818,8 +856,10 @@ fn do_resume_unmatched(pid: u32, ppid: u32, mut stream: std::os::unix::net::Unix
         log_verbose!("还原未匹配子进程 {} patch 失败: {}", pid, e);
     }
 
-    // 6. SIGCONT 恢复子进程
-    unsafe { libc::kill(pid as i32, libc::SIGCONT) };
+    // 6. SIGCONT 恢复子进程；guard 在异常返回时兜底
+    if let Err(e) = sigcont_guard.continue_now() {
+        log_verbose!("恢复未匹配子进程 {} 失败: {}", pid, e);
+    }
 }
 
 /// 活跃连接（等待 ACK 的子进程 stream + fork 时刻的 ppid）
@@ -830,6 +870,7 @@ static ACTIVE_CONNECTIONS: OnceLock<Mutex<HashMap<u32, (std::os::unix::net::Unix
 /// 再 wait_until_stopped 等待 raise(SIGSTOP) 完成。
 pub(crate) fn resume_child(pid: u32) -> Result<(), String> {
     log_step!("正在恢复子进程 {}...", pid);
+    let mut sigcont_guard = SigcontGuard::new(pid);
 
     // 1. 发送 ACK 到子进程
     let conns = ACTIVE_CONNECTIONS.get_or_init(|| Mutex::new(HashMap::new()));
@@ -865,16 +906,8 @@ pub(crate) fn resume_child(pid: u32) -> Result<(), String> {
         log_warn!("还原子进程 {} patch 失败: {}", pid, e);
     }
 
-    // 5. SIGCONT 恢复子进程
-    let ret = unsafe { libc::kill(pid as i32, libc::SIGCONT) };
-    if ret < 0 {
-        let err = std::io::Error::last_os_error();
-        if err.raw_os_error() != Some(libc::ESRCH) {
-            return Err(format!("SIGCONT 子进程 {} 失败: {}", pid, err));
-        }
-        // ESRCH = 进程已退出，不是真正的错误
-        log_verbose!("子进程 {} 已退出 (ESRCH)", pid);
-    }
+    // 5. SIGCONT 恢复子进程；guard 在前面的任意错误返回时兜底
+    sigcont_guard.continue_now()?;
 
     log_success!("子进程 {} 已恢复运行", pid);
     Ok(())
@@ -938,16 +971,9 @@ fn revert_child_patch_by_ppid(pid: u32, ppid: u32) -> Result<(), String> {
     Ok(())
 }
 
-/// 在已停止的目标进程中调用其 libc.madvise，丢弃 payload 覆盖页的 COW 副本。
-///
-/// 调用者通常只有 SIGSTOP，而没有 ptrace 控制权，因此这里临时 attach，完成
-/// 远程调用后立即 detach；调用者随后负责 SIGCONT。只处理 payload 所在的页，
-/// 不触碰 GOT、heap 等其他恢复区域。
+/// 通过 karinahide 的内核控制接口丢弃 payload 覆盖页的 COW 副本。
+/// 只处理 payload 所在的页，不触碰 GOT、heap 等其他恢复区域。
 fn discard_payload_cow(pid: u32, patch: &ZygotePatch, label: &str) -> Result<(), String> {
-    if patch.libc_madvise == 0 {
-        return Err(format!("{} payload 缺少 libc.madvise 地址", label));
-    }
-
     let raw_page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     if raw_page_size <= 0 {
         return Err(format!("{} payload 无法获取 page_size", label));
@@ -970,22 +996,8 @@ fn discard_payload_cow(pid: u32, patch: &ZygotePatch, label: &str) -> Result<(),
         .checked_sub(page_start)
         .ok_or_else(|| format!("{} payload 页范围无效", label))?;
 
-    let target = pid as i32;
-    attach_to_process(target)?;
-    let call_result = call_target_function(
-        target,
-        patch.libc_madvise as usize,
-        &[page_start as usize, page_len as usize, libc::MADV_DONTNEED as usize],
-        None,
-    );
-    let detach_result = ptrace::detach(Pid::from_raw(target), None)
-        .map_err(|e| format!("{} payload COW 清理后 detach 失败: {}", label, e));
-
-    let ret = call_result?;
-    detach_result?;
-    if ret != 0 {
-        return Err(format!("{} payload madvise(MADV_DONTNEED) 返回 {}", label, ret));
-    }
+    madvise_dontneed(pid as i32, page_start as usize, page_len as usize)
+        .map_err(|e| format!("{} payload KPM madvise 失败: {}", label, e))?;
 
     log_verbose!("已清理 {} payload COW 页: 0x{:x}+0x{:x}", label, page_start, page_len);
     Ok(())
@@ -1898,7 +1910,6 @@ fn inject_zymbiote(pid: u32, socket_name: &str) -> Result<ZygotePatch, String> {
         payload_backup,
         payload_path: loc.path,
         payload_file_offset: loc.file_offset,
-        libc_madvise: libc_funcs.madvise,
         setargv0_slot,
         setcontext_got,
         capset_got,
@@ -2031,7 +2042,6 @@ fn dump_maps_near(maps: &[MapEntry], addr: u64, radius: usize) -> String {
 /// libc 函数地址集合
 struct LibcFunctions {
     mprotect: u64,
-    madvise: u64,
     strdup: u64,
     free: u64,
     socket: u64,
@@ -2063,7 +2073,6 @@ fn resolve_libc_functions(maps: &[MapEntry]) -> Result<LibcFunctions, String> {
 
     Ok(LibcFunctions {
         mprotect: resolve("mprotect")?,
-        madvise: resolve("madvise")?,
         strdup: resolve("strdup")?,
         free: resolve("free")?,
         socket: resolve("socket")?,

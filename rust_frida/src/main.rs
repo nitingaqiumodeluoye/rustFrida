@@ -4,6 +4,7 @@ mod args;
 mod communication;
 mod http_rpc;
 mod injection;
+mod kpm;
 mod logger;
 mod proc_mem;
 mod process;

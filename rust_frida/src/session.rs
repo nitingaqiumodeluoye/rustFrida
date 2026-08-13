@@ -47,7 +47,10 @@ pub(crate) struct Session {
     pub(crate) loader_ctx_addr: std::sync::atomic::AtomicU64,
     pub(crate) agent_current_thread_eval_impl: std::sync::atomic::AtomicU64,
     pub(crate) loader_cleanup: Mutex<LoaderCleanupInfo>,
+    /// The ART-managed worker can accept JavaScript tasks.
     pub(crate) java_worker_ready: AtomicBool,
+    /// Java.ready bootstrap has observed an application ClassLoader.
+    pub(crate) java_classloader_ready: AtomicBool,
     pub(crate) connected: AtomicBool,
     pub(crate) disconnected: AtomicBool,
     pub(crate) shutdown_requested: AtomicBool,
@@ -76,6 +79,7 @@ impl Session {
             agent_current_thread_eval_impl: std::sync::atomic::AtomicU64::new(0),
             loader_cleanup: Mutex::new(LoaderCleanupInfo::default()),
             java_worker_ready: AtomicBool::new(false),
+            java_classloader_ready: AtomicBool::new(false),
             connected: AtomicBool::new(false),
             disconnected: AtomicBool::new(false),
             shutdown_requested: AtomicBool::new(false),

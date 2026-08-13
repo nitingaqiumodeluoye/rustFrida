@@ -96,7 +96,7 @@ pub(crate) struct FridaLibcApi {
     pub(crate) sprintf: u64,
     pub(crate) mmap_fn: u64, // 避免与 libc::mmap 冲突
     pub(crate) munmap_fn: u64,
-    pub(crate) madvise_fn: u64,
+    pub(crate) madvise_fn: u64, // loader ABI 字段；COW 清理由 karinahide 完成
     pub(crate) socket: u64,
     pub(crate) socketpair: u64,
     pub(crate) connect: u64,

@@ -353,35 +353,21 @@ fn start_java_worker_and_respond() {
     match quickjs_loader::start_java_worker() {
         Ok(()) => {
             if quickjs_loader::is_initialized() {
-                let script = r#"
-(function () {
-    if (!globalThis.Java || typeof Java._flushReadyCallbacks !== "function") {
-        return "java-unavailable";
-    }
-
-    var Thread = Java.use("java.lang.Thread");
-    for (var attempt = 0; attempt < 200 && !Java._isClassLoaderReady(); attempt++) {
-        if (Java._reprobeClassLoaderOnce && Java._reprobeClassLoaderOnce()) {
-            break;
-        }
-        Thread.sleep(50);
-    }
-
-    Java._flushReadyCallbacks();
-    return Java._isClassLoaderReady() ? "ready" : "timeout";
-})()
-"#;
-                match quickjs_loader::eval_on_java_worker_wait(
-                    script.to_string(),
-                    "<java_ready_bootstrap>".to_string(),
-                    true,
-                    15_000,
-                ) {
-                    Ok(result) => log_msg(format!("[java worker] Java.ready bootstrap: {}\n", result)),
-                    Err(e) => log_msg(format!("[java worker] Java.ready bootstrap failed: {}\n", e)),
+                match quickjs_loader::wait_for_java_ready(30_000) {
+                    quickjs_loader::JavaReadyBootstrapStatus::Ready => {
+                        send_eval_ok("java-worker-started:java-ready");
+                    }
+                    quickjs_loader::JavaReadyBootstrapStatus::Timeout => {
+                        log_msg(
+                            "[java worker] Java.ready bootstrap timeout after 30000ms; background probe remains active\n"
+                                .to_string(),
+                        );
+                        send_eval_ok("java-worker-started:java-ready-pending");
+                    }
                 }
+            } else {
+                send_eval_ok("java-worker-started:java-engine-uninitialized");
             }
-            send_eval_ok("java-worker-ready");
         }
         Err(e) => send_eval_err(&format!("java worker start failed: {}", e)),
     }

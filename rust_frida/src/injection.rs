@@ -15,6 +15,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use crate::proc_mem::ProcMem;
+use crate::kpm::madvise_dontneed;
 use crate::process::{attach_to_process, call_target_function};
 use crate::types::{bootstrap_status, message_type, FridaBootstrapContext, FridaLibcApi, RustFridaLoaderContext};
 use crate::{log_error, log_info, log_success, log_verbose, log_warn};
@@ -530,13 +531,9 @@ fn is_system_code_path(path: &str) -> bool {
 /// 恢复 code-swap 字节后丢弃覆盖页，让内核重新从原文件建立干净页。
 ///
 /// 仅写回原始字节不够：对 MAP_PRIVATE 的可执行文件映射做过写入后，页仍可能
-/// 保持 COW/Anonymous 状态。madvise 地址由 bootstrapper 直接从目标 libc 解析，
-/// 不在主机侧猜测目标地址，也不依赖 Android linker 的 dlsym 兼容行为。
-fn discard_code_swap_pages(tid: i32, swap_addr: usize, swap_len: usize, libc_api: FridaLibcApi) -> Result<(), String> {
-    if libc_api.madvise_fn == 0 {
-        return Err("bootstrapper 未解析到 madvise，无法清理 code-swap COW 页".into());
-    }
-
+/// 保持 COW/Anonymous 状态。页面清理由 karinahide 在内核上下文中完成，
+/// 不在目标进程中执行 libc 调用，也不依赖 Android linker 的 dlsym 兼容行为。
+fn discard_code_swap_pages(tid: i32, swap_addr: usize, swap_len: usize) -> Result<(), String> {
     let page_start = align_down(swap_addr as u64, PAGE_SIZE) as usize;
     let swap_end = swap_addr
         .checked_add(swap_len)
@@ -545,15 +542,7 @@ fn discard_code_swap_pages(tid: i32, swap_addr: usize, swap_len: usize, libc_api
     let page_len = page_end
         .checked_sub(page_start)
         .ok_or_else(|| "code-swap 页范围无效".to_string())?;
-    let ret = call_target_function(
-        tid,
-        libc_api.madvise_fn as usize,
-        &[page_start, page_len, libc::MADV_DONTNEED as usize],
-        None,
-    )?;
-    if ret != 0 {
-        return Err(format!("目标进程 madvise(MADV_DONTNEED) 返回 {}", ret));
-    }
+    madvise_dontneed(tid, page_start, page_len)?;
 
     log_verbose!("已丢弃 code-swap COW 页: 0x{:x}+0x{:x}", page_start, page_len);
     Ok(())
@@ -1476,7 +1465,7 @@ fn inject_via_bootstrapper_once(
     let libc_api: FridaLibcApi = mem_read_value(&mem, libc_api_addr)?;
 
     // Phase 2 已解析目标 libc；现在丢弃 code-swap 覆盖页，清除恢复字节后仍存在的 COW 状态。
-    if let Err(e) = discard_code_swap_pages(trace_tid, swap_addr, BOOTSTRAPPER.len(), libc_api) {
+    if let Err(e) = discard_code_swap_pages(trace_tid, swap_addr, BOOTSTRAPPER.len()) {
         return Err(format!("清理 code-swap COW 页失败: {}", e));
     }
 

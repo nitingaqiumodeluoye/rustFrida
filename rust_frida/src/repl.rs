@@ -98,12 +98,36 @@ pub(crate) fn ensure_java_worker_ready(session: &Session) -> Result<(), String> 
         .eval_state
         .recv_timeout(std::time::Duration::from_secs(JAVA_EXECUTOR_BOOTSTRAP_TIMEOUT_SECS))
     {
-        Some(Ok(_)) => {
+        Some(Ok(status)) if status == "java-worker-started:java-ready" => {
             session
                 .java_worker_ready
                 .store(true, std::sync::atomic::Ordering::Release);
+            session
+                .java_classloader_ready
+                .store(true, std::sync::atomic::Ordering::Release);
             Ok(())
         }
+        Some(Ok(status)) if status == "java-worker-started:java-ready-pending" => {
+            session
+                .java_worker_ready
+                .store(true, std::sync::atomic::Ordering::Release);
+            session
+                .java_classloader_ready
+                .store(false, std::sync::atomic::Ordering::Release);
+            log_warn!("Java worker 已启动，Java.ready 仍 pending；agent 将在后台继续探测 ClassLoader");
+            Ok(())
+        }
+        Some(Ok(status)) if status == "java-worker-started:java-engine-uninitialized" => {
+            session
+                .java_worker_ready
+                .store(true, std::sync::atomic::Ordering::Release);
+            session
+                .java_classloader_ready
+                .store(false, std::sync::atomic::Ordering::Release);
+            log_warn!("Java worker 已启动；QuickJS/Java bootstrap 将在首个 Java 脚本初始化后执行");
+            Ok(())
+        }
+        Some(Ok(status)) => Err(format!("Java worker 初始化返回未知状态: {}", status)),
         Some(Err(e)) => Err(format!("Java worker 初始化失败: {}", e)),
         None => Err(format!(
             "等待 Java worker 初始化超时({}s)",

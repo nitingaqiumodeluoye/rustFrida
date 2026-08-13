@@ -14,12 +14,12 @@ use quickjs_hook::{
     cleanup_engine, cleanup_wxshadow_patches, complete_script, cut_art_controller_routing_hooks,
     cut_art_controller_walkstack_guards, cut_java_hooks, cut_native_hooks, detach_current_jni_thread,
     drain_thunk_in_flight, free_art_controller_state, free_java_hooks, free_native_hooks, get_or_init_engine,
-    init_hook_engine, load_script, load_script_with_filename, set_art_controller_reload_paused, set_console_callback,
-    set_qbdi_helper_blob, set_qbdi_output_dir,
+    init_hook_engine, load_script, load_script_with_filename, load_script_with_filename_without_ready_flush,
+    set_art_controller_reload_paused, set_console_callback, set_qbdi_helper_blob, set_qbdi_output_dir,
 };
 use std::collections::VecDeque;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU8, Ordering};
 use std::sync::mpsc;
 use std::sync::{Condvar, Mutex, OnceLock};
 
@@ -28,6 +28,32 @@ use crate::communication::{log_msg, write_stream};
 const JAVA_WORKER_EVAL_TIMEOUT_MS: u64 = 60_000;
 const JAVA_WORKER_BUSY_FAST_FAIL_MS: u64 = 500;
 const JAVA_WORKER_LOOP_READY_TIMEOUT_MS: u64 = 1_500;
+const JAVA_READY_PROBE_FAST_ATTEMPTS: u32 = 10;
+const JAVA_READY_STATUS_IDLE: u8 = 0;
+const JAVA_READY_STATUS_PENDING: u8 = 1;
+const JAVA_READY_STATUS_READY: u8 = 2;
+
+const JAVA_READY_PROBE_SCRIPT: &str = r#"
+(function () {
+    if (!globalThis.Java || typeof Java._isClassLoaderReady !== "function") {
+        return "java-unavailable";
+    }
+    if (!Java._isClassLoaderReady() && Java._reprobeClassLoaderOnce) {
+        Java._reprobeClassLoaderOnce();
+    }
+    return Java._isClassLoaderReady() ? "ready" : "pending";
+})()
+"#;
+
+const JAVA_READY_FLUSH_SCRIPT: &str = r#"
+(function () {
+    if (!globalThis.Java || typeof Java._flushReadyCallbacks !== "function") {
+        return "java-unavailable";
+    }
+    Java._flushReadyCallbacks();
+    return "flushed";
+})()
+"#;
 
 static ENGINE_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static HOOK_RUNTIME_INITIALIZED: AtomicBool = AtomicBool::new(false);
@@ -38,6 +64,9 @@ static JAVA_WORKER_LOOP_RUNNING: AtomicBool = AtomicBool::new(false);
 static JAVA_WORKER_EVAL_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 static JAVA_WORKER_NATIVE_RELEASED: AtomicBool = AtomicBool::new(false);
 static JAVA_WORKER_TID: AtomicI32 = AtomicI32::new(0);
+static JAVA_READY_MONITOR_ACTIVE: AtomicBool = AtomicBool::new(false);
+static JAVA_READY_STATUS: AtomicU8 = AtomicU8::new(JAVA_READY_STATUS_IDLE);
+static JAVA_READY_PROBE_ATTEMPT: AtomicU32 = AtomicU32::new(0);
 static EXEC_MEM_UNMAPPED: AtomicBool = AtomicBool::new(false);
 static JAVA_WORKER_QUEUE: OnceLock<JavaWorkerQueue> = OnceLock::new();
 static JAVA_WORKER_LIFECYCLE_LOCK: Mutex<()> = Mutex::new(());
@@ -56,6 +85,7 @@ enum JavaWorkerTask {
         init_engine: bool,
         reply: mpsc::Sender<Result<String, String>>,
     },
+    ReadyProbe,
     Stop,
 }
 
@@ -84,9 +114,40 @@ impl JavaWorkerQueue {
             if let Some(task) = tasks.pop_front() {
                 return task;
             }
-            tasks = self.cv.wait(tasks).unwrap_or_else(|e| e.into_inner());
+            if !JAVA_READY_MONITOR_ACTIVE.load(Ordering::Acquire) {
+                tasks = self.cv.wait(tasks).unwrap_or_else(|e| e.into_inner());
+                continue;
+            }
+
+            let attempt = JAVA_READY_PROBE_ATTEMPT.load(Ordering::Acquire);
+            if attempt == 0 {
+                return JavaWorkerTask::ReadyProbe;
+            }
+            let delay_ms = match attempt {
+                1 => 25,
+                2..=JAVA_READY_PROBE_FAST_ATTEMPTS => 50,
+                _ => 100,
+            };
+            let (next_tasks, wait_result) = self
+                .cv
+                .wait_timeout(tasks, std::time::Duration::from_millis(delay_ms))
+                .unwrap_or_else(|e| e.into_inner());
+            tasks = next_tasks;
+            if wait_result.timed_out() && tasks.is_empty() && JAVA_READY_MONITOR_ACTIVE.load(Ordering::Acquire) {
+                return JavaWorkerTask::ReadyProbe;
+            }
         }
     }
+
+    fn wake(&self) {
+        self.cv.notify_one();
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JavaReadyBootstrapStatus {
+    Ready,
+    Timeout,
 }
 
 #[repr(C)]
@@ -292,6 +353,10 @@ unsafe extern "C" fn java_worker_native_loop(
             let _ = reply.send(result);
             true
         }
+        JavaWorkerTask::ReadyProbe => {
+            run_java_ready_probe();
+            true
+        }
         JavaWorkerTask::Stop => {
             let released = unsafe { quickjs_hook::finish_java_worker_thread_from_native(_env, _cls) };
             match released {
@@ -328,12 +393,74 @@ fn run_eval_task(script: &str, filename: &str, init_engine: bool) -> Result<Stri
             Err(e) if e.contains("已初始化") => {}
             Err(e) => return Err(e),
         }
+        arm_java_ready_monitor();
     }
 
     if filename.is_empty() {
         execute_script(script)
     } else {
         execute_script_with_filename(script, filename)
+    }
+}
+
+fn arm_java_ready_monitor() {
+    if JAVA_READY_STATUS.load(Ordering::Acquire) == JAVA_READY_STATUS_READY {
+        return;
+    }
+    JAVA_READY_STATUS.store(JAVA_READY_STATUS_PENDING, Ordering::Release);
+    JAVA_READY_MONITOR_ACTIVE.store(true, Ordering::Release);
+    JavaWorkerQueue::get().wake();
+}
+
+fn run_java_ready_probe() {
+    if !JAVA_READY_MONITOR_ACTIVE.load(Ordering::Acquire)
+        || JAVA_READY_STATUS.load(Ordering::Acquire) == JAVA_READY_STATUS_READY
+    {
+        return;
+    }
+
+    let attempt = JAVA_READY_PROBE_ATTEMPT.fetch_add(1, Ordering::AcqRel) + 1;
+    match load_script_with_filename_without_ready_flush(JAVA_READY_PROBE_SCRIPT, "<java_ready_probe>") {
+        Ok(result) if result == "ready" => {
+            match load_script_with_filename_without_ready_flush(JAVA_READY_FLUSH_SCRIPT, "<java_ready_flush>") {
+                Ok(_) => {
+                    JAVA_READY_STATUS.store(JAVA_READY_STATUS_READY, Ordering::Release);
+                    JAVA_READY_MONITOR_ACTIVE.store(false, Ordering::Release);
+                    log_msg(format!("[java worker] Java.ready ready after {} probe(s)\n", attempt));
+                }
+                Err(err) => log_msg(format!("[java worker] Java.ready flush failed: {}\n", err)),
+            }
+        }
+        Ok(result) if result == "pending" => {}
+        Ok(result) => log_msg(format!(
+            "[java worker] Java.ready probe returned unexpected status '{}': attempt={}\n",
+            result, attempt
+        )),
+        Err(err) => log_msg(format!(
+            "[java worker] Java.ready probe failed: attempt={} error={}\n",
+            attempt, err
+        )),
+    }
+}
+
+/// Start the native ClassLoader monitor and wait independently of QuickJS's
+/// per-eval deadline. Timing out leaves the monitor active in the background.
+pub fn wait_for_java_ready(timeout_ms: u64) -> JavaReadyBootstrapStatus {
+    if JAVA_READY_STATUS.load(Ordering::Acquire) == JAVA_READY_STATUS_READY {
+        return JavaReadyBootstrapStatus::Ready;
+    }
+
+    arm_java_ready_monitor();
+
+    let started = std::time::Instant::now();
+    loop {
+        if JAVA_READY_STATUS.load(Ordering::Acquire) == JAVA_READY_STATUS_READY {
+            return JavaReadyBootstrapStatus::Ready;
+        }
+        if started.elapsed() >= std::time::Duration::from_millis(timeout_ms) {
+            return JavaReadyBootstrapStatus::Timeout;
+        }
+        crate::raw_thread::sleep_ms(10);
     }
 }
 
@@ -368,6 +495,9 @@ pub fn start_java_worker() -> Result<(), String> {
     // The lifecycle lock guarantees that no other start/stop path can publish
     // an eval while a genuinely new worker is being initialized.
     JAVA_WORKER_EVAL_IN_FLIGHT.store(false, Ordering::Release);
+    JAVA_READY_MONITOR_ACTIVE.store(false, Ordering::Release);
+    JAVA_READY_STATUS.store(JAVA_READY_STATUS_IDLE, Ordering::Release);
+    JAVA_READY_PROBE_ATTEMPT.store(0, Ordering::Release);
     write_stream(b"[java worker] starting");
     JAVA_WORKER_LOOP_ENTERED.store(false, Ordering::Release);
     JAVA_WORKER_NATIVE_RELEASED.store(false, Ordering::Release);
@@ -406,6 +536,9 @@ pub fn stop_java_worker() -> bool {
     let _lifecycle = JAVA_WORKER_LIFECYCLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let requested = JAVA_WORKER_START_REQUESTED.swap(false, Ordering::AcqRel);
     let started = JAVA_WORKER_STARTED.swap(false, Ordering::AcqRel);
+    JAVA_READY_MONITOR_ACTIVE.store(false, Ordering::Release);
+    JAVA_READY_STATUS.store(JAVA_READY_STATUS_IDLE, Ordering::Release);
+    JavaWorkerQueue::get().wake();
     if requested || started {
         JavaWorkerQueue::get().push(JavaWorkerTask::Stop);
     }

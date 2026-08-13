@@ -10,3 +10,8 @@ tools/*_test.sh
 tools/
 CLAUDE.md
 scripts/
+
+# Local build artifacts
+/libagent.so
+/libagent.so.newbuild
+/ssh-build/

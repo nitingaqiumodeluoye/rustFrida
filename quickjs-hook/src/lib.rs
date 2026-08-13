@@ -389,6 +389,18 @@ pub fn load_script(script: &str) -> Result<String, String> {
 
 /// Load + execute with an explicit filename (用于 QuickJS 报错时显示 `filename:line:col`)。
 pub fn load_script_with_filename(script: &str, filename: &str) -> Result<String, String> {
+    load_script_with_filename_inner(script, filename, true)
+}
+
+/// Execute a short internal script without implicitly flushing Java.ready().
+///
+/// Java-ready bootstrap uses this so every probe performs exactly one JNI
+/// reprobe. The eventual callback flush is submitted as a separate worker task.
+pub fn load_script_with_filename_without_ready_flush(script: &str, filename: &str) -> Result<String, String> {
+    load_script_with_filename_inner(script, filename, false)
+}
+
+fn load_script_with_filename_inner(script: &str, filename: &str, flush_java_ready: bool) -> Result<String, String> {
     let mut engine = JS_ENGINE
         .lock()
         .map_err(|e| format!("Failed to lock JS engine: {}", e))?;
@@ -399,7 +411,9 @@ pub fn load_script_with_filename(script: &str, filename: &str) -> Result<String,
     let _owner_guard = JsEngineOwnerGuard::acquire();
     let _deadline_guard = JsExecutionDeadlineGuard::begin(JS_TOP_LEVEL_EXECUTION_TIMEOUT_MS);
     let value = engine.eval_file(script, filename)?;
-    engine.flush_java_ready_callbacks()?;
+    if flush_java_ready {
+        engine.flush_java_ready_callbacks()?;
+    }
     engine.run_pending_jobs();
     let result = if value.is_undefined() {
         "undefined".to_string()
