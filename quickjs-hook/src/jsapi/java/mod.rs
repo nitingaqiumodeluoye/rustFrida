@@ -1180,8 +1180,13 @@ pub fn pre_init_art_controller() -> Result<(), String> {
         let ep_offset = spec.entry_point_offset;
         // 发现 ART bridge 函数
         let bridge = art_method::find_art_bridge_functions(env, ep_offset);
-        // 初始化 artController (安装 Layer 1+2 全局 hooks)
-        art_controller::ensure_art_controller_initialized(&bridge, ep_offset, env as *mut std::ffi::c_void);
+        // pre-resume 精简预装: 跳过 Layer1 解释桥 + Layer2 DoCall，避免 resume 后
+        // 主线程解释执行被全局 thunk 拖慢。GC/OAT/Fixup/SIGSEGV guard 仍保留。
+        // 解释桥在 resume 后由具体 hook 的 on-demand 路径动态补装。
+        art_controller::set_lean_preinit(true);
+        let init_result = art_controller::ensure_art_controller_initialized(&bridge, ep_offset, env as *mut std::ffi::c_void);
+        art_controller::set_lean_preinit(false);
+        let _ = init_result;
     }
     Ok(())
 }

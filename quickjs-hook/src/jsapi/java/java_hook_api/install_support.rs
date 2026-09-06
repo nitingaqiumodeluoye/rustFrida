@@ -2,7 +2,9 @@ use crate::ffi::hook as hook_ffi;
 use crate::jsapi::console::{output_message, output_verbose};
 use crate::jsapi::hook_api::StealthMode;
 
-use super::super::art_controller::{ensure_shared_entry_router_hook, prepare_hook_target, stealth_mode};
+use super::super::art_controller::{
+    ensure_shared_entry_router_hook, hot_shared_art_entries_enabled_by_default, prepare_hook_target, stealth_mode,
+};
 use super::super::art_method::*;
 use super::super::callback::delete_replacement_method;
 use super::super::jni_core::*;
@@ -370,16 +372,19 @@ pub(super) unsafe fn install_per_method_router_hook(
         // Only exact bridge/trampoline entries are considered router-safe for
         // default Java callbacks. Managed DSL passes allow_internal_entry_downgrade=false
         // because it is the high-frequency path: preserve exact nterp shared
-        // entries in stealth modes and route them directly instead of degrading
-        // the target ArtMethod to quick_to_interpreter_bridge.
+        // entries when the global router was installed eagerly, otherwise install
+        // that hot shared router only for the concrete hook that requires it.
+        let exact_nterp_entry = (bridge.nterp_entry_point != 0 && original_entry_point == bridge.nterp_entry_point)
+            || (bridge.nterp_with_clinit_entry_point != 0
+                && original_entry_point == bridge.nterp_with_clinit_entry_point);
         let preserve_exact_nterp = !allow_internal_entry_downgrade
             && stealth_mode() != StealthMode::Normal
-            && ((bridge.nterp_entry_point != 0 && original_entry_point == bridge.nterp_entry_point)
-                || (bridge.nterp_with_clinit_entry_point != 0
-                    && original_entry_point == bridge.nterp_with_clinit_entry_point));
+            && exact_nterp_entry;
+        let exact_nterp_eagerly_routed =
+            preserve_exact_nterp && hot_shared_art_entries_enabled_by_default();
         let is_already_routed = original_entry_point == bridge.quick_to_interpreter_bridge
             || original_entry_point == bridge.quick_resolution_trampoline
-            || preserve_exact_nterp;
+            || exact_nterp_eagerly_routed;
 
         if shared_native_art_entry || !is_already_routed {
             if is_native_method {
@@ -391,6 +396,7 @@ pub(super) unsafe fn install_per_method_router_hook(
             }
             let mut original_entry_mutated = false;
             let shared_router_entry;
+            let mut shared_router_pre_scan = false;
             if allow_internal_entry_downgrade && !is_already_routed && bridge.quick_to_interpreter_bridge != 0 {
                 std::ptr::write_volatile(
                     (art_method as usize + ep_offset) as *mut u64,
@@ -405,6 +411,13 @@ pub(super) unsafe fn install_per_method_router_hook(
                 shared_router_entry = bridge.quick_to_interpreter_bridge;
             } else if is_already_routed {
                 shared_router_entry = original_entry_point;
+            } else if preserve_exact_nterp {
+                shared_router_entry = original_entry_point;
+                shared_router_pre_scan = true;
+                output_verbose(&format!(
+                    "[java hook] Step 9: exact nterp shared entry routed on demand in wxshadow lean mode: ep={:#x}",
+                    original_entry_point
+                ));
             } else {
                 output_verbose(&format!(
                     "[java hook] Step 9: non-routed shared ART entry kept without dynamic external entry hook: ep={:#x}",
@@ -417,7 +430,7 @@ pub(super) unsafe fn install_per_method_router_hook(
                 shared_router_entry,
                 ep_offset,
                 env,
-                preserve_exact_nterp,
+                shared_router_pre_scan,
             )?;
             output_verbose(&format!(
                 "[java hook] Step 9: dynamic shared ART router active: ep={:#x}; target ArtMethod entry_external=false",

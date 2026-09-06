@@ -175,9 +175,9 @@ impl Drop for JsEngineCallbackGuard {
 /// Acquire JS_ENGINE lock for a hook callback.
 ///
 /// Same-thread reentrant callbacks reuse the current JS engine owner context.
-/// Other threads block until the global JS engine is available. JS callbacks are
-/// not a high-frequency path; if a user installs one, it must run instead of
-/// being silently bypassed.
+///
+/// 其它线程改用 `try_lock`(非阻塞): 拿不到锁就返回 None 走 bypass(调原方法),
+/// 绝不阻塞调用线程。原因见下——原先的 blocking lock() 会形成一个跨线程死锁。
 pub(crate) unsafe fn acquire_js_engine_for_callback(
     ctx: *mut ffi::JSContext,
     _context_name: &str,
@@ -190,9 +190,41 @@ pub(crate) unsafe fn acquire_js_engine_for_callback(
         return Some(JsEngineCallbackGuard::Reentrant);
     }
 
-    let g = match crate::JS_ENGINE.lock() {
-        Ok(g) => g,
-        Err(e) => e.into_inner(),
+    // try_lock(非阻塞): 若全局 JS engine 正被其它线程占用, 立即返回 None 走
+    // bypass(兜底直接调原方法), 而非阻塞等待。
+    //
+    // 阻塞版本的死锁机制(实测导致主线程 onCreate ANR 14s+):
+    //   hook 目标可能落在 ART 主线程的关键路径上(如 ActivityThread.currentApplication
+    //   被 MIUI 字体加载 TypefaceUtils 反射调用)。hook 回调在主线程执行到这里时
+    //   卡在 JS_ENGINE.lock() 等锁; 而 JS_ENGINE 的持有者(Java worker / raw clone
+    //   JS worker)又在等主线程配合(MessageQueue drain / $orig 回原 native 方法),
+    //   双方互等直到 ANR SIGQUIT 才被打破。
+    // try_lock 消除这条路: JS 繁忙时本线程的这条 hook 调用直接走原方法, 语义等价
+    // 于一次路由未命中, 不会阻塞调用线程, 更不会死锁。
+    // 第二层: 有界自旋(5 次 × 2ms = 最坏 10ms)。短促的持锁窗口(worker 正常执行
+    // 一段几十 ms 内的 JS)会在自旋内顺利交出锁, 回调同步按序执行, console.log
+    // 实时输出; 超过上限说明真正的长临界区(Java.ready boot dex 加载等)正在进行,
+    // 走 bypass —— 调用脚本可显式声明 deferred 敬重放, 见 deferred.rs。
+    let mut spin_attempts = 0u32;
+    let g = loop {
+        match crate::JS_ENGINE.try_lock() {
+            Ok(g) => break g,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                spin_attempts += 1;
+                if spin_attempts >= 5 {
+                    // 统计 bypass(限流打印, 帮助排查 "console.log 丢了")
+                    let n = BYPASS_LOG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if n < 4 {
+                        crate::jsapi::console::output_message(&format!(
+                            "[hook] callback bypassed: engine busy (target={_target_id:#x}) 自旋耗尽; 如需保证执行请在 attach 时声明 {{deferred:true}}",
+                        ));
+                    }
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            Err(std::sync::TryLockError::Poisoned(e)) => break e.into_inner(),
+        }
     };
     crate::mark_js_engine_owner_current_thread();
     ffi::qjs_update_stack_top(ctx);
@@ -531,6 +563,9 @@ pub(crate) unsafe fn dup_callback_to_bytes(ctx: *mut ffi::JSContext, callback: f
 /// 解决 JS_Call 长时间 kNative → SuspendThreadByPeer 超时 → SIGABRT。
 pub(crate) static ART_CHECKPOINT_ENV: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// engine 忙导致的回调 bypass 次数（用于限流打印）。
+static BYPASS_LOG_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// QuickJS interrupt handler — 注册到 JS_SetInterruptHandler。
 /// QuickJS 每执行一定数量的操作码后调用一次（默认 ~255 条指令）。
 pub(crate) unsafe extern "C" fn art_interrupt_handler(_rt: *mut ffi::JSRuntime, _opaque: *mut std::ffi::c_void) -> i32 {
@@ -614,6 +649,9 @@ pub(crate) unsafe fn invoke_hook_callback_common_with_env(
     ffi::qjs_free_value(ctx, result);
     ffi::qjs_free_value(ctx, global);
     ffi::qjs_free_value(ctx, callback_dup);
+
+    // 引擎仍持锁：伴随每次 hook 回调收尾，按序补跑 deferred 积压事件（≤4 条/批，防递归 depth=2）。
+    crate::jsapi::hook_api::callback::drain_deferred_onenter(4);
 
     had_exception
 }

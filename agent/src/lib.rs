@@ -599,15 +599,22 @@ fn process_cmd(command: &str) {
         }
         #[cfg(feature = "quickjs")]
         Some("artinit") => {
-            // 预初始化 artController Layer 1+2 (spawn 模式, 进程暂停时调用)
-            dispatch_js_task(|| {
-                match quickjs_loader::init_hook_runtime()
-                    .and_then(|_| quickjs_hook::jsapi::java::pre_init_art_controller())
-                {
-                    Ok(_) => send_eval_ok("artinit_ok"),
-                    Err(e) => send_eval_err(&format!("artinit failed: {}", e)),
-                }
-            });
+            // 预初始化 artController Layer 1+2 (spawn 模式, 进程暂停时调用)。
+            //
+            // 关键: 不能用 dispatch_js_task —— 它会把任务派发到 raw clone JS 线程并
+            // mark_raw_clone_js_thread(), 而 raw clone 线程上 ensure_jni_initialized 被
+            // 明确禁用 (JNI initialization is disabled on raw clone JS threads), 导致
+            // pre_init_art_controller 必然失败。这里直接在当前 process_cmd 线程 (loader
+            // 线程, 非 raw clone) 同步执行, 可以正常 AttachCurrentThread 拿 JNIEnv。
+            //
+            // 同步阻塞是安全的: pre-resume 阶段 host 只发 artinit 并在等响应, 没有其它
+            // 命令需要并发处理; 进程其余线程仍处于 SIGSTOP, 安装矩阵零竞态。
+            match quickjs_loader::init_hook_runtime()
+                .and_then(|_| quickjs_hook::jsapi::java::pre_init_art_controller())
+            {
+                Ok(_) => send_eval_ok("artinit_ok"),
+                Err(e) => send_eval_err(&format!("artinit failed: {}", e)),
+            }
         }
         #[cfg(feature = "quickjs")]
         Some("jsinit") => dispatch_js_task(init_js_and_respond),

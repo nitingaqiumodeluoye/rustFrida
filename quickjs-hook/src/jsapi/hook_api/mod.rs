@@ -1,6 +1,6 @@
 //! hook() and unhook() API implementation
 
-mod callback;
+pub(crate) mod callback;
 mod cmodule;
 mod functions;
 #[cfg(feature = "qbdi")]

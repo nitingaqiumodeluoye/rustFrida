@@ -39,7 +39,8 @@ use injection::{
 };
 use process::find_pid_by_name;
 use repl::{
-    ensure_java_worker_ready_after_resume, load_script_file, load_script_file_pre_resume, print_eval_result,
+    ensure_java_worker_ready_after_resume, load_script_file, load_script_file_pre_resume, pre_resume_art_init,
+    print_eval_result,
     print_help, rewrite_jseval_for_agent, run_js_repl, script_uses_java_api, try_jseval_on_main_thread_if_java_or_dsl,
     try_loadjs_on_main_thread_if_java, try_managedcounter_on_main_thread, CommandCompleter, EVAL_DEFAULT_TIMEOUT_SECS,
     EVAL_JAVA_TIMEOUT_SECS, EVAL_RECOMP_TIMEOUT_SECS,
@@ -444,6 +445,14 @@ fn main() {
                         spawn::abort_pending_children_and_cleanup_zygote_patches();
                         std::process::exit(1);
                     }
+                }
+            }
+            // 方案 A: 进程仍处于暂停态 (SIGSTOP), 此刻安装 artController 拦截矩阵零竞态。
+            // 旧版在 resume 后由 hook 安装路径触发矩阵安装, 与 onCreate 反射热点路径竞态,
+            // 导致主线程自旋卡死 16-29s。这里提前到暂停态预装, 从根上消除该竞态。
+            if post_resume_java_worker_needed {
+                if let Err(e) = pre_resume_art_init(&session) {
+                    log_warn!("pre-resume artController 预装失败 (将回退到 resume 后按需安装): {}", e);
                 }
             }
             // resume: hook 已就位，恢复子进程

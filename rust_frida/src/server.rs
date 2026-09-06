@@ -29,7 +29,7 @@ use crate::communication::{
 use crate::injection::{cleanup_remote_loader_mappings, inject_via_bootstrapper, LoaderCleanupInfo};
 use crate::process::find_pid_by_name;
 use crate::repl::{
-    cut_pre_resume_java_executor_hook, ensure_java_worker_ready, ensure_java_worker_ready_after_resume,
+    cut_pre_resume_java_executor_hook, ensure_java_worker_ready, ensure_java_worker_ready_after_resume, pre_resume_art_init,
     preconfigure_java_stealth_if_declared, print_eval_result, print_help, rewrite_jseval_for_agent, run_js_repl,
     script_uses_java_api, try_jseval_on_main_thread_if_java_or_dsl, try_loadjs_on_main_thread_if_java,
     try_managedcounter_on_main_thread, EVAL_DEFAULT_TIMEOUT_SECS, EVAL_JAVA_TIMEOUT_SECS, EVAL_RECOMP_TIMEOUT_SECS,
@@ -739,6 +739,14 @@ fn do_spawn(
                         }
                     }
 
+                    // 方案 A: 进程仍处于暂停态 (SIGSTOP), 此刻安装 artController 拦截矩阵零竞态。
+                    // 旧版在 resume 后由 hook 安装路径触发矩阵安装, 与 onCreate 反射热点路径竞态,
+                    // 导致主线程自旋卡死 16-29s。这里提前到暂停态预装, 从根上消除该竞态。
+                    if post_resume_java_worker_needed {
+                        if let Err(e) = pre_resume_art_init(&session) {
+                            log_warn!("[#{}] pre-resume artController 预装失败 (回退到 resume 后按需安装): {}", sid, e);
+                        }
+                    }
                     // resume 子进程
                     if let Err(e) = spawn::resume_child(pid as u32) {
                         log_error!("[#{}] 恢复子进程失败: {}", sid, e);

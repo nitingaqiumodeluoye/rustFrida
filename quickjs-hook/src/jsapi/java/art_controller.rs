@@ -42,6 +42,28 @@ use crate::jsapi::hook_api::StealthMode;
 /// Recomp=2  页级重编译，在重编译页上 hook
 static STEALTH_MODE: AtomicU8 = AtomicU8::new(StealthMode::Normal as u8);
 
+/// pre-resume artinit「精简预装」开关。
+///
+/// 背景: artinit 在进程 SIGSTOP 暂停态预装三层矩阵。若此时把 Layer 1 的
+/// `quick_to_interpreter_bridge` / `quick_resolution_trampoline` 以及 Layer 2 的
+/// DoCall 也一起装上，resume 后主线程从 zygote 初始化走解释执行时，每一次解释
+/// 方法调用/resolve 都要穿过这些全局 thunk，累积开销可把全新安装、无 JIT profile
+/// 的 app 启动拖到 30s+（详见 artinit 预装卡顿排查记录）。
+///
+/// 而 Layer 3（编译方法 per-method quickCode 路由）不依赖 Layer 1/2，是独立路径。
+/// 因此 pre-resume 阶段只装「不阻滞启动」的矩阵（GC/OAT/Fixup/SIGSEGV guard），
+/// 跳过解释桥 + DoCall；待 resume 后按需（on-demand）再动态补装解释桥。
+static LEAN_PREINIT: AtomicBool = AtomicBool::new(false);
+
+/// 设置/查询精简预装开关（pre-resume artinit 专用）。
+pub(super) fn set_lean_preinit(enabled: bool) {
+    LEAN_PREINIT.store(enabled, Ordering::Release);
+}
+
+pub(super) fn lean_preinit_enabled() -> bool {
+    LEAN_PREINIT.load(Ordering::Acquire)
+}
+
 /// Recomp 翻译回调：供 C 层 oat_patch 使用
 unsafe extern "C" fn recomp_translate_for_c(orig_addr: usize) -> usize {
     let suspend_entry = resolve_recomp_suspend_poll_entrypoint();
@@ -189,6 +211,19 @@ pub(super) fn set_stealth_mode(mode: StealthMode) {
 /// 查询当前 stealth 模式
 pub(super) fn stealth_mode() -> StealthMode {
     StealthMode::from_js_arg(STEALTH_MODE.load(Ordering::Relaxed) as i64)
+}
+
+/// Whether Java stealth mode should eagerly route ART's hottest shared entrypoints.
+///
+/// `Java.setStealth(1)` uses wxshadow for code patching, but eagerly routing
+/// `nterp_entry_point` and `quick_generic_jni_trampoline` sends a large fraction
+/// of UI/resource/JNI traffic through the ART router. Keep wxshadow mode lean by
+/// default and install those routers only when a concrete hook requires them.
+///
+/// Recomp mode keeps the old eager behavior because its goal is stronger
+/// non-mutating coverage and it already pays the page translation cost.
+pub(super) fn hot_shared_art_entries_enabled_by_default() -> bool {
+    matches!(stealth_mode(), StealthMode::Recomp)
 }
 
 pub(super) fn art_controller_initialized() -> bool {
@@ -545,6 +580,20 @@ unsafe impl Sync for ArtControllerState {}
 static ART_CONTROLLER: Mutex<Option<ArtControllerState>> = Mutex::new(None);
 static ART_CONTROLLER_RELOAD_PAUSED: AtomicBool = AtomicBool::new(false);
 
+/// 三层矩阵延迟安装的核心就绪标志 (探测/时间戳/需要标志)。
+/// 核心就绪只做原子/探测/信号 handler 改动, 不改任何 libart 代码页;
+/// 完整矩阵 (Layer1/2/GC/OAT/Fixup/SIGSEGV guard) 延迟到主线程 MessageQueue idle 点
+/// (nativePollOnce 只在消息循环空闲时触发, onCreate 期间不 poll → 天然避开启动突发)
+/// 或经 force_install_art_controller_matrix 立即安装 (hook 安装路径/暂停态 prec-init)。
+static ART_CONTROLLER_CORE_READY: AtomicBool = AtomicBool::new(false);
+static ART_CONTROLLER_MATRIX_INSTALLED: AtomicBool = AtomicBool::new(false);
+/// 核心就绪时刻 (单调毫秒), 用于 idle 时间门控。
+static ART_CONTROLLER_INIT_START_MS: AtomicU64 = AtomicU64::new(0);
+/// 记录 ensure 时传入的 ArtMethod entry_point 偏移 (延迟安装时需用).
+static ART_CONTROLLER_EP_OFFSET: AtomicUsize = AtomicUsize::new(0);
+/// idle 时间门: 距核心就绪 (经 force/首次 hook 安装 ensure 触发)至少这些毫秒后才安装完整矩阵, 避让启动期密集消息。
+static ART_CONTROLLER_MATRIX_IDLE_DELAY_MS: u64 = 3000;
+
 pub fn set_art_controller_reload_paused(paused: bool) {
     ART_CONTROLLER_RELOAD_PAUSED.store(paused, Ordering::Release);
 }
@@ -611,35 +660,59 @@ pub(super) fn ensure_art_controller_initialized(
     //
     // quick_generic_jni_trampoline 覆盖 native/shared-JNI 方法。normal 模式下仍跳过:
     // spawn resume 后主线程会高频进 JNI，直接 mprotect/写原 libart prologue 有竞态。
-    // Java.setStealth(1/2) 时才启用，底层走 wxshadow/recomp，不修改目标 ArtMethod
-    // entry_point_/data_ 到外部地址。
+    // Java.setStealth(1) 也默认跳过：它虽用 wxshadow 写码，但该入口是资源加载、
+    // View inflate、系统 JNI 的热路径，默认全局路由会放大 UI 主线程开销。
+    // 真正 hook native/shared-JNI 方法时仍会由 Layer 3 按需安装该共享 router。
+    // Java.setStealth(2) 保留旧行为，底层走 recomp。
     //
     // nterp/interpreter/resolution stub 覆盖解释执行、deopt、GC FixupStaticTrampolines
     // 把 entry_point 保持/改回 libart trampoline 的 edge case。
+    let eager_hot_shared_entries = hot_shared_art_entries_enabled_by_default();
     let mut stubs = Vec::new();
     if stealth_mode() == StealthMode::Normal {
         output_verbose(
-            "[artController] Layer 1: quick_generic_jni_trampoline skipped in normal mode; enable Java.setStealth(1/2) for shared JNI native routing",
+            "[artController] Layer 1: quick_generic_jni_trampoline skipped in normal mode; native/shared-JNI hooks install it on demand",
         );
-    } else {
+    } else if eager_hot_shared_entries {
         stubs.push((
             "quick_generic_jni_trampoline",
             bridge.quick_generic_jni_trampoline,
             false,
         ));
+    } else {
+        output_verbose(
+            "[artController] Layer 1: quick_generic_jni_trampoline skipped in wxshadow lean mode; native/shared-JNI hooks install it on demand",
+        );
     }
-    if bridge.nterp_entry_point != 0 && stealth_mode() != StealthMode::Normal {
+    if bridge.nterp_entry_point != 0 && eager_hot_shared_entries {
         stubs.push(("nterp_entry_point", bridge.nterp_entry_point, true));
+    } else if bridge.nterp_entry_point != 0 && stealth_mode() == StealthMode::WxShadow {
+        output_verbose(
+            "[artController] Layer 1: nterp_entry_point skipped in wxshadow lean mode; non-compiled hooks downgrade/route on demand",
+        );
     }
-    if bridge.nterp_with_clinit_entry_point != 0 && stealth_mode() != StealthMode::Normal {
+    if bridge.nterp_with_clinit_entry_point != 0 && eager_hot_shared_entries {
         stubs.push((
             "nterp_with_clinit_entry_point",
             bridge.nterp_with_clinit_entry_point,
             true,
         ));
+    } else if bridge.nterp_with_clinit_entry_point != 0 && stealth_mode() == StealthMode::WxShadow {
+        output_verbose(
+            "[artController] Layer 1: nterp_with_clinit_entry_point skipped in wxshadow lean mode; non-compiled hooks downgrade/route on demand",
+        );
     }
-    stubs.push(("quick_to_interpreter_bridge", bridge.quick_to_interpreter_bridge, false));
-    stubs.push(("quick_resolution_trampoline", bridge.quick_resolution_trampoline, false));
+    // 精简预装模式: 跳过解释桥 + resolution trampoline。这两个是解释执行的必经
+    // 之路，pre-resume 时安装会导致 resume 后主线程从 zygote 初始化起就为每次
+    // 解释调用/resolve 支付全局 thunk 开销。编译方法 (Layer 3) 不依赖它们。
+    if !lean_preinit_enabled() {
+        stubs.push(("quick_to_interpreter_bridge", bridge.quick_to_interpreter_bridge, false));
+        stubs.push(("quick_resolution_trampoline", bridge.quick_resolution_trampoline, false));
+    } else {
+        output_verbose(
+            "[artController] Layer 1: quick_to_interpreter_bridge / quick_resolution_trampoline skipped in lean preinit mode; installed on demand post-resume",
+        );
+    }
 
     for (name, addr, pre_scan) in &stubs {
         if *addr == 0 {
@@ -705,7 +778,13 @@ pub(super) fn ensure_art_controller_initialized(
     // 历史问题: DoCall 通过 hook_attach 包裹原函数, 任何 Java 阻塞 (wait/IO) 会
     // 把 thunk 栈帧钉在 BLR 之后, 全局 g_thunk_in_flight 永不归零. 已通过把
     // 计数点改到 Rust java_hook_callback 解决 (阻塞在原 DoCall 不影响新计数).
-    let skip_do_call = false;
+    // 精简预装模式: 跳过 DoCall (解释器路径) 全局 hook。DoCall 会被解释执行的
+    // 每一次方法调用高频触发，pre-resume 安装会在启动期积累成秒级~30秒级延迟。
+    let skip_do_call = lean_preinit_enabled();
+    // 精简预装模式也跳过「全局同步 hook」(GC/OAT/FixupStaticTrampolines)。
+    // 这些 hook 的回调在类初始化/GC/栈展开等启动期高频路径上被执行，
+    // pre-resume 安装会累积成秒级启动延迟。它们在 resume 后如需可再按需补装。
+    let skip_global_sync_hooks = lean_preinit_enabled();
     if !skip_do_call {
         for (i, &addr) in bridge.do_call_addrs.iter().enumerate() {
             if addr == 0 {
@@ -743,7 +822,7 @@ pub(super) fn ensure_art_controller_initialized(
     let mut gc_hook_targets = Vec::new();
 
     // Fix 3: hook CopyingPhase/MarkingPhase on_leave
-    if bridge.gc_copying_phase != 0 {
+    if !skip_global_sync_hooks && bridge.gc_copying_phase != 0 {
         if let Some((ha, sf, real_addr)) =
             unsafe { prepare_hook_target_strict("GC CopyingPhase", bridge.gc_copying_phase, std::ptr::null_mut()) }
         {
@@ -773,7 +852,7 @@ pub(super) fn ensure_art_controller_initialized(
     }
 
     // Fix 3: hook CollectGarbageInternal on_leave (主 GC 入口)
-    if bridge.gc_collect_internal != 0 {
+    if !skip_global_sync_hooks && bridge.gc_collect_internal != 0 {
         if let Some((ha, sf, real_addr)) = unsafe {
             prepare_hook_target_strict(
                 "GC CollectGarbageInternal",
@@ -807,7 +886,7 @@ pub(super) fn ensure_art_controller_initialized(
     }
 
     // Fix 3: hook RunFlipFunction on_enter (线程翻转期间同步)
-    if bridge.run_flip_function != 0 {
+    if !skip_global_sync_hooks && bridge.run_flip_function != 0 {
         if let Some((ha, sf, real_addr)) =
             unsafe { prepare_hook_target_strict("GC RunFlipFunction", bridge.run_flip_function, std::ptr::null_mut()) }
         {
@@ -840,7 +919,7 @@ pub(super) fn ensure_art_controller_initialized(
     // replacement 的 data_ = thunk 地址, WalkStack → GetDexPc 查 CodeInfo 会 abort。
     // 对 replacement method 返回 NULL, 防止 ART 查找堆分配方法的 OAT 代码头。
     let mut oat_header_hook_target: u64 = 0;
-    if bridge.get_oat_quick_method_header != 0 {
+    if !skip_global_sync_hooks && bridge.get_oat_quick_method_header != 0 {
         if let Some((ha, sf, real_addr)) = unsafe {
             prepare_hook_target_strict(
                 "GetOatQuickMethodHeader",
@@ -875,7 +954,7 @@ pub(super) fn ensure_art_controller_initialized(
     // --- Fix 5: hook FixupStaticTrampolines on_leave ---
     // 类初始化完成后同步 replacement 方法，防止 quickCode 被更新绕过 hook
     let mut fixup_hook_target: u64 = 0;
-    if bridge.fixup_static_trampolines != 0 {
+    if !skip_global_sync_hooks && bridge.fixup_static_trampolines != 0 {
         if let Some((ha, sf, real_addr)) = unsafe {
             prepare_hook_target_strict(
                 "FixupStaticTrampolines",

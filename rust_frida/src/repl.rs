@@ -150,6 +150,25 @@ pub(crate) fn cut_pre_resume_java_executor_hook(session: &Session) -> Result<(),
     }
 }
 
+/// spawn pre-resume 暂停态预装 artController 拦截矩阵 (Layer1/2/GC/OAT/Fixup)。
+///
+/// 此刻目标进程所有线程处于 SIGSTOP (spawn 注入后、resume 之前), 安装矩阵无执行竞态。
+/// 从根上消除旧版"矩阵安装与 onCreate 反射热点路径竞态 → 主线程自旋卡死 16-29s"的问题
+/// (详见 WALKSTACK_ROOT_CAUSE.md / 29s 启动卡死诊断)。
+///
+/// agent 端 artinit handler (agent/src/lib.rs) 会执行 init_hook_runtime + pre_init_art_controller,
+/// 成功后回 "artinit_ok", 失败回 "artinit failed: ..."。
+pub(crate) fn pre_resume_art_init(session: &Session) -> Result<(), String> {
+    let sender = session.get_sender().ok_or("agent 未连接")?;
+    session.eval_state.clear();
+    send_command(sender, "artinit").map_err(|e| format!("发送 artinit 失败: {}", e))?;
+    match session.eval_state.recv_timeout(std::time::Duration::from_secs(JAVA_EXECUTOR_BOOTSTRAP_TIMEOUT_SECS)) {
+        Some(Ok(_)) => Ok(()),
+        Some(Err(e)) => Err(format!("artinit 失败: {}", e)),
+        None => Err(format!("等待 artinit 超时({}s)", JAVA_EXECUTOR_BOOTSTRAP_TIMEOUT_SECS)),
+    }
+}
+
 pub(crate) fn ensure_java_worker_ready_after_resume(session: &Session, java_worker_needed: bool) -> Result<(), String> {
     run_post_resume_java_worker_mode(session, PostResumeJavaWorkerMode::from_env()?, java_worker_needed)
 }
