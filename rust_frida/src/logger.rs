@@ -38,19 +38,37 @@ fn strip_ansi(s: &str) -> String {
 pub fn write_log_line(line: &str) {
     if let Some(file) = LOG_FILE.get() {
         let mut guard = file.lock().unwrap_or_else(|e| e.into_inner());
-        let _ = writeln!(guard, "{}", strip_ansi(line));
+        let _ = writeln!(guard, "{} {}", format_ts_now(), strip_ansi(line));
         let _ = guard.flush();
     }
 }
 
+/// 本地时刻 "HH:MM:SS.mmm"（依赖系统时区偏移由外部换算，无外部 crate 依赖）
+pub fn format_ts_now() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let d = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = d.as_secs() % 86400;
+    format!(
+        "{:02}:{:02}:{:02}.{:03}",
+        secs / 3600,
+        (secs / 60) % 60,
+        secs % 60,
+        d.subsec_millis()
+    )
+}
+
 pub fn stdout_line(colored: &str, plain: &str) {
-    println!("{}", colored);
-    write_log_line(plain);
+    let ts = format_ts_now();
+    println!("[{}] {}", ts, colored);
+    write_log_line(&format!("{} {}", ts, plain));
 }
 
 pub fn stderr_line(colored: &str, plain: &str) {
-    eprintln!("{}", colored);
-    write_log_line(plain);
+    let ts = format_ts_now();
+    eprintln!("[{}] {}", ts, colored);
+    write_log_line(&format!("{} {}", ts, plain));
 }
 
 /// ANSI 颜色常量

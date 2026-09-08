@@ -1617,6 +1617,8 @@
     // ========================================================================
     var _readyCallbacks = [];
     var _readyFired = false;
+    var _readyRunQueue = [];   // 已 fire 待分片执行的回调队列
+    var _readyRunIndex = 0;
     var _readyGateSig = "(Ljava/lang/ClassLoader;Ljava/lang/String;Landroid/content/Context;)Landroid/app/Application;";
     var _readyCallAppSig = "(Landroid/app/Application;)V";
     var _gateInstalled = false;
@@ -1738,11 +1740,41 @@
         }
 
         _readyFired = true;
-        var cbs = _readyCallbacks;
-        _readyCallbacks = [];
-        for (var i = 0; i < cbs.length; i++) {
-            _callReadyCallback(cbs[i], i);
+        // 分片执行模式：把回调转入 run 队列，每次外部调 _flushStep 只执行一个，
+        // Rust 侧在分片之间释放 JS_ENGINE 锁，让 app 线程排队的 hook 事件插队。
+        for (var i = 0; i < _readyCallbacks.length; i++) {
+            _readyRunQueue.push(_readyCallbacks[i]);
         }
+        _readyCallbacks = [];
+    };
+
+    // 执行下一个 ready 回调（分片）；返回 "done" / "more"。
+    // - 未 fire：先走 _flushReadyCallbacks 做 classloader reprobe 检查，未就绪则不 fire；
+    // - 已 fire：每次只执行一个回调，迟到注册的回调在下一分片被吸收。
+    Java._flushStep = function() {
+        if (_readyFired && _readyCallbacks.length > 0) {
+            for (var i = 0; i < _readyCallbacks.length; i++) {
+                _readyRunQueue.push(_readyCallbacks[i]);
+            }
+            _readyCallbacks = [];
+        }
+        if (!_readyFired) {
+            Java._flushReadyCallbacks();
+        }
+        if (_readyRunIndex >= _readyRunQueue.length) {
+            _readyRunQueue = [];
+            _readyRunIndex = 0;
+            return "done";
+        }
+        var fn = _readyRunQueue[_readyRunIndex];
+        _readyRunIndex++;
+        _callReadyCallback(fn, _readyRunIndex - 1);
+        if (_readyRunIndex >= _readyRunQueue.length) {
+            _readyRunQueue = [];
+            _readyRunIndex = 0;
+            return "done";
+        }
+        return "more";
     };
 
     Java.ready = function(fn) {

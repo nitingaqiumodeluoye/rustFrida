@@ -334,16 +334,20 @@ impl JSEngine {
     /// Run callbacks queued by Java.ready() after the current top-level script
     /// has finished, so callbacks can reference helpers declared later in the
     /// same loadjs payload.
-    pub fn flush_java_ready_callbacks(&self) -> Result<(), String> {
+    ///
+    /// 分片语义：每次调用只执行下一个 ready 回调（Java._flushStep），
+    /// 返回 "more"（还有剩余）或 "done"。Rust 侧在分片之间释放锁。
+    pub fn flush_java_ready_step(&self) -> Result<String, String> {
         if is_raw_clone_js_thread() {
-            return Ok(());
+            return Ok("done".to_string());
         }
         let value = self.context.eval(
-            "if (globalThis.Java && typeof Java._flushReadyCallbacks === 'function') Java._flushReadyCallbacks();",
-            "<java_ready_flush>",
+            "if (globalThis.Java && typeof Java._flushStep === 'function') Java._flushStep(); else 'done';",
+            "<java_ready_flush_step>",
         )?;
+        let status = value.to_string(self.context.as_ptr()).unwrap_or_else(|| "done".into());
         value.free(self.context.as_ptr());
-        Ok(())
+        Ok(status)
     }
 }
 
@@ -401,27 +405,70 @@ pub fn load_script_with_filename_without_ready_flush(script: &str, filename: &st
 }
 
 fn load_script_with_filename_inner(script: &str, filename: &str, flush_java_ready: bool) -> Result<String, String> {
-    let mut engine = JS_ENGINE
-        .lock()
-        .map_err(|e| format!("Failed to lock JS engine: {}", e))?;
-    if engine.is_none() {
-        *engine = Some(JSEngine::new().ok_or_else(|| "Failed to create JS engine".to_string())?);
-    }
-    let engine = engine.as_ref().ok_or("JS engine not initialized")?;
-    let _owner_guard = JsEngineOwnerGuard::acquire();
-    let _deadline_guard = JsExecutionDeadlineGuard::begin(JS_TOP_LEVEL_EXECUTION_TIMEOUT_MS);
-    let value = engine.eval_file(script, filename)?;
-    if flush_java_ready {
-        engine.flush_java_ready_callbacks()?;
-    }
-    engine.run_pending_jobs();
-    let result = if value.is_undefined() {
-        "undefined".to_string()
-    } else {
-        value.to_string(engine.context().as_ptr()).unwrap_or_default()
+    // Span 1: eval + 结果转字符串（拿锁）—— 毕即放锁。
+    let result = {
+        let mut engine = JS_ENGINE
+            .lock()
+            .map_err(|e| format!("Failed to lock JS engine: {}", e))?;
+        if engine.is_none() {
+            *engine = Some(JSEngine::new().ok_or_else(|| "Failed to create JS engine".to_string())?);
+        }
+        let engine = engine.as_ref().ok_or("JS engine not initialized")?;
+        let _owner_guard = JsEngineOwnerGuard::acquire();
+        let _deadline_guard = JsExecutionDeadlineGuard::begin(JS_TOP_LEVEL_EXECUTION_TIMEOUT_MS);
+        let value = engine.eval_file(script, filename)?;
+        let result = if value.is_undefined() {
+            "undefined".to_string()
+        } else {
+            value.to_string(engine.context().as_ptr()).unwrap_or_default()
+        };
+        value.free(engine.context().as_ptr());
+        result
     };
-    value.free(engine.context().as_ptr());
+
+    // Span 2: 分片 flush Java.ready 回调 —— 每分片独立拿锁，分片间放锁，
+    // 让 app 线程排队的 hook 事件有机会插队（缩短临界区）。
+    if flush_java_ready {
+        flush_java_ready_chunked()?;
+    } else {
+        // 保持原语义：无 flush 路径也要泵一次 pending jobs（独立短锁）。
+        {
+            let engine = JS_ENGINE
+                .lock()
+                .map_err(|e| format!("Failed to lock JS engine: {}", e))?;
+            if let Some(engine) = engine.as_ref() {
+                let _owner_guard = JsEngineOwnerGuard::acquire();
+                engine.run_pending_jobs();
+            }
+        }
+    }
     Ok(result)
+}
+
+/// 分片 flush Java.ready 回调。
+///
+/// 每个 chunk = 一次拿锁只跑【一个】 ready 回调 + 它的 pending jobs，分片间真正释放
+/// JS_ENGINE 锁。原先一次性跑完所有回调（含用户脚本里的 Java.perform 主体，
+/// boot 期可达秒级）是 hook 引擎 busy 自旋耗尽的头号元凶；分片后 app 线程的
+/// hook 事件可在分片间隙同步执行，大幅减少 engine-busy 丢弃。
+pub fn flush_java_ready_chunked() -> Result<(), String> {
+    const MAX_CHUNKS: usize = 128;
+    for _ in 0..MAX_CHUNKS {
+        let status = {
+            let engine = JS_ENGINE
+                .lock()
+                .map_err(|e| format!("Failed to lock JS engine: {}", e))?;
+            let engine = engine.as_ref().ok_or("JS engine not initialized")?;
+            let _owner_guard = JsEngineOwnerGuard::acquire();
+            let s = engine.flush_java_ready_step()?;
+            engine.run_pending_jobs();
+            s
+        };
+        if status != "more" {
+            break;
+        }
+    }
+    Ok(())
 }
 
 /// 将任意字符串编码成 JS 字符串字面量（带双引号），可直接拼入 JS 源码。

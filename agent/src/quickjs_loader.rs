@@ -45,15 +45,6 @@ const JAVA_READY_PROBE_SCRIPT: &str = r#"
 })()
 "#;
 
-const JAVA_READY_FLUSH_SCRIPT: &str = r#"
-(function () {
-    if (!globalThis.Java || typeof Java._flushReadyCallbacks !== "function") {
-        return "java-unavailable";
-    }
-    Java._flushReadyCallbacks();
-    return "flushed";
-})()
-"#;
 
 static ENGINE_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static HOOK_RUNTIME_INITIALIZED: AtomicBool = AtomicBool::new(false);
@@ -422,7 +413,7 @@ fn run_java_ready_probe() {
     let attempt = JAVA_READY_PROBE_ATTEMPT.fetch_add(1, Ordering::AcqRel) + 1;
     match load_script_with_filename_without_ready_flush(JAVA_READY_PROBE_SCRIPT, "<java_ready_probe>") {
         Ok(result) if result == "ready" => {
-            match load_script_with_filename_without_ready_flush(JAVA_READY_FLUSH_SCRIPT, "<java_ready_flush>") {
+            match quickjs_hook::flush_java_ready_chunked() {
                 Ok(_) => {
                     JAVA_READY_STATUS.store(JAVA_READY_STATUS_READY, Ordering::Release);
                     JAVA_READY_MONITOR_ACTIVE.store(false, Ordering::Release);

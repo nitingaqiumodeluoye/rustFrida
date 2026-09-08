@@ -730,6 +730,16 @@ void* hook_mmap_near_range(void* target, size_t alloc_size, int64_t max_range) {
                 gs = (gs + page_size - 1) & ~(page_size - 1);
                 ge = ge & ~(page_size - 1);
 
+                /* 排除 boot.art image 前两页：hunter 类检测器的固定探测锚点落在
+                 * boot.art 前一页（0x708dd000），pool 若覆盖该页会把 fixed-probe
+                 * mmap 撞掉，报「missing page / suspicious execution」。 */
+                if (strstr(line, "[anon:dalvik-") && strstr(line, "boot.art")) {
+                    if (ge > (uintptr_t)2 * page_size) {
+                        ge = (ge - 2 * page_size) & ~(page_size - 1);
+                        if (ge < (uintptr_t)gs) ge = (uintptr_t)gs;
+                    }
+                }
+
                 if (ge > gs && (ge - gs) >= alloc_size) {
                     int64_t d;
                     if (target_addr >= gs && target_addr < ge) d = 0;

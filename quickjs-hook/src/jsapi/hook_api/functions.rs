@@ -185,6 +185,7 @@ unsafe fn install_hook(
                 mode,
                 recomp_addr,
                 native_attach_data: 0,
+                mutation: false,
             },
         );
     });
@@ -394,6 +395,7 @@ pub(crate) unsafe extern "C" fn js_hook_native(
                 mode,
                 recomp_addr,
                 native_attach_data: 0,
+                mutation: false,
             },
         );
     });
@@ -594,6 +596,7 @@ pub(crate) unsafe extern "C" fn js_attach_native(
                 mode,
                 recomp_addr,
                 native_attach_data,
+                mutation: false,
             },
         );
     });
@@ -905,6 +908,15 @@ pub(crate) unsafe extern "C" fn js_interceptor_attach(
     let has_on_enter = on_enter_val.is_function(ctx);
     let has_on_leave = on_leave_val.is_function(ctx);
 
+    // mutation 选项（默认 false）: 声明 onEnter 会修改入参 → engine-busy 时自旋等待 300ms 绝不丢弃；
+    // 观察型(默认) 自旋 10ms 耗尽即丢（透传原函数）。deferred 重放机制已退役（曾触发加固自检崩溃）。
+    let mutation_val = callbacks_arg.get_property(ctx, "mutation");
+    let mutation = match mutation_val.to_bool() {
+        Some(true) => true,
+        _ => false,
+    };
+    mutation_val.free(ctx);
+
     if !has_on_enter && !has_on_leave {
         on_enter_val.free(ctx);
         on_leave_val.free(ctx);
@@ -1021,6 +1033,7 @@ pub(crate) unsafe extern "C" fn js_interceptor_attach(
                 mode,
                 recomp_addr,
                 native_attach_data: 0,
+                mutation,
             },
         );
     });

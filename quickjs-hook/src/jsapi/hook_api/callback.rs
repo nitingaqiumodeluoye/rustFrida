@@ -37,99 +37,6 @@ static ATTACH_BYPASS_LOG_COUNT: std::sync::atomic::AtomicUsize = std::sync::atom
 /// 每 target 首次 dispatch 记录一次（诊断事件是否到达分发层）。
 static ATTACH_DISPATCH_LOGGED: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 
-/// attach.onEnter 引擎忙 bypass 时的寄存器快照队列：(HookContext bytes, target_addr)。
-/// 回调补跑（deferred）：引擎空闲时恢复快照重跑用户 onEnter，保证 console.log 执行。
-static DEFERRED_QUEUE: Mutex<Vec<(Box<[u8]>, u64)>> = Mutex::new(Vec::new());
-/// 队列中待补跑事件数（用于 O(1) 快速检测是否需要 drain）。
-static DEFERRED_PENDING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-/// 队列满被丢弃的事件数。
-static DEFERRED_DROPPED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-thread_local! {
-    /// 每线程补跑重入深度（replay 里 JS 又触发 hook → attach wrapper 再次 drain，防递归）。
-    static DEQ_DEPTH: std::cell::Cell<u32> = std::cell::Cell::new(0);
-}
-
-const DEFERRED_QUEUE_CAP: usize = 512;
-
-/// 引擎忙 bypass 时：快照 HookContext 入队（零阻塞，本次透传原函数）。
-unsafe fn enqueue_deferred_onenter(ctx_ptr: *mut hook_ffi::HookContext, target_addr: u64) {
-    let size = std::mem::size_of::<hook_ffi::HookContext>();
-    let mut buf: Box<[u8]> = std::vec![0u8; size].into_boxed_slice();
-    std::ptr::copy_nonoverlapping(ctx_ptr as *const u8, buf.as_mut_ptr(), size);
-    let mut q = DEFERRED_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
-    if q.len() >= DEFERRED_QUEUE_CAP {
-        let n = DEFERRED_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if n < 2 {
-            crate::jsapi::console::output_message("[hook] deferred 队列已满(512)，丢弃本次事件");
-        }
-        return;
-    }
-    q.push((buf, target_addr));
-    DEFERRED_PENDING.fetch_add(1, std::sync::atomic::Ordering::Release);
-}
-
-/// 引擎已持锁时调用：按序补跑队列里的事件（budget 限流，观测者语义：不写回寄存器）。
-/// 调用方必须已经持有 JS_ENGINE（attach_onEnter 成功分支 / invoke_..._with_env 内部）。
-pub(crate) unsafe fn drain_deferred_onenter(budget: usize) {
-    if DEFERRED_PENDING.load(std::sync::atomic::Ordering::Acquire) == 0 {
-        return;
-    }
-    let ok = DEQ_DEPTH.with(|d| {
-        let cur = d.get();
-        if cur >= 2 {
-            return false;
-        }
-        d.set(cur + 1);
-        true
-    });
-    if !ok {
-        return;
-    }
-    for _ in 0..budget {
-        let (buf, target_addr) = {
-            let mut q = DEFERRED_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
-            match q.pop() {
-                Some(x) => x,
-                None => break,
-            }
-        };
-        DEFERRED_PENDING.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-        let mut hc: hook_ffi::HookContext = std::mem::zeroed();
-        let n = buf.len().min(std::mem::size_of::<hook_ffi::HookContext>());
-        std::ptr::copy_nonoverlapping(buf.as_ptr(), &mut hc as *mut _ as *mut u8, n);
-        // 观察者语义：原函数早已跑完。禁 trampoline（$orig() 会抛错），并关闭 leave 拦截。
-        hc.trampoline = std::ptr::null_mut();
-        hc.intercept_leave = 0;
-
-        let (js_ctx_usize, has_on_enter, on_enter_bytes) = {
-            let guard = match HOOK_REGISTRY.lock() {
-                Ok(g) => g,
-                Err(_) => continue,
-            };
-            let registry = guard.as_ref().unwrap();
-            match registry.get(&target_addr) {
-                Some(d) => (d.ctx, d.has_on_enter, d.callback_bytes),
-                None => continue, // hook 已 detach，事件作废
-            }
-        };
-        if !has_on_enter || js_ctx_usize == 0 {
-            continue;
-        }
-        let ctx = js_ctx_usize as *mut ffi::JSContext;
-        let js_ctx = build_invocation_ctx(ctx, &mut hc as *mut hook_ffi::HookContext);
-        call_interceptor_helper(
-            ctx,
-            &on_enter_bytes,
-            js_ctx,
-            b"__interceptorEnter\0",
-            "interceptor.onEnter(deferred)",
-        );
-        ffi::qjs_free_value(ctx, js_ctx);
-    }
-    DEQ_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
-}
-
 struct InFlightNativeHookGuard;
 
 impl InFlightNativeHookGuard {
@@ -559,7 +466,7 @@ pub(crate) unsafe extern "C" fn attach_on_enter_wrapper(
             ));
         }
     }
-    let (ctx_usize, has_on_enter, has_on_leave, on_enter_bytes) = {
+    let (ctx_usize, has_on_enter, has_on_leave, on_enter_bytes, hook_mutation) = {
         let guard = match HOOK_REGISTRY.lock() {
             Ok(g) => g,
             Err(_) => return,
@@ -572,27 +479,32 @@ pub(crate) unsafe extern "C" fn attach_on_enter_wrapper(
             Some(d) => d,
             None => return,
         };
-        (data.ctx, data.has_on_enter, data.has_on_leave, data.callback_bytes)
+        (data.ctx, data.has_on_enter, data.has_on_leave, data.callback_bytes, data.mutation)
     };
 
     let ctx = ctx_usize as *mut ffi::JSContext;
-    let _js_guard = match acquire_js_engine_for_callback(ctx, "interceptor.onEnter", target_addr) {
+    // mutation:true → 修改型 hook（onEnter 会改入参）: 自旋预算 300ms，绝不丢；
+    // 默认观察型: 预算 10ms，耗尽即丢（透传原函数）。deferred 重放机制已退役。
+    let mutation = hook_mutation;
+    let _js_guard = match acquire_js_engine_for_callback(ctx, "interceptor.onEnter", target_addr, if mutation { 150 } else { 5 }) {
         Some(g) => g,
         None => {
-            // 引擎忙：快照入队零阻塞，事件由后续空闲分片补跑（deferred）。
-            enqueue_deferred_onenter(ctx_ptr, target_addr);
+            // 自旋耗尽: 本次 onEnter 未执行（透传原函数）。
+            // 观察型: 允许丢弃（本次日志缺口 <0.2%）;
+            // 修改型(mutation:true 已等满 300ms): 参数修改丢失, 大字告警（功能失守事件）。
             let n = ATTACH_BYPASS_LOG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if n < 4 || n % 200 == 0 {
+            if mutation {
                 crate::jsapi::console::output_message(&format!(
-                    "[hook] bypassed reason=engine-busy(attach.onEnter) target={target_addr:#x} — 已入队列待补跑"
+                    "[hook][严重][MUTATION LOST] engine busy 等待300ms超时 — 本次 onEnter 未执行，原参数已透传，修改丢失 (target={target_addr:#x})"
+                ));
+            } else if n < 4 || n % 200 == 0 {
+                crate::jsapi::console::output_message(&format!(
+                    "[hook] bypassed reason=engine-busy(attach.onEnter) target={target_addr:#x} — 自旋耗尽，已丢弃（观察型）"
                 ));
             }
             return;
         }
     };
-
-    // 引擎已到手：先补跑队列里的积压事件（每批 ≤4 条，防止饿当前事件）。
-    drain_deferred_onenter(4);
 
     let js_ctx = build_invocation_ctx(ctx, ctx_ptr);
 
@@ -638,7 +550,7 @@ pub(crate) unsafe extern "C" fn attach_on_leave_wrapper(
 
     let target_addr = user_data as u64;
 
-    let (ctx_usize, on_leave_bytes, has_on_leave) = {
+    let (ctx_usize, on_leave_bytes, has_on_leave, hook_mutation2) = {
         let guard = match HOOK_REGISTRY.lock() {
             Ok(g) => g,
             Err(_) => return,
@@ -651,7 +563,7 @@ pub(crate) unsafe extern "C" fn attach_on_leave_wrapper(
             Some(d) => d,
             None => return,
         };
-        (data.ctx, data.on_leave_bytes, data.has_on_leave)
+        (data.ctx, data.on_leave_bytes, data.has_on_leave, data.mutation)
     };
 
     if !has_on_leave {
@@ -660,9 +572,16 @@ pub(crate) unsafe extern "C" fn attach_on_leave_wrapper(
     }
 
     let ctx = ctx_usize as *mut ffi::JSContext;
-    let _js_guard = match acquire_js_engine_for_callback(ctx, "interceptor.onLeave", target_addr) {
+    let _js_guard = match acquire_js_engine_for_callback(ctx, "interceptor.onLeave", target_addr, if hook_mutation2 { 150 } else { 5 }) {
         Some(g) => g,
-        None => return,
+        None => {
+            if hook_mutation2 {
+                crate::jsapi::console::output_message(&format!(
+                    "[hook][严重][MUTATION LOST] engine busy 等待300ms超时 — 本次 onLeave 未执行 (target={:#x})", target_addr
+                ));
+            }
+            return;
+        }
     };
 
     // pop on_enter 留下的 this 对象；若 !has_on_enter 或 stack 意外为空，新建一个

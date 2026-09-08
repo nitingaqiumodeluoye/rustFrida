@@ -182,6 +182,7 @@ pub(crate) unsafe fn acquire_js_engine_for_callback(
     ctx: *mut ffi::JSContext,
     _context_name: &str,
     _target_id: u64,
+    spin_budget: u32,
 ) -> Option<JsEngineCallbackGuard> {
     let current_thread = crate::current_thread_id_u64();
 
@@ -189,6 +190,10 @@ pub(crate) unsafe fn acquire_js_engine_for_callback(
         ffi::qjs_update_stack_top(ctx);
         return Some(JsEngineCallbackGuard::Reentrant);
     }
+
+    // 预算选择在锁竞争现场决定：主线程/非主线程有不同上限，且与调用方传来的
+    // 修改型保底预算取 max。
+    let effective_budget = adaptive_spin_budget(current_thread, spin_budget);
 
     // try_lock(非阻塞): 若全局 JS engine 正被其它线程占用, 立即返回 None 走
     // bypass(兜底直接调原方法), 而非阻塞等待。
@@ -199,24 +204,27 @@ pub(crate) unsafe fn acquire_js_engine_for_callback(
     //   卡在 JS_ENGINE.lock() 等锁; 而 JS_ENGINE 的持有者(Java worker / raw clone
     //   JS worker)又在等主线程配合(MessageQueue drain / $orig 回原 native 方法),
     //   双方互等直到 ANR SIGQUIT 才被打破。
-    // try_lock 消除这条路: JS 繁忙时本线程的这条 hook 调用直接走原方法, 语义等价
-    // 于一次路由未命中, 不会阻塞调用线程, 更不会死锁。
-    // 第二层: 有界自旋(5 次 × 2ms = 最坏 10ms)。短促的持锁窗口(worker 正常执行
-    // 一段几十 ms 内的 JS)会在自旋内顺利交出锁, 回调同步按序执行, console.log
-    // 实时输出; 超过上限说明真正的长临界区(Java.ready boot dex 加载等)正在进行,
-    // 走 bypass —— 调用脚本可显式声明 deferred 敬重放, 见 deferred.rs。
+    //   有界自旋对该类互等自解：等待到点后本线程 bypass 放行，引擎持有者的
+    //   等待自然解除，不会形成无界死锁。
+    // 第二层: 有界自旋，预算由 adaptive_spin_budget 决定:
+    //   非主线程 1000ms(500×2ms) —— 池线程阻塞无 ANR 风险，覆盖 RegisterNatives
+    //     洪峰等并发窗口，实现「任意 JS 逻辑零丢弃」的通用语义；
+    //   主线程 200ms(100×2ms) —— 有界等待不可能死锁，200ms 远低于任何 ANR
+    //     /Slow-main 阈值；超过即 bypass（物理上限，见上死锁分析）。
+    //   修改型(mutation:true) 与两者取 max，保底 300ms。
     let mut spin_attempts = 0u32;
     let g = loop {
         match crate::JS_ENGINE.try_lock() {
             Ok(g) => break g,
             Err(std::sync::TryLockError::WouldBlock) => {
                 spin_attempts += 1;
-                if spin_attempts >= 5 {
+                if spin_attempts >= effective_budget {
                     // 统计 bypass(限流打印, 帮助排查 "console.log 丢了")
                     let n = BYPASS_LOG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     if n < 4 {
                         crate::jsapi::console::output_message(&format!(
-                            "[hook] callback bypassed: engine busy (target={_target_id:#x}) 自旋耗尽; 如需保证执行请在 attach 时声明 {{deferred:true}}",
+                            "[hook] callback bypassed: engine busy (target={_target_id:#x}) 等待{}ms耗尽; 观察型已丢弃，改入参的 hook 请在 attach 时声明 {{mutation:true}}",
+                            effective_budget * 2,
                         ));
                     }
                     return None;
@@ -229,6 +237,30 @@ pub(crate) unsafe fn acquire_js_engine_for_callback(
     crate::mark_js_engine_owner_current_thread();
     ffi::qjs_update_stack_top(ctx);
     Some(JsEngineCallbackGuard::Locked { _guard: g })
+}
+
+/// 主线程 tid 缓存（主线程 tid == 进程 pid，首次调用时采集）。
+static MAIN_TID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// 自适应自旋预算：非主线程 1000ms，主线程 200ms；修改型保底取 max(mutation_floor)。
+fn adaptive_spin_budget(_current_thread: u64, mutation_floor: u32) -> u32 {
+    let mut main_tid = MAIN_TID.load(std::sync::atomic::Ordering::Acquire);
+    if main_tid == 0 {
+        // 主线程 tid == 进程 pid（Android/Linux 惯例），首访时缓存。
+        let pid = unsafe { libc::getpid() } as i32;
+        let _ = MAIN_TID.compare_exchange(
+            0,
+            pid,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        );
+        main_tid = pid;
+    }
+    // current_thread_id_u64() 返回 TPIDR_EL0，与 gettid 不同源，这里用 gettid 比较。
+    let tid = unsafe { libc::syscall(libc::SYS_gettid) as i64 };
+    let is_main = tid == main_tid as i64;
+    let base: u32 = if is_main { 100 } else { 500 };
+    if mutation_floor > base { mutation_floor } else { base }
 }
 
 /// Check for JS exception, extract message + stack, and output error.
@@ -618,7 +650,7 @@ pub(crate) unsafe fn invoke_hook_callback_common_with_env(
     let ctx = ctx_raw as *mut ffi::JSContext;
 
     // 获取 JS 引擎锁（try_lock 避免死锁）
-    let _js_guard = match acquire_js_engine_for_callback(ctx, context_name, target_id) {
+    let _js_guard = match acquire_js_engine_for_callback(ctx, context_name, target_id, 5) {
         Some(g) => g,
         None => return false,
     };
@@ -649,9 +681,6 @@ pub(crate) unsafe fn invoke_hook_callback_common_with_env(
     ffi::qjs_free_value(ctx, result);
     ffi::qjs_free_value(ctx, global);
     ffi::qjs_free_value(ctx, callback_dup);
-
-    // 引擎仍持锁：伴随每次 hook 回调收尾，按序补跑 deferred 积压事件（≤4 条/批，防递归 depth=2）。
-    crate::jsapi::hook_api::callback::drain_deferred_onenter(4);
 
     had_exception
 }
