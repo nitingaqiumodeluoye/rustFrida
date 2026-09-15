@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use crate::injection::{inject_via_bootstrapper, InjectionResult};
 use crate::kpm::madvise_dontneed;
 use crate::proc_mem::ProcMem;
-use crate::process::{parse_proc_maps, wait_until_stopped, MapEntry};
+use crate::process::{any_thread_pc_in_range, parse_proc_maps, wait_until_stopped, MapEntry};
 use crate::{log_error, log_info, log_step, log_success, log_verbose, log_warn};
 
 /// 嵌入编译好的 zymbiote ELF
@@ -852,6 +852,7 @@ fn do_resume_unmatched(pid: u32, ppid: u32, mut stream: std::os::unix::net::Unix
     }
 
     // 5. 还原子进程 patch（使用 ppid 匹配正确的 zygote patch）
+    //    含 payload 页字节还原 + 丢 COW（避免 smaps 出现 Anonymous/Shared_Dirty）
     if let Err(e) = revert_child_patch_by_ppid(pid, ppid) {
         log_verbose!("还原未匹配子进程 {} patch 失败: {}", pid, e);
     }
@@ -913,7 +914,31 @@ pub(crate) fn resume_child(pid: u32) -> Result<(), String> {
     Ok(())
 }
 
-/// 用给定 ppid 还原子进程的 zymbiote patch
+/// 用给定 ppid 还原子进程的 zymbiote patch。
+///
+/// 1) 写回 payload 覆盖页的原始字节（备份来源 = backing 文件原文，见写入侧说明），
+///    并通过 karinahide 丢弃本进程的 COW 副本；
+/// 2) 还原与 payload 页无关的指针（setArgV0 slot / setcontext GOT / capset GOT）。
+///
+/// 第 1 步是上游既有行为，作用是让该页在子进程里回到“文件 backed、干净、非匿名”，
+/// DuckDetector 的 Memory 卡片正是按 smaps 里的 Anonymous/Shared_Dirty 判定
+/// (`x.so has N kB shared-dirty executable pages` / `reports N kB anonymous executable pages`)，
+/// 去掉它就会立刻报 DANGER。
+///
+/// ★ 为什么在“子进程 SIGSTOP 之后”做这一步是安全的（2026-09-13 结论）
+/// payload 的完成路径顺序是：free(package_name) → package_name = NULL →
+/// mprotect(还原 original_protection)，全部发生在它自己 raise(SIGSTOP) **之前**；
+/// 而 raise(SIGSTOP) 走 `musttail` 尾调 `rustfrida_stop_and_return_from_setargv0`
+/// （zymbiote.c），即 SIGCONT 之后直接回到 ART 调用者的栈帧，不会再执行 payload 页内代码。
+/// 因此在父进程观察到 SIGSTOP 的时刻写回/丢页，不会破坏 payload 正在执行的代码。
+///
+/// ★ 历史上“propmask 开启就崩”的真因不在这一步，而在 payload 自身：
+/// 崩溃现场 pc = payload_base+0x3ac 的 `str xzr, [x22,#0x18]`，fault = payload_base+0xf50，
+/// 即 payload 写自己的 ctx 字段；该页此前已被（zygote 或上一次调用）mprotect 成 R|X 自锁，
+/// 子进程 fork 后又只拿到只读的 COW pte，于是写自己那页直接 SIGSEGV。
+/// 修法在 payload 侧：zymbiote.c 两个 replacement 在写 ctx 前重新 mprotect(R|W|X)，
+/// 末尾仍按原逻辑还原 original_protection，自锁语义不变。
+/// 本函数保留 PC 安全门（`any_thread_pc_in_range`）兜底 revert_now=false 的竞态。
 fn revert_child_patch_by_ppid(pid: u32, ppid: u32) -> Result<(), String> {
     // 检查子进程是否仍存在
     if !std::path::Path::new(&format!("/proc/{}", pid)).exists() {
@@ -937,15 +962,54 @@ fn revert_child_patch_by_ppid(pid: u32, ppid: u32) -> Result<(), String> {
 
     let mem = ProcMem::open(pid)?;
 
-    // 还原 payload 区域
-    log_verbose!(
-        "还原子进程 {} payload at 0x{:x} ({} bytes)",
-        pid,
-        patch.payload_base,
-        patch.payload_backup.len()
-    );
-    mem.pwrite_all(&patch.payload_backup, patch.payload_base)?;
+    // 安全门：若仍有线程在该页内取指（revert_now=false 时子进程可能没走 SIGSTOP 路径），
+    // 跳过页清理，避免破坏仍在执行的 payload 代码。
+    let page_safe = match payload_page_range(patch) {
+        Ok((start, end)) => match any_thread_pc_in_range(pid, start, end) {
+            Ok(true) => {
+                log_warn!(
+                    "子进程 {} 仍有线程在 payload 页内取指，跳过 payload 页还原/丢页",
+                    pid
+                );
+                false
+            }
+            Ok(false) => true,
+            Err(e) => {
+                log_verbose!("子进程 {} PC 安全门检查失败（继续清理）: {}", pid, e);
+                true
+            }
+        },
+        Err(e) => {
+            log_verbose!("子进程 {} payload 页范围解析失败（跳过安全门）: {}", pid, e);
+            true
+        }
+    };
 
+    if page_safe {
+        // 写回原始 payload 字节（备份 = backing 文件原文）
+        log_verbose!(
+            "还原子进程 {} payload at 0x{:x} ({} bytes)",
+            pid,
+            patch.payload_base,
+            patch.payload_backup.len()
+        );
+        mem.pwrite_all(&patch.payload_backup, patch.payload_base)?;
+    }
+
+    restore_child_pointers(&mem, pid, patch)?;
+
+    // 写回原始 payload 只恢复字节内容；对文件-backed 私有可执行页还要丢弃
+    // 本进程的 COW 副本，否则后续 smaps 仍可能看到 Anonymous/Dirty。
+    if page_safe {
+        discard_payload_cow(pid, patch, "子进程")?;
+    }
+
+    Ok(())
+}
+
+/// 还原子进程内与 payload 页无关的指针（setArgV0 slot / setcontext GOT / capset GOT）。
+/// 幂等：多次调用安全。
+fn restore_child_pointers(mem: &ProcMem, pid: u32, patch: &ZygotePatch) -> Result<(), String> {
     // 还原 setArgV0 指针（降级模式下为 None）
     if let Some((addr, backup)) = &patch.setargv0_slot {
         log_verbose!("还原子进程 {} setArgV0 指针 at 0x{:x}", pid, addr);
@@ -964,34 +1028,39 @@ fn revert_child_patch_by_ppid(pid: u32, ppid: u32) -> Result<(), String> {
         mem.pwrite_all(backup, *addr)?;
     }
 
-    // 写回原始 payload 只恢复字节内容；对文件-backed 私有可执行页还要丢弃
-    // 本进程的 COW 副本，否则后续 smaps 仍可能看到 Anonymous/Dirty。
-    discard_payload_cow(pid, patch, "子进程")?;
-
     Ok(())
 }
 
-/// 通过 karinahide 的内核控制接口丢弃 payload 覆盖页的 COW 副本。
-/// 只处理 payload 所在的页，不触碰 GOT、heap 等其他恢复区域。
-fn discard_payload_cow(pid: u32, patch: &ZygotePatch, label: &str) -> Result<(), String> {
+/// payload 覆盖的整页范围 `[page_start, page_end)`。
+/// “是否丢弃 COW 页”与“页内是否仍有线程取指”的安全检查必须用同一范围。
+fn payload_page_range(patch: &ZygotePatch) -> Result<(u64, u64), String> {
     let raw_page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     if raw_page_size <= 0 {
-        return Err(format!("{} payload 无法获取 page_size", label));
+        return Err("payload 无法获取 page_size".to_string());
     }
     let page_size = raw_page_size as u64;
     if (page_size & (page_size - 1)) != 0 {
-        return Err(format!("{} payload page_size 非 2 的幂: {}", label, page_size));
+        return Err(format!("payload page_size 非 2 的幂: {}", page_size));
     }
 
     let page_start = patch.payload_base & !(page_size - 1);
     let payload_end = patch
         .payload_base
         .checked_add(patch.payload_backup.len() as u64)
-        .ok_or_else(|| format!("{} payload 地址范围溢出", label))?;
+        .ok_or_else(|| "payload 地址范围溢出".to_string())?;
     let page_end = payload_end
         .checked_add(page_size - 1)
-        .ok_or_else(|| format!("{} payload 页范围溢出", label))?
+        .ok_or_else(|| "payload 页范围溢出".to_string())?
         & !(page_size - 1);
+
+    Ok((page_start, page_end))
+}
+
+/// 通过 karinahide 的内核控制接口丢弃 payload 覆盖页的 COW 副本。
+/// 只处理 payload 所在的页，不触碰 GOT、heap 等其他恢复区域。
+fn discard_payload_cow(pid: u32, patch: &ZygotePatch, label: &str) -> Result<(), String> {
+    let (page_start, page_end) = payload_page_range(patch)
+        .map_err(|e| format!("{} payload: {}", label, e))?;
     let page_len = page_end
         .checked_sub(page_start)
         .ok_or_else(|| format!("{} payload 页范围无效", label))?;
@@ -1781,21 +1850,44 @@ fn inject_zymbiote(pid: u32, socket_name: &str) -> Result<ZygotePatch, String> {
         page_size
     );
 
-    // 备份原始数据
-    // 与 Frida 一致：already-patched 时从 backing 文件读取真正的原始数据（COW 场景）
-    let payload_backup = if already_patched {
-        read_backing_file_data(&loc.path, loc.file_offset, payload_data.len())?
-    } else {
-        let mut buf = vec![0u8; payload_data.len()];
-        mem.pread_exact(&mut buf, loc.base).map_err(|e| {
-            format!(
-                "payload 预读失败 (用于备份): {}{}",
-                e,
-                dump_maps_near(&maps, loc.base, 2)
-            )
-        })?;
-        buf
-    };
+    // 备份原始数据（供后续还原 payload 页使用）
+    // ★ 一律优先读 backing 文件原文，而不是按 already_patched 二选一（2026-09-13 污染修复）：
+    //   already_patched 只看 setArgV0 指针是否已被替换；若上次会话只还原了指针、页内仍残留
+    //   payload（上次未清理 / 被强杀），从“目标页当前内容”取的备份就是残留 payload，之后
+    //   所有还原都会变成“把 payload 写回”，页永远清不干净（实测：crash 现场子进程页内容与
+    //   zygote 页逐字节相同，均仍为 payload，而 backing 文件该处是 PLT 原文）。
+    log_verbose!(
+        "payload 备份来源: backing 文件 {} +0x{:x} (already_patched={})",
+        loc.path,
+        loc.file_offset,
+        already_patched
+    );
+    let payload_backup =
+        match read_backing_file_data(&loc.path, loc.file_offset, payload_data.len()) {
+            Ok(buf) => {
+                // 页内若与文件原文不一致，说明上次的 payload 还残留在页上（告警以便取证）
+                let mut cur = vec![0u8; payload_data.len()];
+                if mem.pread_exact(&mut cur, loc.base).is_ok() && cur != buf {
+                    log_warn!(
+                        "payload 页 0x{:x} 与 backing 文件原文不一致（上次会话残留 payload？）；本次以文件原文作为还原备份",
+                        loc.base
+                    );
+                }
+                buf
+            }
+            Err(e) => {
+                log_warn!("读取 backing 文件原文失败({})，退回按目标页当前内容备份", e);
+                let mut buf = vec![0u8; payload_data.len()];
+                mem.pread_exact(&mut buf, loc.base).map_err(|e| {
+                    format!(
+                        "payload 预读失败 (用于备份): {}{}",
+                        e,
+                        dump_maps_near(&maps, loc.base, 2)
+                    )
+                })?;
+                buf
+            }
+        };
 
     // 写入 payload
     mem.pwrite_all(&payload_data, loc.base).map_err(|e| {
@@ -2606,9 +2698,44 @@ fn cleanup_zygote_patches_with_pending_mode(mode: PendingConnectionCleanup) {
 
         match ProcMem::open(patch.pid) {
             Ok(mem) => {
-                // 还原 payload
-                if let Err(e) = mem.pwrite_all(&patch.payload_backup, patch.payload_base) {
-                    log_error!("还原 zygote {} payload 失败: {}", patch.pid, e);
+                // ★ payload 页安全门（与子进程路径同一竞态）：zygote 组停止时可能有线程仍
+                // 在 payload 页内取指，写回字节 / 丢页会让恢复运行的 zygote SIGSEGV。
+                let payload_safe = match payload_page_range(patch) {
+                    Ok((start, end)) => match any_thread_pc_in_range(patch.pid, start, end) {
+                        Ok(true) => {
+                            log_error!(
+                                "Zygote {} payload 页 0x{:x}-0x{:x} 内仍有线程在取指，跳过字节还原/丢页（zygote 保持已 patch 状态）",
+                                patch.pid,
+                                start,
+                                end
+                            );
+                            false
+                        }
+                        Ok(false) => true,
+                        Err(err) => {
+                            log_error!(
+                                "Zygote {} payload 页安全检查失败({})，保守跳过字节还原/丢页",
+                                patch.pid,
+                                err
+                            );
+                            false
+                        }
+                    },
+                    Err(err) => {
+                        log_error!(
+                            "Zygote {} payload 页范围计算失败({})，保守跳过字节还原/丢页",
+                            patch.pid,
+                            err
+                        );
+                        false
+                    }
+                };
+
+                // 还原 payload（仅当页内确认没有线程在取指）
+                if payload_safe {
+                    if let Err(e) = mem.pwrite_all(&patch.payload_backup, patch.payload_base) {
+                        log_error!("还原 zygote {} payload 失败: {}", patch.pid, e);
+                    }
                 }
 
                 // 还原 setArgV0 指针（降级模式下为 None）
@@ -2634,8 +2761,10 @@ fn cleanup_zygote_patches_with_pending_mode(mode: PendingConnectionCleanup) {
 
                 // payload 位于文件-backed 可执行页；写回原始字节后继续丢弃
                 // zygote 自己的 COW 副本，避免 patch 生命周期结束后留下脏页。
-                if let Err(e) = discard_payload_cow(patch.pid, patch, "zygote") {
-                    log_error!("清理 zygote {} payload COW 失败: {}", patch.pid, e);
+                if payload_safe {
+                    if let Err(e) = discard_payload_cow(patch.pid, patch, "zygote") {
+                        log_error!("清理 zygote {} payload COW 失败: {}", patch.pid, e);
+                    }
                 }
 
                 log_success!("Zygote {} patch 已还原", patch.pid);

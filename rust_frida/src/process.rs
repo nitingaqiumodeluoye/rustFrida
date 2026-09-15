@@ -724,6 +724,93 @@ pub(crate) fn wait_until_stopped(pid: u32) -> Result<(), String> {
     }
 }
 
+/// 检查进程内是否有线程的用户态 PC 落在 `[start, end)` 内。
+///
+/// 数据来源 `/proc/<pid>/task/<tid>/syscall`：内核输出
+/// `<syscall_nr> 0x<arg0..arg5> 0x<sp> 0x<pc>`，最后一列即该线程的用户态 PC；
+/// 正在 CPU 上执行的任务输出 `running`。
+///
+/// 返回 `Ok(true)` = 检测到（或无法排除）有线程正在该范围内取指，调用方不应修改或丢弃
+/// 该范围的内存；`Ok(false)` = 所有线程 PC 都在范围外。任何一项读取/解析失败都按
+/// “仍可能在其中执行”处理（保守）。
+///
+/// 用途：rustFrida payload 被写进子进程后，父进程会在子进程 SIGSTOP 期间写回原始字节并
+/// 丢弃 COW 页；若该页仍有线程在取指（子进程 payload 自身的收尾重映射，或 propmask 等
+/// 模块把早期阶段拉长时主线程尚未跑完 payload bootstrap），恢复运行的线程会从已失效的
+/// 页取指 → SIGSEGV。动那块内存前必须先问这里。
+pub(crate) fn any_thread_pc_in_range(pid: u32, start: u64, end: u64) -> Result<bool, String> {
+    let task_dir = format!("/proc/{}/task", pid);
+    let entries =
+        std::fs::read_dir(&task_dir).map_err(|e| format!("读取 {} 失败: {}", task_dir, e))?;
+    let mut checked = 0usize;
+
+    for entry in entries.flatten() {
+        let tid = entry.file_name().to_string_lossy().to_string();
+        let path = format!("/proc/{}/task/{}/syscall", pid, tid);
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(v) => v,
+            // 正在运行 / 权限不足（system_server 等 SELinux 高域）/ 线程刚退出：无法判定
+            Err(e) => {
+                log_verbose!(
+                    "any_thread_pc_in_range: 读取 {} 失败({})，按范围内活动处理",
+                    path,
+                    e
+                );
+                return Ok(true);
+            }
+        };
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with("running") {
+            log_verbose!(
+                "any_thread_pc_in_range: pid={} tid={} 仍在运行，无法判定 PC",
+                pid,
+                tid
+            );
+            return Ok(true);
+        }
+        let pc = match line.split_whitespace().last() {
+            Some(v) => match u64::from_str_radix(v.trim_start_matches("0x"), 16) {
+                Ok(pc) => pc,
+                Err(_) => {
+                    log_verbose!(
+                        "any_thread_pc_in_range: pid={} tid={} pc 解析失败: {:?}",
+                        pid,
+                        tid,
+                        line
+                    );
+                    return Ok(true);
+                }
+            },
+            None => {
+                log_verbose!("any_thread_pc_in_range: pid={} tid={} 输出为空", pid, tid);
+                return Ok(true);
+            }
+        };
+        checked += 1;
+        if pc >= start && pc < end {
+            log_verbose!(
+                "any_thread_pc_in_range: pid={} tid={} pc=0x{:x} 落在 0x{:x}-0x{:x} 内（已查 {} 个线程）",
+                pid,
+                tid,
+                pc,
+                start,
+                end,
+                checked
+            );
+            return Ok(true);
+        }
+    }
+
+    log_verbose!(
+        "any_thread_pc_in_range: pid={} 范围 0x{:x}-0x{:x} 无线程取指（已查 {} 个线程）",
+        pid,
+        start,
+        end,
+        checked
+    );
+    Ok(false)
+}
+
 /// 通过读 /proc/*/cmdline 按进程名查找 PID。
 /// 精确匹配（含末路径组件）；多匹配列出并返回错误。
 pub(crate) fn find_pid_by_name(name: &str) -> Result<i32, String> {
