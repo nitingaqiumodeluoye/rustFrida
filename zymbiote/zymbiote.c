@@ -640,6 +640,14 @@ rustfrida_zymbiote_replacement_setcontext(uid_t uid, bool is_system_server, cons
 
         rustfrida_wait_for_permission_to_resume(zymbiote.package_name, &revert_now);
 
+        /* 可重入修复（2026-09-13，propmask × rustFrida spawn 冲突取证）：
+         * replacement 完成路径末尾会把本页还原成 R|X（自锁）；若 replacement 被再次进入
+         * （实测 propmask 启用时 setArgV0 会进两次），下面 `package_name = NULL`
+         * 就是写只读页 → SIGSEGV(MAPERR)。此处临时放开写权限，随后仍按原逻辑
+         * 还原 payload_original_protection，自锁语义不变。 */
+        zymbiote.mprotect(zymbiote.payload_base, zymbiote.payload_size,
+                          PROT_READ | PROT_WRITE | PROT_EXEC);
+
         /* 还原状态：释放 package_name、恢复页保护 */
         zymbiote.free(zymbiote.package_name);
         zymbiote.package_name = NULL;
@@ -689,6 +697,12 @@ rustfrida_zymbiote_replacement_setargv0(JNIEnv *env, jobject clazz, jstring name
     }
 
     rustfrida_wait_for_permission_to_resume(name_utf8, &revert_now);
+
+    /* 可重入修复：见 replacement_setcontext 同名注释。
+     * 上一次调用末尾已把本页锁回 R|X，这里先重新放开写权限，
+     * 否则下面的 `package_name = NULL`（本页内 store）会权限 fault。 */
+    zymbiote.mprotect(zymbiote.payload_base, zymbiote.payload_size,
+                      PROT_READ | PROT_WRITE | PROT_EXEC);
 
     if (zymbiote.package_name != NULL)
     {
