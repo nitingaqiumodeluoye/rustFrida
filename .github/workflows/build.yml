@@ -49,17 +49,43 @@ jobs:
           sudo unzip -q /tmp/android-ndk.zip -d /opt
           rm -f /tmp/android-ndk.zip
 
-      - name: Verify NDK toolchain
+      # NDK r29 只提供 llvm-* 工具，没有 aarch64-linux-android-ar 这类
+      # 目标三元组前缀的包装脚本；cc-rs 不会自动回退到 llvm-ar，所以必须
+      # 显式导出 AR_<triple>（两种写法 cc-rs 都查）。
+      # LIBCLANG_PATH 指向 NDK 自带的 libclang.so，让 bindgen 与工具链/ sysroot
+      # 保持同一个 clang 版本，避免宿主 libclang 与 NDK 头文件不匹配。
+      - name: Configure Android NDK env
         run: |
           set -euxo pipefail
-          echo "ANDROID_NDK_HOME=${NDK_DIR}" >> "${GITHUB_ENV}"
-          echo "ANDROID_NDK_ROOT=${NDK_DIR}" >> "${GITHUB_ENV}"
           TC="${NDK_DIR}/toolchains/llvm/prebuilt/linux-x86_64/bin"
-          test -x "${TC}/aarch64-linux-android33-clang"
-          test -x "${TC}/llvm-objcopy"
+          SYSROOT="${NDK_DIR}/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
+          LIBCLANG="${NDK_DIR}/toolchains/llvm/prebuilt/linux-x86_64/lib"
+
+          CC="${TC}/aarch64-linux-android33-clang"
+          CXX="${TC}/aarch64-linux-android33-clang++"
+          test -x "${CC}"
+          test -x "${CXX}"
           test -x "${TC}/llvm-ar"
-          test -d "${NDK_DIR}/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
-          "${TC}/aarch64-linux-android33-clang" --version | head -1
+          test -x "${TC}/llvm-objcopy"
+          test -d "${SYSROOT}"
+          test -f "${LIBCLANG}/libclang.so"
+
+          {
+            echo "ANDROID_NDK_HOME=${NDK_DIR}"
+            echo "ANDROID_NDK_ROOT=${NDK_DIR}"
+            echo "CC_aarch64-linux-android=${CC}"
+            echo "CC_aarch64_linux_android=${CC}"
+            echo "CXX_aarch64-linux-android=${CXX}"
+            echo "CXX_aarch64_linux_android=${CXX}"
+            echo "AR_aarch64-linux-android=${TC}/llvm-ar"
+            echo "AR_aarch64_linux_android=${TC}/llvm-ar"
+            echo "RANLIB_aarch64-linux-android=${TC}/llvm-ranlib"
+            echo "RANLIB_aarch64_linux_android=${TC}/llvm-ranlib"
+            echo "LIBCLANG_PATH=${LIBCLANG}"
+          } >> "${GITHUB_ENV}"
+          echo "${TC}" >> "${GITHUB_PATH}"
+
+          "${CC}" --version | head -1
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
