@@ -2751,7 +2751,9 @@ fn cleanup_pending_connections(mode: PendingConnectionCleanup) {
                 retry_child_payload_revert_after_resume(pid, ppid, &revert_result);
             }
             // 子进程即将被 SIGKILL：残留页随进程消失，无需补还原
-            PendingConnectionCleanup::KillAfterRevert => unsafe { libc::kill(pid as i32, libc::SIGKILL) },
+            PendingConnectionCleanup::KillAfterRevert => {
+                unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+            }
         };
     }
 }
