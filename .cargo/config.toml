@@ -5,8 +5,30 @@ target = "aarch64-linux-android"
 linker = "/opt/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android33-clang"
 ar = "/opt/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
 
+# 注意：上面的 [target.*].linker/ar 只作用于 rustc/链接阶段。
+# cc-rs（编译 hook_engine.c / tinycc / transform.c 等）和 bindgen 只认环境变量，
+# 所以交叉工具必须在 [env] 里再声明一遍，否则命令行 `cargo build` 会报
+#   cc-rs: failed to find tool "aarch64-linux-android-ar"
+# （NDK r29 的 bin/ 里只有 llvm-ar / llvm-ranlib，没有三元组前缀的 ar 包装脚本，
+#   而 cc-rs 不会自动回退到 llvm-ar，必须显式给 AR_<triple>。）
+# 另外这些变量在环境里已存在时以环境为准（Cargo 的 [env] 默认不覆盖），
+# 所以想换 NDK 直接在 shell 里 export 覆盖即可。
 [env]
 ANDROID_NDK_HOME = "/opt/android-ndk-r29"
 ANDROID_NDK_ROOT = "/opt/android-ndk-r29"
+
+# cc-rs 两种写法都会查（连字符与下划线），两个都给上避免踩隐式约定。
 CC_aarch64-linux-android = "/opt/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android33-clang"
+CC_aarch64_linux_android = "/opt/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android33-clang"
+CXX_aarch64-linux-android = "/opt/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android33-clang++"
+CXX_aarch64_linux_android = "/opt/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android33-clang++"
+AR_aarch64-linux-android = "/opt/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
+AR_aarch64_linux_android = "/opt/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
+RANLIB_aarch64-linux-android = "/opt/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ranlib"
+RANLIB_aarch64_linux_android = "/opt/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ranlib"
+
+# bindgen 跑在宿主机上，需要一份 libclang。用 NDK 自带的，保证与工具链/sysroot 同版本，
+# 不去猜宿主机装的是哪个 clang。
+LIBCLANG_PATH = "/opt/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/lib"
+
 BINDGEN_EXTRA_CLANG_ARGS = "--sysroot=/opt/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/sysroot/"
