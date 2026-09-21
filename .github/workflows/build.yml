@@ -1,0 +1,110 @@
+name: Build (Android aarch64)
+
+on:
+  push:
+    branches: [master, main]
+    tags: ["v*"]
+  pull_request:
+    branches: [master, main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  NDK_VERSION: r29
+  NDK_DIR: /opt/android-ndk-r29
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: agent + rustfrida
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      # NDK r29 安装到 /opt/android-ndk-r29，与仓库内 .cargo/config.toml
+      # 里写死的 linker / sysroot / BINDGEN_EXTRA_CLANG_ARGS 路径保持一致。
+      - name: Restore Android NDK ${{ env.NDK_VERSION }}
+        id: ndk-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.NDK_DIR }}
+          key: ndk-${{ env.NDK_VERSION }}-linux-x86_64
+
+      - name: Install Android NDK ${{ env.NDK_VERSION }}
+        if: steps.ndk-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euxo pipefail
+          curl -fL --retry 3 --retry-delay 5 \
+            -o /tmp/android-ndk.zip \
+            "https://dl.google.com/android/repository/android-ndk-${NDK_VERSION}-linux.zip"
+          sudo mkdir -p "${NDK_DIR}"
+          sudo unzip -q /tmp/android-ndk.zip -d /opt
+          rm -f /tmp/android-ndk.zip
+
+      - name: Verify NDK toolchain
+        run: |
+          set -euxo pipefail
+          echo "ANDROID_NDK_HOME=${NDK_DIR}" >> "${GITHUB_ENV}"
+          echo "ANDROID_NDK_ROOT=${NDK_DIR}" >> "${GITHUB_ENV}"
+          TC="${NDK_DIR}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          test -x "${TC}/aarch64-linux-android33-clang"
+          test -x "${TC}/llvm-objcopy"
+          test -x "${TC}/llvm-ar"
+          test -d "${NDK_DIR}/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
+          "${TC}/aarch64-linux-android33-clang" --version | head -1
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: android-aarch64
+
+      - name: Show toolchain
+        run: |
+          rustc -Vv
+          cargo -V
+          python3 --version
+
+      # 1) loader shellcode：rustfrida 通过 include_bytes! 内嵌，必须先构建。
+      #    （rust_frida/build.rs 也会兜底重跑，这里显式跑一次便于早期报错）
+      - name: Build loader shellcode
+        run: python3 loader/build_helpers.py
+
+      # 2) agent：rustfrida 通过 include_bytes! 内嵌 libagent.so，必须先于主程序。
+      - name: Build agent (libagent.so)
+        run: cargo build -p agent --release --locked --target aarch64-linux-android
+
+      # 3) 主程序：内嵌 bootstrapper.bin + rustfrida-loader.bin + libagent.so
+      - name: Build rustfrida
+        run: cargo build -p rust_frida --release --locked --target aarch64-linux-android
+
+      - name: Collect artifacts
+        run: |
+          set -euxo pipefail
+          OUT=target/aarch64-linux-android/release
+          mkdir -p dist
+          cp "${OUT}/rustfrida" dist/
+          cp "${OUT}/libagent.so" dist/
+          file dist/* || true
+          ls -l dist
+          sha256sum dist/* | tee dist/SHA256SUMS.txt
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustfrida-aarch64-${{ github.sha }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
