@@ -59,6 +59,11 @@ struct ZygotePatch {
     setcontext_got: Option<(u64, [u8; 8])>,
     /// capset GOT slot（可选，用于属性 profile mount）
     capset_got: Option<(u64, [u8; 8])>,
+    /// zygote 侧是否已还原完成。
+    /// cleanup 的幂等性由该标志**逐条**保证（不再依赖进程级一次性闩锁）：
+    /// 还原成功 / 进程已消失 → true；被 PC 安全门拦截、/proc/<pid>/mem 打开失败、
+    /// 或部分写回失败 → 保持 false，以便下一次 cleanup（abort 或退出）重试。
+    restored: bool,
 }
 
 /// 全局状态
@@ -483,9 +488,12 @@ pub(crate) fn ensure_zymbiote_loaded() -> Result<(), String> {
     }
 
     // 过滤掉已注入的 pid
+    // 注意：restored=true 的 entry 不再算"已注入"——cleanup 还原后 zygote 已干净，
+    // 再次 spawn 必须重新注入（旧实现靠 patches.clear() 达到同样效果，但那样会让
+    // 子进程侧的 revert 找不到 patch 而跳过子进程还原）。
     let already_patched_pids: Vec<u32> = if let Some(patches_lock) = ZYGOTE_PATCHES.get() {
         let patches = patches_lock.lock().unwrap();
-        patches.iter().map(|p| p.pid).collect()
+        patches.iter().filter(|p| !p.restored).map(|p| p.pid).collect()
     } else {
         Vec::new()
     };
@@ -526,10 +534,13 @@ pub(crate) fn ensure_zymbiote_loaded() -> Result<(), String> {
         return Err("所有 zygote 进程注入失败".to_string());
     }
 
-    // 追加新 patches 到全局列表
+    // 追加新 patches 到全局列表（同 pid 的旧 entry 先剔除：一个 zygote 只保留最新一份，
+    // 避免 revert_child_patch_by_ppid 按 ppid 查找时命中已被还原的旧 entry）
     if !new_patches.is_empty() {
+        let new_pids: Vec<u32> = new_patches.iter().map(|p| p.pid).collect();
         let patches_lock = ZYGOTE_PATCHES.get_or_init(|| Mutex::new(Vec::new()));
         let mut patches = patches_lock.lock().unwrap();
+        patches.retain(|p| !new_pids.contains(&p.pid));
         patches.extend(new_patches);
     }
 
@@ -951,8 +962,11 @@ fn revert_child_patch_by_ppid(pid: u32, ppid: u32) -> Result<(), String> {
         None => return Ok(()),
     };
     let patches = patches_lock.lock().unwrap();
-    // 按 ppid 精确匹配父 Zygote 的 patch（与 Frida 一致：不做 fallback，避免多 zygote 时用错 patch）
-    let patch = match patches.iter().find(|p| p.pid == ppid) {
+    // 按 ppid 精确匹配父 Zygote 的 patch（与 Frida 一致：不做 fallback，避免多 zygote 时用错 patch）。
+    // 取最新 entry（iter().rev()）：同一 zygote 重新注入后会有新 entry；
+    // 且 restored=true 的 entry 对子进程依然有效——子进程持有自己的 COW 副本，
+    // zygote 侧还原不影响子进程页，仍应用它还原子进程的 payload 页与指针。
+    let patch = match patches.iter().rev().find(|p| p.pid == ppid) {
         Some(p) => p,
         None => {
             log_warn!("未找到 ppid={} 对应的 zygote patch，跳过子进程 {} 的还原", ppid, pid);
@@ -2005,6 +2019,7 @@ fn inject_zymbiote(pid: u32, socket_name: &str) -> Result<ZygotePatch, String> {
         setargv0_slot,
         setcontext_got,
         capset_got,
+        restored: false,
     })
 }
 
@@ -2650,10 +2665,18 @@ fn cleanup_pending_connections(mode: PendingConnectionCleanup) {
 fn cleanup_zygote_patches_with_pending_mode(mode: PendingConnectionCleanup) {
     CLEANUP_STARTED.store(true, Ordering::SeqCst);
 
-    // 幂等保护：所有调用路径（正常退出 + 信号处理）共享此检查
-    if CLEANUP_DONE.swap(true, Ordering::SeqCst) {
-        return;
-    }
+    // 重入保护：只阻止"同一轮 cleanup 被并发/重入执行"，不再永久禁用后续清理。
+    // （旧实现是一次性闩锁 CLEANUP_DONE：任何一次调用——例如某次 spawn 的 pre-resume
+    //  脚本失败走 abort 路径——都会永久消费掉它，导致本进程之后注入的 zygote patch
+    //  在退出时无人还原，payload 页以 rwxp/脏页残留，被内存检测器（duck-detector 的
+    //  "Writable+executable mapping ... libstagefright.so"）抓到。）
+    let _reentry_guard = match CleanupReentryGuard::acquire() {
+        Some(guard) => guard,
+        None => {
+            log_warn!("cleanup 正在执行中，跳过本次重入调用");
+            return;
+        }
+    };
 
     // 1. 先恢复所有挂起的子进程连接（与 Frida close() 顺序一致）
     //    必须在还原 Zygote 之前执行：子进程持有 COW 副本，需要独立还原
@@ -2662,7 +2685,11 @@ fn cleanup_zygote_patches_with_pending_mode(mode: PendingConnectionCleanup) {
     // 2. 再还原 Zygote patch
     let patches = match ZYGOTE_PATCHES.get() {
         Some(lock) => lock,
-        None => return,
+        None => {
+            // 从未注入过：无需还原 zygote，只需归还 SELinux 策略（自身幂等）
+            crate::selinux::restore_selinux();
+            return;
+        }
     };
 
     let mut patches = match patches.lock() {
@@ -2670,12 +2697,34 @@ fn cleanup_zygote_patches_with_pending_mode(mode: PendingConnectionCleanup) {
         Err(_) => return,
     };
 
-    for patch in patches.iter() {
+    let pending_before: Vec<u32> = patches
+        .iter()
+        .filter(|p| !p.restored)
+        .map(|p| p.pid)
+        .collect();
+    if pending_before.is_empty() {
+        log_verbose!("无未还原的 zygote patch，跳过还原");
+    } else {
+        log_info!(
+            "正在还原 {} 个 zygote 的 patch... (pid={:?})",
+            pending_before.len(),
+            pending_before
+        );
+    }
+
+    for patch in patches.iter_mut() {
+        // 幂等：已还原过的条目直接跳过（真实状态由 restored 决定，
+        // 与本进程此前是否 cleanup 过无关）
+        if patch.restored {
+            continue;
+        }
+
         log_info!("正在还原 zygote {} 的 patch...", patch.pid);
 
         // 检查进程是否仍然存在（与 Frida catch (Error e) {} 一致：进程不存在时跳过）
         if !std::path::Path::new(&format!("/proc/{}", patch.pid)).exists() {
             log_warn!("Zygote {} 已不存在，跳过还原", patch.pid);
+            patch.restored = true; // 进程都没了，残留页随之消失
             continue;
         }
 
@@ -2685,6 +2734,7 @@ fn cleanup_zygote_patches_with_pending_mode(mode: PendingConnectionCleanup) {
             let err = std::io::Error::last_os_error();
             if err.raw_os_error() == Some(libc::ESRCH) {
                 log_warn!("Zygote {} 已退出 (ESRCH)，跳过还原", patch.pid);
+                patch.restored = true; // 进程已退出，无需再还原
                 continue;
             }
             log_error!("SIGSTOP zygote {} 失败: {}", patch.pid, err);
@@ -2695,6 +2745,9 @@ fn cleanup_zygote_patches_with_pending_mode(mode: PendingConnectionCleanup) {
             log_error!("等待 zygote {} 停止超时", patch.pid);
             // 仍然尝试还原，与 Frida try/finally 一致
         }
+
+        // 本轮是否把该 patch 还原干净（决定 restored 标志；未还原干净则下次 cleanup 重试）
+        let mut fully_restored = true;
 
         match ProcMem::open(patch.pid) {
             Ok(mem) => {
@@ -2735,13 +2788,19 @@ fn cleanup_zygote_patches_with_pending_mode(mode: PendingConnectionCleanup) {
                 if payload_safe {
                     if let Err(e) = mem.pwrite_all(&patch.payload_backup, patch.payload_base) {
                         log_error!("还原 zygote {} payload 失败: {}", patch.pid, e);
+                        fully_restored = false;
                     }
+                } else {
+                    // 安全门拦截：payload 页可能仍是 rwxp 且仍装着 payload 字节，
+                    // 保持 restored=false，让后续 cleanup（下一次 abort 或退出）重试
+                    fully_restored = false;
                 }
 
                 // 还原 setArgV0 指针（降级模式下为 None）
                 if let Some((addr, backup)) = &patch.setargv0_slot {
                     if let Err(e) = mem.pwrite_all(backup, *addr) {
                         log_error!("还原 zygote {} setArgV0 指针失败: {}", patch.pid, e);
+                        fully_restored = false;
                     }
                 }
 
@@ -2749,6 +2808,7 @@ fn cleanup_zygote_patches_with_pending_mode(mode: PendingConnectionCleanup) {
                 if let Some((addr, backup)) = &patch.setcontext_got {
                     if let Err(e) = mem.pwrite_all(backup, *addr) {
                         log_error!("还原 zygote {} setcontext GOT 失败: {}", patch.pid, e);
+                        fully_restored = false;
                     }
                 }
 
@@ -2756,6 +2816,7 @@ fn cleanup_zygote_patches_with_pending_mode(mode: PendingConnectionCleanup) {
                 if let Some((addr, backup)) = &patch.capset_got {
                     if let Err(e) = mem.pwrite_all(backup, *addr) {
                         log_error!("还原 zygote {} capset GOT 失败: {}", patch.pid, e);
+                        fully_restored = false;
                     }
                 }
 
@@ -2764,28 +2825,52 @@ fn cleanup_zygote_patches_with_pending_mode(mode: PendingConnectionCleanup) {
                 if payload_safe {
                     if let Err(e) = discard_payload_cow(patch.pid, patch, "zygote") {
                         log_error!("清理 zygote {} payload COW 失败: {}", patch.pid, e);
+                        fully_restored = false;
                     }
                 }
-
-                log_success!("Zygote {} patch 已还原", patch.pid);
             }
             Err(e) => {
                 log_error!("打开 /proc/{}/mem 失败: {}", patch.pid, e);
+                fully_restored = false;
             }
         }
 
         // SIGCONT 恢复 zygote（无论还原是否成功，与 Frida finally 一致）
         unsafe { libc::kill(patch.pid as i32, libc::SIGCONT) };
+
+        patch.restored = fully_restored;
+        if fully_restored {
+            log_success!("Zygote {} patch 已还原", patch.pid);
+        } else {
+            log_error!(
+                "Zygote {} patch 未完全还原（保持待还原状态，下次 cleanup 重试）",
+                patch.pid
+            );
+        }
     }
 
-    patches.clear();
+    // 不再 patches.clear()：保留 entry（restored=true）以便该 zygote 之后 fork 出的
+    // 子进程仍能被 revert_child_patch_by_ppid 还原子进程自己的 COW 副本；
+    // 旧实现 clear() 后子进程还原会因找不到 patch 而整段跳过，留下脏页。
+    // 失效 entry 由 ensure_zymbiote_loaded() 里按 zygote 存活性剪枝清理。
+    let pending_after: Vec<u32> = patches
+        .iter()
+        .filter(|p| !p.restored)
+        .map(|p| p.pid)
+        .collect();
 
-    // 还原 SELinux 状态
+    // 还原 SELinux 状态（restore_selinux 自身幂等：SELINUX_SOFTENED.swap(false)）
     crate::selinux::restore_selinux();
+
+    // 3. 退出自检：把"残余 patch / 残留 rwxp payload 页"变成退出时可见的信号，
+    //    而不是事后被内存检测器抓出来（见函数注释）
+    self_check_payload_page_leftovers(&patches[..], &pending_after);
 }
 
-/// 退出时还原所有 Zygote patch（幂等：多次调用只执行一次）
-/// 与 Frida close() 顺序一致：先恢复挂起的子进程，再还原 Zygote patch
+/// 退出时还原所有 Zygote patch
+/// 与 Frida close() 顺序一致：先恢复挂起的子进程，再还原 Zygote patch。
+/// 幂等语义：逐条按 `ZygotePatch::restored` 判断，未还原成功的条目会在下一次调用
+/// （例如退出前最后一次 cleanup）重试——不再是一次性闩锁。
 pub(crate) fn cleanup_zygote_patches() {
     cleanup_zygote_patches_with_pending_mode(PendingConnectionCleanup::Resume);
 }
@@ -2795,10 +2880,118 @@ pub(crate) fn abort_pending_children_and_cleanup_zygote_patches() {
     cleanup_zygote_patches_with_pending_mode(PendingConnectionCleanup::KillAfterRevert);
 }
 
-/// 是否已执行过清理（幂等保护，cleanup_zygote_patches 内部使用）
-static CLEANUP_DONE: AtomicBool = AtomicBool::new(false);
+/// 退出自检：只读检查 payload 页是否还以"可写可执行"（rwx）形式留在任何进程里。
+///
+/// 动机：zymbiote payload 被写进 libstagefright.so 的 R+X 段尾页，注入期间该页被临时
+/// 改成 rwxp（payload 侧 mprotect）；若 cleanup 没跑完（PC 安全门拦截、进程被 SIGKILL、
+/// 子进程未走还原路径），这一页会以 "shared-dirty + anonymous executable" 的形态留在
+/// smaps 里——这正是 duck-detector 之类内存检测器的 DANGER 项（实测：
+/// `Writable+executable mapping 0x7f71fc0000-0x7f71fc1000 /system/lib64/libstagefright.so`）。
+/// 自检只报告、不修复，目的是让"清理失败"在退出时立刻可见，而不是事后很久才发现。
+fn self_check_payload_page_leftovers(patches: &[ZygotePatch], pending: &[u32]) {
+    if patches.is_empty() {
+        return;
+    }
+
+    if !pending.is_empty() {
+        log_error!(
+            "zygote 自检: {} 个 patch 未完全还原 (pid={:?})，下次 cleanup 会重试；若反复失败请重启 zygote/framework 或设备",
+            pending.len(),
+            pending
+        );
+    }
+
+    // payload 页地址（同一 boot 内 zygote 与其子进程共享同一 VMA）
+    let mut page_ranges: Vec<(u64, u64)> = Vec::new();
+    for patch in patches {
+        if let Ok(range) = payload_page_range(patch) {
+            if !page_ranges.contains(&range) {
+                page_ranges.push(range);
+            }
+        }
+    }
+    if page_ranges.is_empty() {
+        return;
+    }
+
+    let mut pids: Vec<u32> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir("/proc") {
+        for entry in entries.flatten() {
+            if let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() {
+                pids.push(pid);
+            }
+        }
+    }
+
+    let mut hits: Vec<String> = Vec::new();
+    for (page_start, _) in &page_ranges {
+        for pid in &pids {
+            // 进程已退出 / 无权限读取：忽略
+            let maps = match parse_proc_maps(*pid) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if let Some(entry) = maps
+                .iter()
+                .find(|e| e.start <= *page_start && *page_start < e.end)
+            {
+                if entry.is_writable() && entry.is_executable() {
+                    hits.push(format!(
+                        "pid {} 0x{:x}-0x{:x} {} {}",
+                        pid,
+                        entry.start,
+                        entry.end,
+                        entry.perms,
+                        if entry.path.is_empty() {
+                            "(anon)".to_string()
+                        } else {
+                            entry.path.clone()
+                        }
+                    ));
+                }
+            }
+        }
+    }
+
+    if hits.is_empty() {
+        log_success!(
+            "zygote 自检: payload 页无 w+x 残留（检查了 {} 个进程）",
+            pids.len()
+        );
+    } else {
+        log_error!(
+            "zygote 自检: 发现 {} 处残留的可写可执行 payload 页: {}",
+            hits.len(),
+            hits.join("; ")
+        );
+    }
+}
+
+/// cleanup 重入保护（只保护"当前这一轮"，不再跨 patch 生命周期禁用清理）。
+/// 幂等性由 `ZygotePatch::restored` 逐条保证；此标志仅用于防止信号退出路径与
+/// 正常退出路径并发/重入执行同一轮 cleanup。
+static CLEANUP_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 /// 清理是否已经开始（第二次 Ctrl+C 仅在此阶段允许强退）
 static CLEANUP_STARTED: AtomicBool = AtomicBool::new(false);
+
+/// cleanup 重入保护 guard：Drop 时释放，保证任何 early return 都不会漏放。
+struct CleanupReentryGuard;
+
+impl CleanupReentryGuard {
+    fn acquire() -> Option<Self> {
+        if CLEANUP_IN_PROGRESS.swap(true, Ordering::SeqCst) {
+            None
+        } else {
+            Some(CleanupReentryGuard)
+        }
+    }
+}
+
+impl Drop for CleanupReentryGuard {
+    fn drop(&mut self) {
+        CLEANUP_IN_PROGRESS.store(false, Ordering::SeqCst);
+    }
+}
 
 /// 信号是否已收到（信号处理函数只设标记，不做清理，避免死锁）
 static SIGNAL_RECEIVED: AtomicBool = AtomicBool::new(false);
