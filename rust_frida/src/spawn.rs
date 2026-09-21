@@ -156,12 +156,15 @@ fn cleanup_orphan_spawn_connections() {
         // 防止 fire-and-forget 线程未完成就 exit 导致子进程卡在 SIGSTOP）
         drain_until_eof(&mut stream, std::time::Duration::from_secs(5));
         drop(stream);
-        if let Err(e) = wait_until_stopped(orphan_pid) {
+        let revert_result = if let Err(e) = wait_until_stopped(orphan_pid) {
             log_verbose!("等待孤儿子进程 {} SIGSTOP 失败: {}", orphan_pid, e);
+            Ok(ChildPayloadRevert::PageUntouched)
         } else {
-            let _ = revert_child_patch_by_ppid(orphan_pid, ppid);
-        }
+            revert_child_patch_by_ppid(orphan_pid, ppid)
+        };
         unsafe { libc::kill(orphan_pid as i32, libc::SIGCONT) };
+        // SIGCONT 后补还原被安全门拦下的 payload 页
+        retry_child_payload_revert_after_resume(orphan_pid, ppid, &revert_result);
     }
 }
 
@@ -864,7 +867,8 @@ fn do_resume_unmatched(pid: u32, ppid: u32, mut stream: std::os::unix::net::Unix
 
     // 5. 还原子进程 patch（使用 ppid 匹配正确的 zygote patch）
     //    含 payload 页字节还原 + 丢 COW（避免 smaps 出现 Anonymous/Shared_Dirty）
-    if let Err(e) = revert_child_patch_by_ppid(pid, ppid) {
+    let revert_result = revert_child_patch_by_ppid(pid, ppid);
+    if let Err(e) = &revert_result {
         log_verbose!("还原未匹配子进程 {} patch 失败: {}", pid, e);
     }
 
@@ -872,6 +876,9 @@ fn do_resume_unmatched(pid: u32, ppid: u32, mut stream: std::os::unix::net::Unix
     if let Err(e) = sigcont_guard.continue_now() {
         log_verbose!("恢复未匹配子进程 {} 失败: {}", pid, e);
     }
+
+    // 7. 兜底：安全门拦下的 payload 页在放行后补还原
+    retry_child_payload_revert_after_resume(pid, ppid, &revert_result);
 }
 
 /// 活跃连接（等待 ACK 的子进程 stream + fork 时刻的 ppid）
@@ -914,12 +921,21 @@ pub(crate) fn resume_child(pid: u32) -> Result<(), String> {
 
     // 4. 还原子进程的 zymbiote patch（使用 hello 消息中的 ppid，而非 /proc 读取）
     //    revert_child_patch_by_ppid 内部已检查进程是否存在，安全调用
-    if let Err(e) = revert_child_patch_by_ppid(pid, ppid) {
-        log_warn!("还原子进程 {} patch 失败: {}", pid, e);
-    }
+    let revert_result = match revert_child_patch_by_ppid(pid, ppid) {
+        Ok(result) => Ok(result),
+        Err(e) => {
+            log_warn!("还原子进程 {} patch 失败: {}", pid, e);
+            Err(e)
+        }
+    };
 
     // 5. SIGCONT 恢复子进程；guard 在前面的任意错误返回时兜底
     sigcont_guard.continue_now()?;
+
+    // 5.1 兜底：安全门若拦下了 payload 页还原（子进程停在 payload 页内取指），
+    //     此刻 payload 已返回、页内不再取指，补还原字节 + 丢 COW 副本，
+    //     避免该 app 进程带着 payload 脏页继续跑（检测器按 smaps 判定）
+    retry_child_payload_revert_after_resume(pid, ppid, &revert_result);
 
     log_success!("子进程 {} 已恢复运行", pid);
     Ok(())
@@ -950,16 +966,22 @@ pub(crate) fn resume_child(pid: u32) -> Result<(), String> {
 /// 修法在 payload 侧：zymbiote.c 两个 replacement 在写 ctx 前重新 mprotect(R|W|X)，
 /// 末尾仍按原逻辑还原 original_protection，自锁语义不变。
 /// 本函数保留 PC 安全门（`any_thread_pc_in_range`）兜底 revert_now=false 的竞态。
-fn revert_child_patch_by_ppid(pid: u32, ppid: u32) -> Result<(), String> {
+///
+/// 返回值 `ChildPayloadRevert` 表示 payload 页这次到底动没动：安全门拦下时返回
+/// `PageUntouched`，调用方应在 SIGCONT 之后调用
+/// `retry_child_payload_revert_after_resume` 补还原（彼时 payload 的 replacement
+/// 已返回，页内不再取指）。
+fn revert_child_patch_by_ppid(pid: u32, ppid: u32) -> Result<ChildPayloadRevert, String> {
     // 检查子进程是否仍存在
     if !std::path::Path::new(&format!("/proc/{}", pid)).exists() {
         log_verbose!("子进程 {} 已不存在，跳过 patch 还原", pid);
-        return Ok(());
+        return Ok(ChildPayloadRevert::Restored);
     }
 
     let patches_lock = match ZYGOTE_PATCHES.get() {
         Some(lock) => lock,
-        None => return Ok(()),
+        // 从未注入过：没有可还原的页
+        None => return Ok(ChildPayloadRevert::Restored),
     };
     let patches = patches_lock.lock().unwrap();
     // 按 ppid 精确匹配父 Zygote 的 patch（与 Frida 一致：不做 fallback，避免多 zygote 时用错 patch）。
@@ -970,7 +992,7 @@ fn revert_child_patch_by_ppid(pid: u32, ppid: u32) -> Result<(), String> {
         Some(p) => p,
         None => {
             log_warn!("未找到 ppid={} 对应的 zygote patch，跳过子进程 {} 的还原", ppid, pid);
-            return Ok(());
+            return Ok(ChildPayloadRevert::Restored);
         }
     };
 
@@ -982,7 +1004,7 @@ fn revert_child_patch_by_ppid(pid: u32, ppid: u32) -> Result<(), String> {
         Ok((start, end)) => match any_thread_pc_in_range(pid, start, end) {
             Ok(true) => {
                 log_warn!(
-                    "子进程 {} 仍有线程在 payload 页内取指，跳过 payload 页还原/丢页",
+                    "子进程 {} 仍有线程在 payload 页内取指，跳过 payload 页还原/丢页（SIGCONT 后将补还原）",
                     pid
                 );
                 false
@@ -1018,7 +1040,71 @@ fn revert_child_patch_by_ppid(pid: u32, ppid: u32) -> Result<(), String> {
         discard_payload_cow(pid, patch, "子进程")?;
     }
 
-    Ok(())
+    Ok(if page_safe {
+        ChildPayloadRevert::Restored
+    } else {
+        ChildPayloadRevert::PageUntouched
+    })
+}
+
+/// 子进程 payload 页的还原结果。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ChildPayloadRevert {
+    /// payload 页已写回 backing 原文（并已丢 COW 副本），或该页已无需处理
+    /// （子进程不存在 / 找不到对应 patch）。
+    Restored,
+    /// payload 页本次未动：安全门判定页内仍有线程取指。
+    /// 调用方应在 SIGCONT 之后调 `retry_child_payload_revert_after_resume` 补还原。
+    PageUntouched,
+}
+
+/// SIGCONT 之后的兜底补还原。
+///
+/// 背景：子进程里 payload 的完成路径是 `free(package_name)` → `package_name = NULL`
+/// → `mprotect(original_protection)` → `musttail` 尾调 libc `raise(SIGSTOP)`。
+/// 父进程在观察到 SIGSTOP 的瞬间做页还原时，PC 仍可能落在 payload 页内
+/// （实测 127 例），于是安全门保守跳过；这些子进程随后被 SIGCONT 放行，
+/// 带着 payload 字节 + 脏 COW 页继续跑 —— 正是检测器按 smaps 判定
+/// （anonymous executable / shared-dirty executable pages）抓到的残留。
+///
+/// 补救：SIGCONT 之后 payload 已返回、页内不再取指，此时补做页还原是安全的。
+/// 只做有限次轮询（不来回 SIGSTOP/SIGCONT），幂等；`first` 已 `Restored` 时直接返回。
+fn retry_child_payload_revert_after_resume(
+    pid: u32,
+    ppid: u32,
+    first: &Result<ChildPayloadRevert, String>,
+) {
+    if matches!(first, Ok(ChildPayloadRevert::Restored)) {
+        return;
+    }
+
+    const ATTEMPTS: u64 = 12;
+    const INTERVAL_MS: u64 = 20;
+
+    for _ in 0..ATTEMPTS {
+        std::thread::sleep(std::time::Duration::from_millis(INTERVAL_MS));
+        if !std::path::Path::new(&format!("/proc/{}", pid)).exists() {
+            // 进程已退出：残留页随进程消失
+            return;
+        }
+        match revert_child_patch_by_ppid(pid, ppid) {
+            Ok(ChildPayloadRevert::Restored) => {
+                log_info!("子进程 {} 的 payload 页已在恢复运行后补还原", pid);
+                return;
+            }
+            Ok(ChildPayloadRevert::PageUntouched) => continue,
+            Err(e) => {
+                log_verbose!("子进程 {} 补还原失败: {}", pid, e);
+                return;
+            }
+        }
+    }
+
+    log_error!(
+        "子进程 {} 恢复运行后 {}ms 内仍未完成 payload 页还原（页内持续有线程取指）：该进程会保留 payload 字节与脏页",
+        pid,
+        ATTEMPTS * INTERVAL_MS
+    );
 }
 
 /// 还原子进程内与 payload 页无关的指针（setArgV0 slot / setcontext GOT / capset GOT）。
@@ -2652,11 +2738,19 @@ fn cleanup_pending_connections(mode: PendingConnectionCleanup) {
         drop(stream);
 
         // 3. 等待子进程 raise(SIGSTOP)，然后还原 patch 并恢复
-        if wait_until_stopped(pid).is_ok() {
-            let _ = revert_child_patch_by_ppid(pid, ppid);
-        }
+        let revert_result = if wait_until_stopped(pid).is_ok() {
+            revert_child_patch_by_ppid(pid, ppid)
+        } else {
+            log_verbose!("子进程 {} 未进入 SIGSTOP，页还原留待放行后补做", pid);
+            Ok(ChildPayloadRevert::PageUntouched)
+        };
         match mode {
-            PendingConnectionCleanup::Resume => unsafe { libc::kill(pid as i32, libc::SIGCONT) },
+            PendingConnectionCleanup::Resume => {
+                unsafe { libc::kill(pid as i32, libc::SIGCONT) };
+                // 放行之后 payload 的 replacement 立即返回，页内不再取指 → 补还原
+                retry_child_payload_revert_after_resume(pid, ppid, &revert_result);
+            }
+            // 子进程即将被 SIGKILL：残留页随进程消失，无需补还原
             PendingConnectionCleanup::KillAfterRevert => unsafe { libc::kill(pid as i32, libc::SIGKILL) },
         };
     }

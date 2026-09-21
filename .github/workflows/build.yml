@@ -92,6 +92,12 @@ jobs:
           cargo -V
           python3 --version
 
+      # 0) zymbiote payload：rust_frida 通过 include_bytes! 内嵌
+      #    zymbiote/build/zymbiote.elf。build.sh 用 NDK clang 现场重建，
+      #    避免「改了 zymbiote.c、仓库里的 ELF 还是旧的」这种静默失效。
+      - name: Build zymbiote payload
+        run: bash zymbiote/build.sh
+
       # 1) loader shellcode：rustfrida 通过 include_bytes! 内嵌，必须先构建。
       #    （rust_frida/build.rs 也会兜底重跑，这里显式跑一次便于早期报错）
       - name: Build loader shellcode
@@ -112,6 +118,8 @@ jobs:
           mkdir -p dist
           cp "${OUT}/rustfrida" dist/
           cp "${OUT}/libagent.so" dist/
+          # 内嵌的 zymbiote payload 也一并产出：便于把 CI 构建结果回写到仓库
+          cp zymbiote/build/zymbiote.elf dist/
           file dist/* || true
           ls -l dist
           sha256sum dist/* | tee dist/SHA256SUMS.txt
