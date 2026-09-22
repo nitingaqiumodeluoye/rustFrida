@@ -354,18 +354,25 @@ fn read_u64_at(buf: &[u8], off: usize) -> Option<u64> {
 }
 
 /// 在 payload 页内找 ZymbioteContext，并做"自证"校验。
-/// ctx 的定位不依赖事先知道 ctx 偏移：结构体首成员是 `char socket_path[64]`，
-/// 其第一个字节 = 路径长度（rustFrida 生成 32 个 hex 字符），
-/// 因此扫描"首字节像长度、随后是可打印 ASCII + NUL"的 8 对齐位置即可。
+///
+/// ctx 定位：结构体首成员是 `char socket_path[64]`。它的**静态初值**是
+/// `/rustfrida-zymbiote-<32 个 0>`；运行时 build_payload 会把真实 socket 名
+/// （generate_socket_name() 产出，**无前导斜杠**）覆写到字段开头，
+/// 所以残留页里可能是 `rustfrida-zymbiote-<hex>` 或 `/rustfrida-zymbiote-...`，
+/// 两种情况都要接受。
+/// （2026-09-22 实测：按"首字节=长度"或"必须以 / 开头"实现均探测不到 ctx，
+///  直接导致真残留被漏掉。）
 ///
 /// 自证项（均须成立，否则不返回，避免误改无关内存）：
-///   1. socket_path 为 8..=63 个可打印非空白字符 + NUL（rustFrida 随机名）；
+///   1. socket_path 命中固定前缀 `rustfrida-zymbiote-`、NUL 结尾、全可打印非空白；
 ///   2. payload_base == 本页起始（payload 就是写在这一页）；payload_size 合理；
 ///   3. original_protection 是 R|W|X 组合；
 ///   4. 结构体里的函数指针确实落在本进程对应模块的映射里：
 ///      original_setargv0 → libandroid_runtime.so，12 个 libc 函数 → libc.so，
 ///      original_setcontext → libselinux.so（或 0）。
 /// 能同时满足这些，就不可能是别的工具碰巧留下的页。
+const SOCKET_PATH_PREFIX: &[u8] = b"rustfrida-zymbiote-";
+
 fn probe_orphan_ctx(page: &[u8], page_start: u64, maps: &[MapEntry]) -> Option<OrphanCtx> {
     // 必须能读到最后一个被校验的字段（CTX_RAISE + 8）。不能要求整个 232 字节结构体
     // 都在页内：payload 可以一直排到页末，ctx 结构体尾部（prop_remap 之后）会越过页边界。
@@ -397,24 +404,44 @@ fn probe_orphan_ctx(page: &[u8], page_start: u64, maps: &[MapEntry]) -> Option<O
 
     let mut off = 0usize;
     while off <= max_off {
-        let len = page[off] as usize;
-        // 路径长度：rustFrida 生成 32 个 hex 字符；放宽到 8..=63
-        if !(8..=63).contains(&len) || off + 1 + len >= page.len() {
+        // socket_path 必须以固定前缀开头；静态初值带前导 '/'，运行时值不带
+        let after_slash = if page[off] == b'/' {
+            off + 1
+        } else {
+            off
+        };
+        if page.len() < after_slash + SOCKET_PATH_PREFIX.len()
+            || &page[after_slash..after_slash + SOCKET_PATH_PREFIX.len()] != SOCKET_PATH_PREFIX
+        {
             off += 8;
             continue;
         }
-        let name_bytes = &page[off + 1..off + 1 + len];
+        // 找到 NUL 结尾（最长 63 字节，socket_path[64]）
+        let name_len = match page[off..off + 64].iter().position(|b| *b == 0) {
+            Some(l) if l >= SOCKET_PATH_PREFIX.len() => l,
+            _ => {
+                off += 8;
+                continue;
+            }
+        };
+        let name_bytes = &page[off..off + name_len];
         let printable = name_bytes
             .iter()
             .all(|b| b.is_ascii_graphic() && !b.is_ascii_whitespace());
-        if !printable || page[off + 1 + len] != 0 {
+        if !printable {
             off += 8;
             continue;
         }
 
-        let payload_base = read_u64_at(page, off + CTX_PAYLOAD_BASE)?;
-        let payload_size = read_u64_at(page, off + CTX_PAYLOAD_SIZE)?;
-        let original_prot = read_u64_at(page, off + CTX_PAYLOAD_ORIGINAL_PROT)?;
+        let payload_base = match read_u64_at(page, off + CTX_PAYLOAD_BASE) {
+            Some(v) => v,
+            None => {
+                off += 8;
+                continue;
+            }
+        };
+        let payload_size = read_u64_at(page, off + CTX_PAYLOAD_SIZE).unwrap_or(0);
+        let original_prot = read_u64_at(page, off + CTX_PAYLOAD_ORIGINAL_PROT).unwrap_or(0);
 
         // 结构体自洽校验：payload_base 必须等于本页起点（payload 就写在这一页）
         if payload_base != page_start || payload_size == 0 || payload_size > 65536 {
@@ -428,8 +455,8 @@ fn probe_orphan_ctx(page: &[u8], page_start: u64, maps: &[MapEntry]) -> Option<O
         }
 
         // 函数指针归属校验：落在对应模块映射内
-        let original_setargv0 = read_u64_at(page, off + CTX_ORIGINAL_SET_ARGV0)?;
-        let original_setcontext = read_u64_at(page, off + CTX_ORIGINAL_SETCONTEXT)?;
+        let original_setargv0 = read_u64_at(page, off + CTX_ORIGINAL_SET_ARGV0).unwrap_or(0);
+        let original_setcontext = read_u64_at(page, off + CTX_ORIGINAL_SETCONTEXT).unwrap_or(0);
         if !in_module(original_setargv0, "libandroid_runtime.so") {
             off += 8;
             continue;
