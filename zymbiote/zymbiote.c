@@ -608,6 +608,14 @@ rustfrida_zymbiote_replacement_capset(struct cap_header *hdrp, struct cap_data *
     return (int)raw_syscall6(91 /*__NR_capset*/, (long)hdrp, (long)datap, 0, 0, 0, 0);
 }
 
+/* payload 页保护位统一入口（noinline，省体积且避免分支漏恢复）；payload 只能占一页 */
+__attribute__((noinline))
+static void
+rustfrida_payload_setprot(uint64_t prot)
+{
+    zymbiote.mprotect(zymbiote.payload_base, zymbiote.payload_size, (int)prot);
+}
+
 /* ========== setcontext 替换函数 ========== */
 __attribute__((section(".text.entrypoint")))
 __attribute__((visibility("default")))
@@ -622,19 +630,12 @@ rustfrida_zymbiote_replacement_setcontext(uid_t uid, bool is_system_server, cons
 
     if (zymbiote.package_name == NULL)
     {
-        zymbiote.mprotect(zymbiote.payload_base, zymbiote.payload_size,
-                          PROT_READ | PROT_WRITE | PROT_EXEC);
+        rustfrida_payload_setprot(PROT_READ | PROT_WRITE | PROT_EXEC);
         /* mount 已在 capset hook 中完成（cap drop 前） */
         zymbiote.package_name = zymbiote.strdup(name);
 
-        /* ★ 写完立刻锁回原始保护位：本函数退出后本页不再需要写权限
-         * （后续 setArgV0 若要写 `package_name = NULL`，会自己重新放开写权限）。
-         * 旧实现把本页留在 RWX 等 setArgV0 收尾再还原；若 setArgV0 没走到
-         * （passive 模式、该 fork 之后 rustFrida 已退出、app 提前退出），
-         * 该进程就永久留下 rwxp 页 —— 即检测器报的
-         * "Writable+executable mapping 0x...-0x... /system/lib64/libstagefright.so"。 */
-        zymbiote.mprotect(zymbiote.payload_base, zymbiote.payload_size,
-                          zymbiote.payload_original_protection);
+        /* ★ 写完立刻锁回：本页不再需要写权限；否则 setArgV0 未走到时永久留 rwxp */
+        rustfrida_payload_setprot(zymbiote.payload_original_protection);
     }
 
     /* 降级模式：setArgV0 slot 未找到时在这里阻塞。
@@ -654,14 +655,12 @@ rustfrida_zymbiote_replacement_setcontext(uid_t uid, bool is_system_server, cons
          * （实测 propmask 启用时 setArgV0 会进两次），下面 `package_name = NULL`
          * 就是写只读页 → SIGSEGV(MAPERR)。此处临时放开写权限，随后仍按原逻辑
          * 还原 payload_original_protection，自锁语义不变。 */
-        zymbiote.mprotect(zymbiote.payload_base, zymbiote.payload_size,
-                          PROT_READ | PROT_WRITE | PROT_EXEC);
+        rustfrida_payload_setprot(PROT_READ | PROT_WRITE | PROT_EXEC);
 
         /* 还原状态：释放 package_name、恢复页保护 */
         zymbiote.free(zymbiote.package_name);
         zymbiote.package_name = NULL;
-        zymbiote.mprotect(zymbiote.payload_base, zymbiote.payload_size,
-                          zymbiote.payload_original_protection);
+        rustfrida_payload_setprot(zymbiote.payload_original_protection);
 
         if (revert_now)
         {
@@ -688,10 +687,8 @@ rustfrida_zymbiote_replacement_setargv0(JNIEnv *env, jobject clazz, jstring name
     /* 诊断模式：只保留 setArgV0 指针改写，不做 socket/ACK/SIGSTOP/revert。 */
     if (zymbiote.passive_setargv0)
     {
-        /* ★ 诊断模式同样要锁回保护位（幂等）：setcontext 阶段可能已把本页写成 RWX，
-         * 旧实现直接 return 0 → 该进程永久留 rwxp 页。 */
-        zymbiote.mprotect(zymbiote.payload_base, zymbiote.payload_size,
-                          zymbiote.payload_original_protection);
+        /* ★ 诊断模式同样要锁回（幂等）：setcontext 可能已把本页写成 RWX */
+        rustfrida_payload_setprot(zymbiote.payload_original_protection);
         return 0;
     }
 
@@ -715,10 +712,8 @@ rustfrida_zymbiote_replacement_setargv0(JNIEnv *env, jobject clazz, jstring name
 
     if (zymbiote.package_name != NULL)
     {
-        /* 可重入修复：setcontext 收尾已把本页锁回 R|X（见其同名注释），
-         * 这里写 `package_name = NULL` 是页内 store，需临时放开写权限。 */
-        zymbiote.mprotect(zymbiote.payload_base, zymbiote.payload_size,
-                          PROT_READ | PROT_WRITE | PROT_EXEC);
+        /* 可重入：上一步已锁回 R|X，页内 store 前临时放开写权限 */
+        rustfrida_payload_setprot(PROT_READ | PROT_WRITE | PROT_EXEC);
         zymbiote.free(zymbiote.package_name);
         zymbiote.package_name = NULL;
     }
@@ -727,12 +722,8 @@ rustfrida_zymbiote_replacement_setargv0(JNIEnv *env, jobject clazz, jstring name
         (*env)->ReleaseStringUTFChars(env, name, name_utf8);
     }
 
-    /* ★ 兜底：无论走哪个分支，退出本函数前都把本页锁回原始保护位（幂等）。
-     * 旧实现是无条件 mprotect(RWX) 后只在 package_name != NULL 分支还原 →
-     * 走 else 的进程会永久留下 rwxp 页；propmask 场景 setArgV0 会进两次，
-     * 第二次必然走 else，于是每个 spawn 的子进程都会中招。 */
-    zymbiote.mprotect(zymbiote.payload_base, zymbiote.payload_size,
-                      zymbiote.payload_original_protection);
+    /* ★ 兜底：所有出口都锁回（幂等）；旧实现走 else 分支会永久留 rwxp */
+    rustfrida_payload_setprot(zymbiote.payload_original_protection);
 
     if (revert_now)
     {
