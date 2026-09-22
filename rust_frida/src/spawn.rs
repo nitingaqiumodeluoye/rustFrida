@@ -193,16 +193,52 @@ fn cleanup_orphan_spawn_connections() {
 //   4. `RF_NO_ORPHAN_CLEANUP=1` 关闭；`RF_ORPHAN_SCAN_ALL=1` 扩大到全设备扫描。
 
 /// 「自证」阈值：payload 页与编译期 ELF 模板的 16 位窗口命中率（百分比）。
-/// 运行期变化的只有 ctx 内的指针字段（约 200 字节），其余都是编译期常量。
-const ORPHAN_TEMPLATE_MATCH_PCT: usize = 60;
+/// 运行期变化的只有 ctx 内的指针字段（约 200 字节），其余都是编译期常量，
+/// 因此真实 payload 页实测能到 97%+；阈值取 85 既容得下 ctx 变化，
+/// 又不会被"碰巧有很多 00 对"的数据页蒙过（60% 阈值实测会误报 libstagefright
+/// 的 r--p/rw-p 数据页）。
+const ORPHAN_TEMPLATE_MATCH_PCT: usize = 85;
 
-/// 把编译期嵌入的 zymbiote ELF 放进一段匿名 RX 页，作为识别孤儿残留的字节模板。
-/// 只初始化一次（进程级，4KB），失败返回 None（此时跳过孤儿清理，不影响其他功能）。
+/// 把编译期嵌入的 zymbiote ELF 的**可执行 LOAD 段内容**放进一段匿名 RX 页，
+/// 作为识别孤儿残留的字节模板。
+///
+/// ★ 必须是段内容（offset=ph.p_offset），而不是文件开头：注入时 payload 就是
+/// 从 `text_seg.p_offset` 开始复制 `p_filesz` 字节（见 build_payload），
+/// 拿 ELF header 当模板会得到几乎不相关的字节序列，既漏报也误报。
+/// 只初始化一次（进程级，4KB）；解析失败返回 None（跳过孤儿清理，不影响其他功能）。
 fn payload_template() -> Option<&'static [u8]> {
     static TEMPLATE: OnceLock<usize> = OnceLock::new();
     const TPL_LEN: usize = 4096;
 
     let addr = *TEMPLATE.get_or_init(|| {
+        let elf = match goblin::elf::Elf::parse(ZYMBIOTE_ELF) {
+            Ok(e) => e,
+            Err(e) => {
+                log_warn!("孤儿清理: 解析内嵌 zymbiote ELF 失败({})，跳过孤儿扫描", e);
+                return 0;
+            }
+        };
+        let seg = match elf.program_headers.iter().find(|ph| {
+            ph.p_type == goblin::elf::program_header::PT_LOAD
+                && (ph.p_flags & goblin::elf::program_header::PF_X) != 0
+        }) {
+            Some(s) => s,
+            None => {
+                log_warn!("孤儿清理: 内嵌 zymbiote ELF 无可执行段，跳过孤儿扫描");
+                return 0;
+            }
+        };
+        let start = seg.p_offset as usize;
+        let end = match start.checked_add(seg.p_filesz as usize) {
+            Some(v) if v <= ZYMBIOTE_ELF.len() => v,
+            _ => {
+                log_warn!("孤儿清理: 内嵌 zymbiote ELF 可执行段越界，跳过孤儿扫描");
+                return 0;
+            }
+        };
+        let seg_bytes = &ZYMBIOTE_ELF[start..end];
+        let len = seg_bytes.len().min(TPL_LEN);
+
         let page = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -217,9 +253,9 @@ fn payload_template() -> Option<&'static [u8]> {
             log_warn!("孤儿清理: 分配 payload 模板页失败，跳过孤儿扫描");
             return 0;
         }
-        let len = ZYMBIOTE_ELF.len().min(TPL_LEN);
+        // 映射为匿名页时已零填充：段末之后的填充字节与真实 payload 页一致（均为 0）
         unsafe {
-            std::ptr::copy_nonoverlapping(ZYMBIOTE_ELF.as_ptr(), page as *mut u8, len);
+            std::ptr::copy_nonoverlapping(seg_bytes.as_ptr(), page as *mut u8, len);
             libc::mprotect(page, TPL_LEN, libc::PROT_READ | libc::PROT_EXEC);
         }
         page as usize
@@ -442,9 +478,9 @@ fn is_payload_scan_candidate(entry: &MapEntry) -> bool {
     if entry.path.ends_with("/libstagefright.so") {
         return true;
     }
-    if entry.is_executable() && entry.path.is_empty() {
-        return true;
-    }
+    // 注意：不再把"任意匿名可执行页"当候选。孤儿 payload 页始终是 libstagefright.so
+    // 的文件页（被匿名替换后 maps 仍显示该路径），而 ART JIT / 其他工具会产生大量
+    // 匿名 RX 页，拿它们做模板比对只是徒劳。memfd/anon_inode 形态是保险。
     entry.path.starts_with("/memfd:") || entry.path.starts_with("anon_inode")
 }
 
@@ -504,6 +540,7 @@ fn scan_process_for_payload_pages(
 /// 扫描孤儿 payload 残留（只读）。
 fn scan_orphan_payload_residue(template: &[u8], scan_all: bool) -> Vec<OrphanResidue> {
     let mut found = Vec::new();
+    let mut reported = 0usize;
 
     for pid in all_pids() {
         if pid == std::process::id() {
@@ -517,16 +554,19 @@ fn scan_orphan_payload_residue(template: &[u8], scan_all: bool) -> Vec<OrphanRes
 
         for (entry, page_start, ctx) in scan_process_for_payload_pages(pid, template) {
             let Some(ctx) = ctx else {
-                // 只命中模板字节、但没探测到 ctx：不能安全还原，只报告
-                log_warn!(
-                    "启动自检: pid {} ({}) 发现疑似 payload 页 0x{:x}-0x{:x} {} {}，但未探测到 ctx，仅报告",
-                    pid,
-                    if is_zygote { "zygote" } else { "非 zygote" },
-                    page_start,
-                    page_start + PAYLOAD_PAGE_LEN,
-                    entry.perms,
-                    if entry.path.is_empty() { "(anon)" } else { entry.path.as_str() },
-                );
+                // 只命中模板字节、但没探测到 ctx：不能安全还原，只报告（限条数，避免刷屏）
+                reported += 1;
+                if reported <= 3 {
+                    log_verbose!(
+                        "启动自检: pid {} ({}) 疑似 payload 页 0x{:x}-0x{:x} {} {}（未探测到 ctx，仅记录）",
+                        pid,
+                        if is_zygote { "zygote" } else { "非 zygote" },
+                        page_start,
+                        page_start + PAYLOAD_PAGE_LEN,
+                        entry.perms,
+                        if entry.path.is_empty() { "(anon)" } else { entry.path.as_str() },
+                    );
+                }
                 continue;
             };
 
