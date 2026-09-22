@@ -217,6 +217,14 @@ fn main() {
         std::process::exit(1);
     }
 
+    // ── 启动自检：清理上一次会话（SIGKILL / 崩溃）遗留的孤儿 zymbiote payload ──
+    // 必须在任何注入动作（--spawn / --pid / --server）之前做：
+    //   1) 残留的 setArgV0 hook 会让本次 spawn 的子进程在 libstagefright.so 里执行
+    //      到一半的旧 payload → 崩溃；
+    //   2) 页保护位还留在 rwxp 时，检测器会直接判 DANGER。
+    // 只处理"自证是 rustFrida payload"的映射；非 zygote 且正在运行的进程只报告不改。
+    spawn::cleanup_orphan_payload_residue();
+
     // ── Server daemon 模式 ──
     if args.server {
         server::run_server(&args);

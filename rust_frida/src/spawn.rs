@@ -168,6 +168,730 @@ fn cleanup_orphan_spawn_connections() {
     }
 }
 
+// ==================== 启动期孤儿 payload 残留清理 ====================
+//
+// 为什么需要：zymbiote payload 以「直接写 /proc/<zygote>/mem + 改 setArgV0 指针 +
+// 临时 rwxp」的方式注入。若 rustfrida 被 SIGKILL / 崩溃（cleanup 被旁路），或某个
+// fork 出的进程在握手前 rustfrida 就已退出，这些映射会留在系统里：
+//   * payload 页：/system/lib64/libstagefright.so 段尾页，内容为 payload、保护位
+//     rwxp、COW 脏页 —— 检测器报的 "Writable+executable mapping 0x..-0x..
+//     /system/lib64/libstagefright.so" / "shared-dirty executable pages" /
+//     "anonymous executable pages" 三项都来自它；
+//   * loader 匿名 r-x 映射（注入用的 bootstrapper/loader）；
+//   * zygote 里指向 payload 的 setArgV0 指针 —— 后续 fork 的子进程会在
+//     libstagefright.so 里执行到一半的 payload → 崩溃。
+// 这类进程无法自行清理（payload 正在"自己正在执行的页"里，写回字节或丢页都会立刻
+// 让取指到文件原文），只能由下一次 rustfrida 启动、趁目标进程可安全停止时清掉 ——
+// 即本模块（rfstart 调用）。
+//
+// 安全策略：
+//   1. 只处理「自证是 rustFrida payload」的映射（模板逐字节命中率 + ctx 结构校验），
+//      绝不按地址/模块名盲写；
+//   2. 默认只对 zygote 进程做「SIGSTOP → 改 → SIGCONT」；跑着的 app 进程只报告，
+//      因为对一个正在运行的进程改它正在执行的代码页会立刻 SIGSEGV；
+//   3. 页内仍有线程取指（安全门）时不做字节还原，只报告（依赖已存在的补还原路径）；
+//   4. `RF_NO_ORPHAN_CLEANUP=1` 关闭；`RF_ORPHAN_SCAN_ALL=1` 扩大到全设备扫描。
+
+/// 「自证」阈值：payload 页与编译期 ELF 模板的 16 位窗口命中率（百分比）。
+/// 运行期变化的只有 ctx 内的指针字段（约 200 字节），其余都是编译期常量。
+const ORPHAN_TEMPLATE_MATCH_PCT: usize = 60;
+
+/// 把编译期嵌入的 zymbiote ELF 放进一段匿名 RX 页，作为识别孤儿残留的字节模板。
+/// 只初始化一次（进程级，4KB），失败返回 None（此时跳过孤儿清理，不影响其他功能）。
+fn payload_template() -> Option<&'static [u8]> {
+    static TEMPLATE: OnceLock<usize> = OnceLock::new();
+    const TPL_LEN: usize = 4096;
+
+    let addr = *TEMPLATE.get_or_init(|| {
+        let page = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                TPL_LEN,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if page == libc::MAP_FAILED {
+            log_warn!("孤儿清理: 分配 payload 模板页失败，跳过孤儿扫描");
+            return 0;
+        }
+        let len = ZYMBIOTE_ELF.len().min(TPL_LEN);
+        unsafe {
+            std::ptr::copy_nonoverlapping(ZYMBIOTE_ELF.as_ptr(), page as *mut u8, len);
+            libc::mprotect(page, TPL_LEN, libc::PROT_READ | libc::PROT_EXEC);
+        }
+        page as usize
+    });
+
+    if addr == 0 {
+        return None;
+    }
+    Some(unsafe { std::slice::from_raw_parts(addr as *const u8, TPL_LEN) })
+}
+
+/// 一次扫描发现的孤儿残留。
+struct OrphanResidue {
+    pid: u32,
+    is_zygote: bool,
+    page_start: u64,
+    page_end: u64,
+    perms: String,
+    path: String,
+    /// 探测到的 ctx；None = 只匹配了 payload 字节，无法安全还原（仅报告）
+    ctx: Option<OrphanCtx>,
+}
+
+/// 从 payload 页里探测到的 ZymbioteContext。
+/// 结构体存在 + socket_path 是 rustFrida 生成的随机名 → 钉死"这是 rustFrida 的 payload"，
+/// 而不是某个恰好长得像的映射。
+struct OrphanCtx {
+    addr: u64,
+    socket_path: String,
+    payload_base: u64,
+    payload_size: u64,
+    original_prot: u64,
+}
+
+fn all_pids() -> Vec<u32> {
+    let mut pids = Vec::new();
+    if let Ok(entries) = std::fs::read_dir("/proc") {
+        for entry in entries.flatten() {
+            if let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() {
+                pids.push(pid);
+            }
+        }
+    }
+    pids.sort_unstable();
+    pids
+}
+
+fn process_cmdline(pid: u32) -> String {
+    std::fs::read(format!("/proc/{}/cmdline", pid))
+        .map(|raw| {
+            let mut out = String::new();
+            for part in raw.split(|c| *c == 0) {
+                if part.is_empty() {
+                    continue;
+                }
+                if !out.is_empty() {
+                    out.push(' ');
+                }
+                out.push_str(&String::from_utf8_lossy(part));
+            }
+            out
+        })
+        .unwrap_or_default()
+}
+
+fn is_zygote_cmdline(cmdline: &str) -> bool {
+    cmdline.contains("zygote")
+}
+
+/// payload 页与模板的 16 位窗口命中率（百分比）。
+fn template_match_pct(page: &[u8], template: &[u8]) -> usize {
+    let n = page.len().min(template.len());
+    if n < 2 {
+        return 0;
+    }
+    let mut hits = 0usize;
+    let mut windows = 0usize;
+    let mut i = 0usize;
+    while i + 2 <= n {
+        if page[i] == template[i] && page[i + 1] == template[i + 1] {
+            hits += 1;
+        }
+        windows += 1;
+        i += 2;
+    }
+    if windows == 0 {
+        0
+    } else {
+        hits * 100 / windows
+    }
+}
+
+fn read_u64_at(buf: &[u8], off: usize) -> Option<u64> {
+    buf.get(off..off + 8)
+        .map(|s| u64::from_ne_bytes(s.try_into().unwrap()))
+}
+
+/// 在 payload 页内找 ZymbioteContext，并做"自证"校验。
+/// ctx 的定位不依赖事先知道 ctx 偏移：结构体首成员是 `char socket_path[64]`，
+/// 其第一个字节 = 路径长度（rustFrida 生成 32 个 hex 字符），
+/// 因此扫描"首字节像长度、随后是可打印 ASCII + NUL"的 8 对齐位置即可。
+///
+/// 自证项（均须成立，否则不返回，避免误改无关内存）：
+///   1. socket_path 为 8..=63 个可打印非空白字符 + NUL（rustFrida 随机名）；
+///   2. payload_base == 本页起始（payload 就是写在这一页）；payload_size 合理；
+///   3. original_protection 是 R|W|X 组合；
+///   4. 结构体里的函数指针确实落在本进程对应模块的映射里：
+///      original_setargv0 → libandroid_runtime.so，12 个 libc 函数 → libc.so，
+///      original_setcontext → libselinux.so（或 0）。
+/// 能同时满足这些，就不可能是别的工具碰巧留下的页。
+fn probe_orphan_ctx(page: &[u8], page_start: u64, maps: &[MapEntry]) -> Option<OrphanCtx> {
+    // ctx 最小长度：232 字节（socket_path..passive_setargv0）
+    if page.len() < 240 {
+        return None;
+    }
+
+    let in_module = |addr: u64, suffix: &str| -> bool {
+        maps.iter()
+            .any(|e| e.path.ends_with(suffix) && e.start <= addr && addr < e.end)
+    };
+
+    // 必须校验的 libc 指针字段（偏移 -> 名字）
+    const LIBC_FIELDS: [usize; 12] = [
+        CTX_MPROTECT,
+        CTX_STRDUP,
+        CTX_FREE,
+        CTX_SOCKET,
+        CTX_CONNECT,
+        CTX_ERRNO,
+        CTX_GETPID,
+        CTX_GETPPID,
+        CTX_SENDMSG,
+        CTX_RECV,
+        CTX_CLOSE,
+        CTX_RAISE,
+    ];
+
+    let mut off = 0usize;
+    while off + 232 <= page.len() {
+        let len = page[off] as usize;
+        // 路径长度：rustFrida 生成 32 个 hex 字符；放宽到 8..=63
+        if !(8..=63).contains(&len) || off + 1 + len >= page.len() {
+            off += 8;
+            continue;
+        }
+        let name_bytes = &page[off + 1..off + 1 + len];
+        let printable = name_bytes
+            .iter()
+            .all(|b| b.is_ascii_graphic() && !b.is_ascii_whitespace());
+        if !printable || page[off + 1 + len] != 0 {
+            off += 8;
+            continue;
+        }
+
+        let payload_base = read_u64_at(page, off + CTX_PAYLOAD_BASE)?;
+        let payload_size = read_u64_at(page, off + CTX_PAYLOAD_SIZE)?;
+        let original_prot = read_u64_at(page, off + CTX_PAYLOAD_ORIGINAL_PROT)?;
+
+        // 结构体自洽校验：payload_base 必须等于本页起点（payload 就写在这一页）
+        if payload_base != page_start || payload_size == 0 || payload_size > 65536 {
+            off += 8;
+            continue;
+        }
+        // 保护位只可能是 R|W|X 的组合
+        if original_prot == 0 || (original_prot & !0x7) != 0 {
+            off += 8;
+            continue;
+        }
+
+        // 函数指针归属校验：落在对应模块映射内
+        let original_setargv0 = read_u64_at(page, off + CTX_ORIGINAL_SET_ARGV0)?;
+        let original_setcontext = read_u64_at(page, off + CTX_ORIGINAL_SETCONTEXT)?;
+        if !in_module(original_setargv0, "libandroid_runtime.so") {
+            off += 8;
+            continue;
+        }
+        if original_setcontext != 0 && !in_module(original_setcontext, "libselinux.so") {
+            off += 8;
+            continue;
+        }
+        let libc_hits = LIBC_FIELDS
+            .iter()
+            .filter(|f| {
+                read_u64_at(page, off + **f)
+                    .map(|v| in_module(v, "libc.so"))
+                    .unwrap_or(false)
+            })
+            .count();
+        if libc_hits < LIBC_FIELDS.len() {
+            off += 8;
+            continue;
+        }
+
+        return Some(OrphanCtx {
+            addr: page_start + off as u64,
+            socket_path: String::from_utf8_lossy(name_bytes).to_string(),
+            payload_base,
+            payload_size,
+            original_prot,
+        });
+    }
+
+    None
+}
+
+/// 判断一个 mapping 是否值得做 payload 模板比对。
+///
+/// 孤儿 payload 页在 /proc/<pid>/maps 里有两种表现形式：
+///   a) 保护位被留在 RWX（mprotect 会拆分 VMA）→ 单独一行
+///      `7f..-7f.. rwxp 001bd000 /system/lib64/libstagefright.so`；
+///   b) 保护位已还原成 R|X → 该页重新并回 libstagefright.so 的大 r-xp 映射，
+///      maps 上看不出异常，只能靠内容（smaps 才会显示 Anonymous/Shared_Dirty）。
+/// 因此候选 = 无路径/memfd/anon_inode 的可执行映射 + libstagefright.so。
+fn is_payload_scan_candidate(entry: &MapEntry) -> bool {
+    if !entry.is_readable() {
+        return false;
+    }
+    if entry.path.ends_with("/libstagefright.so") {
+        return true;
+    }
+    if entry.is_executable() && entry.path.is_empty() {
+        return true;
+    }
+    entry.path.starts_with("/memfd:") || entry.path.starts_with("anon_inode")
+}
+
+/// 扫描单个进程，返回命中的 payload 页（页对齐地址）及其所属 mapping 信息。
+fn scan_process_for_payload_pages(
+    pid: u32,
+    template: &[u8],
+) -> Vec<(MapEntry, u64, Option<OrphanCtx>)> {
+    const CHUNK: usize = 256 * 1024;
+    const MAX_SCAN: u64 = 64 * 1024 * 1024;
+
+    let mut hits = Vec::new();
+    let maps = match parse_proc_maps(pid) {
+        Ok(m) => m,
+        Err(_) => return hits,
+    };
+    let mem = match ProcMem::open(pid) {
+        Ok(m) => m,
+        Err(_) => return hits,
+    };
+
+    for entry in &maps {
+        if !is_payload_scan_candidate(entry) {
+            continue;
+        }
+        let size = entry.end.saturating_sub(entry.start).min(MAX_SCAN);
+        if size < 4096 {
+            continue;
+        }
+
+        let mut buf = vec![0u8; CHUNK];
+        let mut pos = 0u64;
+        while pos < size {
+            let want = buf.len().min((size - pos) as usize);
+            if mem.pread_exact(&mut buf[..want], entry.start + pos).is_err() {
+                break;
+            }
+            let chunk = &buf[..want];
+            // 以 4KB 页为粒度比对模板（16 位窗口命中率），命中后精确定位到页
+            let mut page_off = 0usize;
+            while page_off + 4096 <= chunk.len() {
+                let page = &chunk[page_off..page_off + 4096];
+                if template_match_pct(page, template) >= ORPHAN_TEMPLATE_MATCH_PCT {
+                    let page_start = (entry.start + pos + page_off as u64) & !0xfffu64;
+                    let ctx = probe_orphan_ctx(page, page_start, &maps);
+                    hits.push((entry.clone(), page_start, ctx));
+                }
+                page_off += 4096;
+            }
+            pos += want as u64;
+        }
+    }
+
+    hits
+}
+
+/// 扫描孤儿 payload 残留（只读）。
+fn scan_orphan_payload_residue(template: &[u8], scan_all: bool) -> Vec<OrphanResidue> {
+    let mut found = Vec::new();
+
+    for pid in all_pids() {
+        if pid == std::process::id() {
+            continue;
+        }
+        let cmdline = process_cmdline(pid);
+        let is_zygote = is_zygote_cmdline(&cmdline);
+        if !scan_all && !is_zygote {
+            continue;
+        }
+
+        for (entry, page_start, ctx) in scan_process_for_payload_pages(pid, template) {
+            let Some(ctx) = ctx else {
+                // 只命中模板字节、但没探测到 ctx：不能安全还原，只报告
+                log_warn!(
+                    "启动自检: pid {} ({}) 发现疑似 payload 页 0x{:x}-0x{:x} {} {}，但未探测到 ctx，仅报告",
+                    pid,
+                    if is_zygote { "zygote" } else { "非 zygote" },
+                    page_start,
+                    page_start + PAYLOAD_PAGE_LEN,
+                    entry.perms,
+                    if entry.path.is_empty() { "(anon)" } else { entry.path.as_str() },
+                );
+                continue;
+            };
+
+            log_warn!(
+                "启动自检: pid {} ({}) 发现孤儿 payload 页: 0x{:x}-0x{:x} {} {} ctx@0x{:x} socket={} payload_size={}",
+                pid,
+                if is_zygote { "zygote" } else { "非 zygote" },
+                page_start,
+                page_start + PAYLOAD_PAGE_LEN,
+                entry.perms,
+                if entry.path.is_empty() { "(anon)" } else { entry.path.as_str() },
+                ctx.addr,
+                ctx.socket_path,
+                ctx.payload_size,
+            );
+
+            found.push(OrphanResidue {
+                pid,
+                is_zygote,
+                page_start,
+                page_end: page_start + PAYLOAD_PAGE_LEN,
+                perms: entry.perms.clone(),
+                path: entry.path.clone(),
+                ctx: Some(ctx),
+            });
+        }
+    }
+
+    found
+}
+
+/// 页大小（孤儿清理内部使用）。
+const PAYLOAD_PAGE_LEN: u64 = 4096;
+
+/// 找到包含指定地址的 maps 条目。
+fn find_mapped_entry(maps: &[MapEntry], addr: u64) -> Option<&MapEntry> {
+    maps.iter().find(|e| e.start <= addr && addr < e.end)
+}
+
+/// payload 页与模板的 16 位窗口命中率（百分比）。
+fn template_match_pct(page: &[u8], template: &[u8]) -> usize {
+    let n = page.len().min(template.len());
+    if n < 2 {
+        return 0;
+    }
+    let mut hits = 0usize;
+    let mut windows = 0usize;
+    let mut i = 0usize;
+    while i + 2 <= n {
+        if page[i] == template[i] && page[i + 1] == template[i + 1] {
+            hits += 1;
+        }
+        windows += 1;
+        i += 2;
+    }
+    if windows == 0 {
+        0
+    } else {
+        hits * 100 / windows
+    }
+}
+
+/// 在进程内查找值为 `needle` 的 8 字节对齐 slot（限定 boot heap / ART / libandroid_runtime）。
+fn find_pointer_slots(pid: u32, needle: u64, limit: usize) -> Vec<u64> {
+    let maps = match parse_proc_maps(pid) {
+        Ok(m) => m,
+        Err(_) => return Vec::new(),
+    };
+    let mem = match ProcMem::open(pid) {
+        Ok(m) => m,
+        Err(_) => return Vec::new(),
+    };
+    let needle_bytes = needle.to_ne_bytes();
+    let mut hits = Vec::new();
+
+    for entry in maps.iter().filter(|e| {
+        e.is_readable()
+            && (is_boot_heap(e)
+                || e.path.contains("dalvik")
+                || e.path.contains("/art")
+                || e.path.ends_with("libandroid_runtime.so"))
+    }) {
+        let size = entry.end.saturating_sub(entry.start);
+        let mut pos = 0u64;
+        let mut buf = vec![0u8; 256 * 1024];
+        while pos < size {
+            let want = buf.len().min((size - pos) as usize);
+            if mem.pread_exact(&mut buf[..want], entry.start + pos).is_err() {
+                break;
+            }
+            let chunk = &buf[..want];
+            let mut i = 0usize;
+            while i + 8 <= chunk.len() {
+                if chunk[i..i + 8] == needle_bytes {
+                    hits.push(entry.start + pos + i as u64);
+                    if hits.len() >= limit {
+                        return hits;
+                    }
+                }
+                i += 8;
+            }
+            pos += want as u64;
+        }
+    }
+
+    hits
+}
+
+/// payload 内替换函数（setArgV0/setcontext/capset）在目标进程里的地址。
+fn payload_replacement_addrs(payload_base: u64) -> Option<(u64, u64, u64)> {
+    let elf = goblin::elf::Elf::parse(ZYMBIOTE_ELF).ok()?;
+    let seg = elf.program_headers.iter().find(|ph| {
+        ph.p_type == goblin::elf::program_header::PT_LOAD
+            && (ph.p_flags & goblin::elf::program_header::PF_X) != 0
+    })?;
+    let seg_vm_address = seg.p_vaddr;
+    let find = |name: &str| -> Option<u64> {
+        elf.dynsyms
+            .iter()
+            .find(|sym| elf.dynstrtab.get_at(sym.st_name) == Some(name))
+            .map(|sym| payload_base + (sym.st_value - seg_vm_address))
+    };
+    Some((
+        find("rustfrida_zymbiote_replacement_setargv0")?,
+        find("rustfrida_zymbiote_replacement_setcontext")?,
+        find("rustfrida_zymbiote_replacement_capset")?,
+    ))
+}
+
+/// 在 `pid` 里把 payload 残留清干净（调用方负责确保进程可安全停止）。
+/// 返回处理说明（已还原的项）。
+fn fix_orphan_payload_in_process(pid: u32, residue: &OrphanResidue) -> Result<String, String> {
+    let ctx = residue
+        .ctx
+        .as_ref()
+        .ok_or_else(|| "未探测到 ctx（无法安全定位 payload 范围），仅报告".to_string())?;
+
+    let maps = parse_proc_maps(pid)?;
+    let mem = ProcMem::open(pid)?;
+    let page_safe = match any_thread_pc_in_range(pid, residue.page_start, residue.page_end) {
+        Ok(v) => !v,
+        Err(_) => false,
+    };
+
+    let mut actions: Vec<String> = Vec::new();
+
+    if page_safe {
+        // 1) 页字节还原：从 mapping 的 backing 文件读原文
+        //    （payload 页就是文件页的匿名替换；cx payload_base 就落在本页内）
+        let page_len = (residue.page_end - residue.page_start) as usize;
+        let ctx_off = ctx.payload_base.saturating_sub(residue.page_start);
+        let want_len = (ctx.payload_size as usize).min(page_len - ctx_off as usize);
+        match backing_path_for_range(&maps, residue.page_start, residue.page_end - residue.page_start) {
+            Some((path, mapping_start)) => {
+                // backing 文件偏移 = maps 条目的 offset + (页起点 - 映射起点)
+                let (map_offset, map_start) = find_mapped_entry(&maps, residue.page_start)
+                    .map(|e| (e.offset, e.start))
+                    .unwrap_or((0, mapping_start));
+                let file_offset = map_offset + residue.page_start - map_start;
+                match read_backing_file_data(&path, file_offset, want_len) {
+                    Ok(backup) => {
+                        mem.pwrite_all(&backup, ctx.payload_base)?;
+                        actions.push(format!(
+                            "还原 payload 页字节 {}B (backing {} +0x{:x})",
+                            backup.len(),
+                            path,
+                            file_offset
+                        ));
+                    }
+                    Err(e) => actions.push(format!("跳过页字节还原(读 backing 失败: {})", e)),
+                }
+            }
+            None => actions.push("跳过页字节还原(本页无 backing 文件)".to_string()),
+        }
+
+        // 2) 丢 COW 脏页（检测器的 "shared-dirty / anonymous executable" 就看它）
+        if let Err(e) = madvise_dontneed(pid as i32, residue.page_start as usize, page_len) {
+            actions.push(format!("丢 COW 页失败: {}", e));
+        } else {
+            actions.push(format!("丢弃 COW 页 0x{:x}+0x{:x}", residue.page_start, page_len));
+        }
+    } else {
+        actions.push("页内仍有线程取指，跳过字节还原/丢页".to_string());
+    }
+
+    // 3) 还原 zygote 里指向 payload 的 setArgV0 指针
+    //    （残留 hook 会让后续 fork 的子进程在 libstagefright.so 里执行到一半的 payload）
+    if let Some((replacement_setargv0, replacement_setcontext, _)) =
+        payload_replacement_addrs(ctx.payload_base)
+    {
+        let mut restored = 0usize;
+        for (needle, name) in [
+            (replacement_setargv0, "setArgV0"),
+            (replacement_setcontext, "setcontext(GOT)"),
+        ] {
+            for slot in find_pointer_slots(pid, needle, 16) {
+                let current = match read_u64_at_proc(&mem, slot) {
+                    Some(v) => v,
+                    None => continue,
+                };
+                if current != needle {
+                    continue;
+                }
+                // 原始值：setArgV0 用 ctx 里记录的原函数地址；setcontext 用 libselinux 导出
+                let original = if name == "setArgV0" {
+                    let v = read_u64_at_proc(&mem, ctx.addr + CTX_ORIGINAL_SET_ARGV0 as u64);
+                    match v {
+                        Some(v) if v != 0 && v != needle => v,
+                        _ => continue,
+                    }
+                } else {
+                    match find_export_in_maps(&maps, "libselinux.so", "selinux_android_setcontext") {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    }
+                };
+                if mem.pwrite_all(&original.to_ne_bytes(), slot).is_ok() {
+                    restored += 1;
+                    log_verbose!("孤儿清理: 还原 {} slot 0x{:x} -> 0x{:x}", name, slot, original);
+                }
+            }
+        }
+        if restored > 0 {
+            actions.push(format!("还原 {} 个 hook 指针", restored));
+        }
+    }
+
+    Ok(actions.join(", "))
+}
+
+fn read_u64_at_proc(mem: &ProcMem, addr: u64) -> Option<u64> {
+    let mut buf = [0u8; 8];
+    mem.pread_exact(&mut buf, addr).ok()?;
+    Some(u64::from_ne_bytes(buf))
+}
+
+/// 启动自检：清理上一次会话被强杀/崩溃留下的孤儿 zymbiote payload 残留。
+/// 由 main.rs 在任何注入动作之前调用（幂等；无残留时只做一次只读扫描）。
+pub(crate) fn cleanup_orphan_payload_residue() {
+    let Some(template) = payload_template() else {
+        return;
+    };
+
+    let scan_all = diag_env_flag("RF_ORPHAN_SCAN_ALL");
+    if diag_env_flag("RF_NO_ORPHAN_CLEANUP") {
+        log_verbose!("启动自检: RF_NO_ORPHAN_CLEANUP=1，跳过孤儿 payload 残留清理");
+        return;
+    }
+    log_step!(
+        "启动自检: 扫描孤儿 zymbiote payload 残留{}...",
+        if scan_all { "（全设备）" } else { "（仅 zygote）" }
+    );
+
+    let residues = scan_orphan_payload_residue(template, scan_all);
+    if residues.is_empty() {
+        log_success!("启动自检: 未发现孤儿 payload 残留");
+        return;
+    }
+
+    let mut fixed = 0usize;
+    let mut skipped = 0usize;
+
+    for residue in &residues {
+        let pid = residue.pid;
+
+        // 非 zygote 进程：正在运行时不能改它正在执行的代码页（会立刻 SIGSEGV），
+        // 只有在它恰好处于 stopped 状态时才安全。
+        let stopped = crate::process::is_process_stopped(pid);
+        if !residue.is_zygote && !stopped {
+            log_error!(
+                "启动自检: pid {} 存在孤儿 payload 但进程正在运行（非 zygote），只报告不修改: 0x{:x}-0x{:x} {}",
+                pid,
+                residue.page_start,
+                residue.page_end,
+                residue.perms
+            );
+            skipped += 1;
+            continue;
+        }
+
+        // zygote：短暂 SIGSTOP → 改 → SIGCONT（与 cleanup 同一套安全门）
+        let need_resume = if residue.is_zygote {
+            let ret = unsafe { libc::kill(pid as i32, libc::SIGSTOP) };
+            if ret == 0 {
+                let _ = wait_until_stopped(pid);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        let result = fix_orphan_payload_in_process(pid, residue);
+
+        if need_resume {
+            unsafe { libc::kill(pid as i32, libc::SIGCONT) };
+        }
+
+        match result {
+            Ok(detail) => {
+                log_success!(
+                    "启动自检: 已清理 pid {} 的孤儿 payload (0x{:x}-0x{:x}): {}",
+                    pid,
+                    residue.page_start,
+                    residue.page_end,
+                    detail
+                );
+                fixed += 1;
+            }
+            Err(e) => {
+                log_warn!("启动自检: pid {} 孤儿 payload 未清理: {}", pid, e);
+                skipped += 1;
+            }
+        }
+    }
+
+    log_info!("启动自检完成: 已清理 {} 处，跳过/仅报告 {} 处", fixed, skipped);
+
+    // 修复后再核对一次：仍有 w+x payload 页就明确报出来（等价于 rfstop 的断言，
+    // 但发生在注入之前，能避免"带着残留去 spawn"）
+    let _ = verify_no_wx_payload_pages(&residues);
+}
+
+/// 修复后核对：残留页是否仍有可写可执行的。
+fn verify_no_wx_payload_pages(residues: &[OrphanResidue]) -> Result<(), String> {
+    let mut left = Vec::new();
+    for residue in residues {
+        if !std::path::Path::new(&format!("/proc/{}", residue.pid)).exists() {
+            continue;
+        }
+        let maps = match parse_proc_maps(residue.pid) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if let Some(entry) = find_mapped_entry(&maps, residue.page_start) {
+            if entry.is_writable() && entry.is_executable() {
+                left.push(format!(
+                    "pid {} 0x{:x}-0x{:x} {}",
+                    residue.pid, entry.start, entry.end, entry.perms
+                ));
+            }
+        }
+    }
+    if left.is_empty() {
+        log_success!("启动自检: 已无 w+x payload 页");
+        Ok(())
+    } else {
+        log_error!("启动自检: 仍有 w+x payload 页残留: {}", left.join("; "));
+        Err(left.join("; "))
+    }
+}
+
+/// 在 `pid` 的 `maps` 里找第一个地址落在 [addr, addr+len) 内的 mapping 路径。
+/// 用途：孤儿 payload 页的 `mprotect` 会把 VMA 拆成单页；若保护位已被 payload
+/// 自己还原成 R|X，该页会重新并回 libstagefright.so 的大 r-xp 映射——两种形态
+/// 都要能定位到 backing 文件。
+fn backing_path_for_range(maps: &[MapEntry], addr: u64, len: u64) -> Option<(String, u64)> {
+    let end = addr.checked_add(len)?;
+    for entry in maps {
+        if entry.start <= addr && entry.end >= end && !entry.path.is_empty() {
+            return Some((entry.path.clone(), entry.start));
+        }
+    }
+    None
+}
+
 // ZymbioteContext 字段偏移常量（与 zymbiote.c 布局完全一致）
 const CTX_SOCKET_PATH: usize = 0;
 const CTX_PAYLOAD_BASE: usize = 64;
