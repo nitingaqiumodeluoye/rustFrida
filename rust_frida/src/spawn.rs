@@ -331,10 +331,12 @@ fn read_u64_at(buf: &[u8], off: usize) -> Option<u64> {
 ///      original_setcontext → libselinux.so（或 0）。
 /// 能同时满足这些，就不可能是别的工具碰巧留下的页。
 fn probe_orphan_ctx(page: &[u8], page_start: u64, maps: &[MapEntry]) -> Option<OrphanCtx> {
-    // ctx 最小长度：232 字节（socket_path..passive_setargv0）
-    if page.len() < 240 {
+    // 必须能读到最后一个被校验的字段（CTX_RAISE + 8）。不能要求整个 232 字节结构体
+    // 都在页内：payload 可以一直排到页末，ctx 结构体尾部（prop_remap 之后）会越过页边界。
+    if page.len() < CTX_RAISE + 8 {
         return None;
     }
+    let max_off = page.len() - (CTX_RAISE + 8);
 
     let in_module = |addr: u64, suffix: &str| -> bool {
         maps.iter()
@@ -358,7 +360,7 @@ fn probe_orphan_ctx(page: &[u8], page_start: u64, maps: &[MapEntry]) -> Option<O
     ];
 
     let mut off = 0usize;
-    while off + 232 <= page.len() {
+    while off <= max_off {
         let len = page[off] as usize;
         // 路径长度：rustFrida 生成 32 个 hex 字符；放宽到 8..=63
         if !(8..=63).contains(&len) || off + 1 + len >= page.len() {
