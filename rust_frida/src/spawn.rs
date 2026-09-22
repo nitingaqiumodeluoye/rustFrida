@@ -564,29 +564,6 @@ fn find_mapped_entry(maps: &[MapEntry], addr: u64) -> Option<&MapEntry> {
     maps.iter().find(|e| e.start <= addr && addr < e.end)
 }
 
-/// payload 页与模板的 16 位窗口命中率（百分比）。
-fn template_match_pct(page: &[u8], template: &[u8]) -> usize {
-    let n = page.len().min(template.len());
-    if n < 2 {
-        return 0;
-    }
-    let mut hits = 0usize;
-    let mut windows = 0usize;
-    let mut i = 0usize;
-    while i + 2 <= n {
-        if page[i] == template[i] && page[i + 1] == template[i + 1] {
-            hits += 1;
-        }
-        windows += 1;
-        i += 2;
-    }
-    if windows == 0 {
-        0
-    } else {
-        hits * 100 / windows
-    }
-}
-
 /// 在进程内查找值为 `needle` 的 8 字节对齐 slot（限定 boot heap / ART / libandroid_runtime）。
 fn find_pointer_slots(pid: u32, needle: u64, limit: usize) -> Vec<u64> {
     let maps = match parse_proc_maps(pid) {
