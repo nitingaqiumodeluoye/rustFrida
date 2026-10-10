@@ -109,8 +109,17 @@ jobs:
 
       # 3) 主程序：内嵌 bootstrapper.bin + rustfrida-loader.bin + libagent.so
       #    启用 watch-so feature：内嵌 ldmonitor eBPF SO 加载监听能力（--watch-so）
+      #    watch-so 会通过 aya-build 现场编译 ldmonitor-ebpf（bpfel-unknown-none 目标），
+      #    需要：nightly 工具链 + rust-src 组件 + bpf-linker 链接器。
+      #    整个 rustfrida 构建用 +nightly 跑，保证 build script 内部子 cargo 也是 nightly（-Z build-std 需要）。
+      - name: Install eBPF toolchain (for watch-so)
+        run: |
+          set -euxo pipefail
+          rustup toolchain install nightly --profile minimal --component rust-src
+          cargo +nightly install bpf-linker
+
       - name: Build rustfrida
-        run: cargo build -p rust_frida --release --locked --features watch-so --target aarch64-linux-android
+        run: cargo +nightly build -p rust_frida --release --locked --features watch-so --target aarch64-linux-android
 
       - name: Collect artifacts
         run: |
