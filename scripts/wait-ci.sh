@@ -103,12 +103,24 @@ while :; do
                 if [ -n "$DOWNLOAD" ]; then
                     echo
                     echo "下载产物 → $DOWNLOAD"
-                    rm -rf "$DOWNLOAD"
-                    if gh run download "$RUN_ID" --repo "$REPO" -D "$DOWNLOAD"; then
+                    rm -rf "$DOWNLOAD" "$DOWNLOAD.tmp"
+                    if gh run download "$RUN_ID" --repo "$REPO" -D "$DOWNLOAD.tmp"; then
+                        # gh run download 会按 artifact 名再套一层目录（如
+                        # rustfrida-aarch64-<sha>/ ），展平一层，
+                        # 统一为 $DOWNLOAD/rustfrida，方便后续引用。
+                        mkdir -p "$DOWNLOAD"
+                        find "$DOWNLOAD.tmp" -type f -exec mv -f {} "$DOWNLOAD/" \;
+                        rm -rf "$DOWNLOAD.tmp"
                         echo
-                        find "$DOWNLOAD" -type f -exec ls -l {} \;
-                        [ -f "$DOWNLOAD/SHA256SUMS.txt" ] && { echo; cat "$DOWNLOAD/SHA256SUMS.txt"; }
+                        find "$DOWNLOAD" -maxdepth 1 -type f -exec ls -l {} \;
+                        if [ -f "$DOWNLOAD/SHA256SUMS.txt" ]; then
+                            echo
+                            cat "$DOWNLOAD/SHA256SUMS.txt"
+                        fi
+                        echo
+                        echo "部署: adb push $DOWNLOAD/rustfrida /data/local/tmp/rustfrida"
                     else
+                        rm -rf "$DOWNLOAD.tmp"
                         echo "❌ 产物下载失败" >&2
                         exit 1
                     fi
