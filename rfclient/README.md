@@ -5,12 +5,21 @@ TCP 控制服务器，像本地 REPL 一样注入、执行脚本、调用 RPC。
 
 ## 构建
 
-> 仓库 `.cargo/config.toml` 默认 target 是 `aarch64-linux-android`，
-> 构建 rfclient 时需显式指定主机 target。
+> `rfclient` 是主机端二进制，已随 CI 流水线一起构建，直接取产物即可：
+> `out/ci-<run-id>/rfclient`。构建方法见 [`../doc/build.md`](../doc/build.md)。
 
 ```bash
-# 主机三元组示例（按本机 rustup 已安装的 target 选择）
-cargo build -p rfclient --release --target x86_64-unknown-linux-gnu
+REPO=nitingaqiumodeluoye/rustFrida
+gh run watch <run-id> --repo "$REPO" --exit-status
+gh run download <run-id> --repo "$REPO" -D out/ci-<run-id>
+chmod +x out/ci-<run-id>/rfclient
+```
+
+仅在需要本地复现 CI 失败时才手动编（仓库 `.cargo/config.toml` 默认 target 是
+`aarch64-linux-android`，必须显式指定宿主三元组）：
+
+```bash
+cargo build -p rfclient --release --locked --target x86_64-unknown-linux-gnu
 # 产物: target/x86_64-unknown-linux-gnu/release/rfclient
 ```
 
@@ -18,7 +27,7 @@ cargo build -p rfclient --release --target x86_64-unknown-linux-gnu
 
 ```bash
 # 1. 设备端启动 daemon（含 TCP 控制服务器）
-adb push target/aarch64-linux-android/release/rustfrida /data/local/tmp/
+adb push out/ci-<run-id>/rustfrida /data/local/tmp/
 adb shell su -c "chmod 755 /data/local/tmp/rustfrida"
 adb shell su -c "nohup /data/local/tmp/rustfrida >/data/local/tmp/rustfrida.log 2>&1 </dev/null &"
 

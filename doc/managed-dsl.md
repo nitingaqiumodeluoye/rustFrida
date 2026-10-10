@@ -432,12 +432,15 @@ direct hits before calling the result stable.
 
 ## Device Validation
 
-Build and push:
+构建与推送统一走 CI（`doc/build.md`）：
 
 ```bash
-cargo build --release -p agent
-cargo build --release -p rust_frida
-adb -s <device> push target/aarch64-linux-android/release/rustfrida /data/local/tmp/rustfrida
+REPO=nitingaqiumodeluoye/rustFrida
+git push origin master
+gh run watch <run-id> --repo "$REPO" --exit-status
+gh run download <run-id> --repo "$REPO" -D out/ci-<run-id>
+
+adb -s <device> push out/ci-<run-id>/rustfrida /data/local/tmp/rustfrida
 adb -s <device> shell "su -c 'sh -c \"chmod 755 /data/local/tmp/rustfrida\"'"
 ```
 

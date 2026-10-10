@@ -4,8 +4,11 @@ ARM64 Android 动态插桩框架。
 
 ## 环境要求
 
-- Android NDK 25+（默认路径 `~/Android/Sdk/ndk/`）
-- Rust toolchain + `aarch64-linux-android` target
+本节只针对**本地诊断构建**；标准流程不需要本地环境，见下一节。
+
+- Android NDK `r29`，装在 `/opt/android-ndk-r29`（路径钉在 `.cargo/config.toml`）
+- Rust `nightly` + `rust-src` + `aarch64-linux-android` target
+- LLVM 23（`bpf-linker` 需要）
 - Python 3（构建 loader shellcode）
 - `.cargo/config.toml` 已配置交叉编译（仓库自带）
 
@@ -17,63 +20,41 @@ git submodule update --init --recursive
 
 `quickjs-hook/third_party/tinycc` 是 RF 的 CModule 编译器子仓库，默认跟随 `https://github.com/kkkbbb/tinycc.git` 的 `rf/cmodule-runtime` 分支。
 
-## 构建
+## 构建：统一走 CI
 
-最终产物 `rustfrida` 通过 `include_bytes!` 内嵌了 loader shellcode 和 agent SO，有严格的**构建顺序**：
-
-```
-loader shellcode  ──┐
-                    ├──→  rustfrida (主程序)
-agent (libagent.so) ┘
-```
-
-### 1. 构建 loader shellcode（bootstrapper + rustfrida-loader）
+**不要本地编译。** 标准流程是把改动 push 上去，由 GitHub Actions 出包：
 
 ```bash
-python3 build_helpers.py
-# 输出:
-#   loader/build/bootstrapper.bin
-#   loader/build/rustfrida-loader.bin
+REPO=nitingaqiumodeluoye/rustFrida
+git push origin master                      # 自动触发
+gh run watch <run-id> --repo "$REPO" --exit-status
+gh run download <run-id> --repo "$REPO" -D out/ci-<run-id>
 ```
 
-loader 是 bare-metal ARM64 shellcode，被 `rustfrida` 通过 `include_bytes!` 嵌入。**修改 loader C 代码后需重新运行此步。**
+产物：`rustfrida`（自包含单文件）、`libagent.so`、`zymbiote.elf`、`rfclient`、`SHA256SUMS.txt`。
 
-### 2. 构建 agent（libagent.so）
+理由、完整步骤与故障排查见 **[doc/build.md](doc/build.md)**。
+
+因为 `rustfrida` 通过 `include_bytes!` 内嵌了 loader shellcode 和 agent SO，构建有严格的**顺序**要求——这个顺序由 CI 流水线保证，不需要手工拼：
+
+```
+zymbiote payload ──┐
+loader shellcode ──┼──→  rustfrida (主程序)
+agent (libagent.so)┘
+```
+
+### 可选组件
+
+QBDI Trace 支持（先构建 qbdi-helper SO，再用 `--features qbdi` 编译 agent 和 rustfrida）与 ldmonitor 独立二进制不在流水线里，需要时单独加进 CI：
 
 ```bash
-cargo build -p agent --release
-# 输出: target/aarch64-linux-android/release/libagent.so
+cargo build -p qbdi-helper --release                  # → libqbdi_helper.so
+cargo build -p agent --release --features qbdi
+cargo build -p rust_frida --release --features qbdi   # rustfrida 内嵌 qbdi-helper SO
+cargo build -p ldmonitor --release
 ```
 
-agent 是注入到目标进程的动态库，包含 hook 引擎、QuickJS、Java hook 等。**必须先于 rustfrida 构建**，因为 rustfrida 通过 `include_bytes!` 嵌入 agent SO。
-
-### 3. 构建 rustfrida（主程序）
-
-```bash
-cargo build -p rust_frida --release
-# 输出: target/aarch64-linux-android/release/rustfrida
-```
-
-rustfrida 内嵌了 `bootstrapper.bin` + `rustfrida-loader.bin` + `libagent.so`，是一个自包含的单文件。
-
-### 可选组件（单独构建）
-
-这些不在 default-members 里，按需构建：
-
-**QBDI Trace 支持：** 需要先构建 qbdi-helper SO，再用 `--features qbdi` 编译 agent 和 rustfrida：
-
-```bash
-cargo build -p qbdi-helper --release           # → libqbdi_helper.so
-cargo build -p agent --release --features qbdi  # agent 启用 qbdi feature
-cargo build -p rust_frida --release --features qbdi  # rustfrida 嵌入 qbdi-helper SO
-```
-
-**eBPF SO 加载监控（`--watch-so`）：** 默认纯 attach/spawn 构建不包含该能力；如需启用，请显式打开 `watch-so` feature。独立使用 ldmonitor 命令行工具时：
-
-```bash
-cargo build -p ldmonitor --release    # → ldmonitor 独立二进制
-cargo build -p rust_frida --release --features watch-so
-```
+`--watch-so`（eBPF SO 加载监控）已在 CI 默认启用。
 
 ### TinyCC 子仓库维护
 
@@ -102,8 +83,11 @@ git commit -m "Update tinycc submodule"
 
 ## 部署 & 运行
 
+从 CI 产物推上去（`out/ci-<run-id>/` 是 `gh run download` 的落地目录）：
+
 ```bash
-adb push target/aarch64-linux-android/release/rustfrida /data/local/tmp/
+adb push out/ci-<run-id>/rustfrida /data/local/tmp/rustfrida
+adb shell 'su -c "chmod 755 /data/local/tmp/rustfrida"'
 
 # PID 注入
 ./rustfrida --pid <pid>
@@ -132,8 +116,8 @@ adb push target/aarch64-linux-android/release/rustfrida /data/local/tmp/
 # 设备端：启动 server + TCP 控制服务器（0.0.0.0:27042）
 ./rustfrida --server --listen 0.0.0.0:27042
 
-# 主机端构建 rfclient（见 rfclient/README.md）
-cargo build -p rfclient --release --target x86_64-unknown-linux-gnu
+# 主机端 rfclient：直接取 CI 产物（已随流水线一起构建）
+#   out/ci-<run-id>/rfclient
 
 # 端口转发（设备直连网段可省略）
 adb forward tcp:27042 tcp:27042

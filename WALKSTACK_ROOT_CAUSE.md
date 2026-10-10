@@ -158,11 +158,15 @@ LDR 即可), 但 POC 先不做。
 
 ## 5. 编译/部署
 
+构建统一走 CI（`doc/build.md`）：
+
 ```bash
-cd /home/wwb/RustroverProjects/rustFrida/.claude/worktrees/agent-a78f9f0b
-cargo build -p agent --release
-cargo build -p rust_frida --release
-adb -s 10.0.0.44:5556 push target/aarch64-linux-android/release/rustfrida /data/local/tmp/
+REPO=nitingaqiumodeluoye/rustFrida
+git push origin master
+gh run watch <run-id> --repo "$REPO" --exit-status
+gh run download <run-id> --repo "$REPO" -D out/ci-<run-id>
+
+adb -s 10.0.0.44:5556 push out/ci-<run-id>/rustfrida /data/local/tmp/
 # 在 Pixel 6 (API 36) 上:
 ./rustfrida --name com.example -l test_hashmap_put_hook.js
 # 触发 HashMap.put 大量调用 + Throwable.fillInStackTrace

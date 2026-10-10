@@ -173,15 +173,26 @@ jobs:
       - name: Build rustfrida
         run: cargo +nightly build -p rust_frida --release --locked --features watch-so --target aarch64-linux-android
 
+      # rfclient 是跑在主机上的 TCP 控制客户端，不是 Android 二进制。仓库的
+      # .cargo/config.toml 把默认 target 钉成了 aarch64-linux-android，所以这里
+      # 必须显式指定宿主三元组，否则会被编成 arm64 而无法在主机执行。
+      - name: Build rfclient (host client)
+        run: |
+          set -euxo pipefail
+          rustup target add x86_64-unknown-linux-gnu
+          cargo build -p rfclient --release --locked --target x86_64-unknown-linux-gnu
+
       - name: Collect artifacts
         run: |
           set -euxo pipefail
           OUT=target/aarch64-linux-android/release
+          HOST_OUT=target/x86_64-unknown-linux-gnu/release
           mkdir -p dist
           cp "${OUT}/rustfrida" dist/
           cp "${OUT}/libagent.so" dist/
           # 内嵌的 zymbiote payload 也一并产出：便于把 CI 构建结果回写到仓库
           cp zymbiote/build/zymbiote.elf dist/
+          cp "${HOST_OUT}/rfclient" dist/
           file dist/* || true
           ls -l dist
           sha256sum dist/* | tee dist/SHA256SUMS.txt
