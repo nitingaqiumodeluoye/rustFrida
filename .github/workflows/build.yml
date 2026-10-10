@@ -15,6 +15,8 @@ concurrency:
 env:
   NDK_VERSION: r29
   NDK_DIR: /opt/android-ndk-r29
+  # eBPF 工具链缓存版本：llvm-23 / bpf-linker 升级或缓存失效时手动 bump
+  EBPF_CACHE_VERSION: v1
   CARGO_TERM_COLOR: always
 
 jobs:
@@ -110,27 +112,63 @@ jobs:
       # 3) 主程序：内嵌 bootstrapper.bin + rustfrida-loader.bin + libagent.so
       #    启用 watch-so feature：内嵌 ldmonitor eBPF SO 加载监听能力（--watch-so）
       #    watch-so 会通过 aya-build 现场编译 ldmonitor-ebpf（bpfel-unknown-none 目标），
-      #    需要：nightly 工具链 + rust-src 组件 + bpf-linker 链接器 + LLVM-23 开发库。
+      #    需要：nightly 工具链 + rust-src 组件 + bpf-linker 链接器 + LLVM-23 开发库
+      #    （三者均已在上面带缓存的 Install eBPF toolchain 步骤中就绪）。
       #    整个 rustfrida 构建用 +nightly 跑，保证 build script 内部子 cargo 也是 nightly（-Z build-std 需要）。
-      #    bpf-linker 自己的 build.rs 认 LLVM_PREFIX（定位 LLVM lib 目录并输出 link-search），
-      #    llvm-sys（LLVM-23，bpf-linker 以 no-llvm-linking 使用）认 LLVM_SYS_231_PREFIX；
-      #    同时把 llvm-23 bin 加进 PATH，两个变量都设上双保险。
+      # ---- eBPF 工具链缓存（llvm-23 deb + nightly 工具链 + bpf-linker）----
+      # 缓存内容：
+      #   /tmp/llvm-23-debs                    llvm-23-dev 及其依赖的 deb 包（离线安装）
+      #   ~/.rustup/toolchains/nightly-*       nightly + rust-src + android target
+      #   ~/.cargo/bin/bpf-linker              bpf-linker 二进制（编译最耗时，命中可省 ~3 分钟）
+      # EBPF_CACHE_VERSION 变化或首次运行时回源重建并写入缓存。
+      - name: Restore eBPF toolchain cache
+        id: ebpf-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            /tmp/llvm-23-debs
+            ~/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu
+            ~/.cargo/bin/bpf-linker
+          key: ebpf-toolchain-${{ env.EBPF_CACHE_VERSION }}
+
       - name: Install eBPF toolchain (for watch-so)
         run: |
           set -euxo pipefail
-          # bpf-linker 0.11 默认动态链接 LLVM-23，需要系统级 llvm-23-dev（含 libLLVM.so）
-          CODENAME="$(. /etc/os-release && echo "$VERSION_CODENAME")"
-          curl -fLsS https://apt.llvm.org/llvm-snapshot.gpg.key | sudo gpg --dearmor --yes -o /usr/share/keyrings/llvm.gpg
-          echo "deb [signed-by=/usr/share/keyrings/llvm.gpg] http://apt.llvm.org/${CODENAME}/ llvm-toolchain-${CODENAME}-23 main" | sudo tee /etc/apt/sources.list.d/llvm.list
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends llvm-23-dev
+
+          # 1) llvm-23-dev：优先用缓存的 deb 离线安装，否则在线下载并回写缓存
+          mkdir -p /tmp/llvm-23-debs
+          if ! ls /tmp/llvm-23-debs/*.deb >/dev/null 2>&1; then
+            CODENAME="$(. /etc/os-release && echo "$VERSION_CODENAME")"
+            curl -fLsS https://apt.llvm.org/llvm-snapshot.gpg.key | sudo gpg --dearmor --yes -o /usr/share/keyrings/llvm.gpg
+            echo "deb [signed-by=/usr/share/keyrings/llvm.gpg] http://apt.llvm.org/${CODENAME}/ llvm-toolchain-${CODENAME}-23 main" | sudo tee /etc/apt/sources.list.d/llvm.list
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends --download-only llvm-23-dev
+            cp /var/cache/apt/archives/*.deb /tmp/llvm-23-debs/
+          fi
+          if ! test -x /usr/lib/llvm-23/bin/llvm-config; then
+            sudo dpkg -i /tmp/llvm-23-debs/*.deb || sudo apt-get install -y -f --no-install-recommends
+          fi
+          # 运行时库路径注册（每次都要做，cache 不包含系统配置）
           echo "/usr/lib/llvm-23/lib" | sudo tee /etc/ld.so.conf.d/llvm-23.conf
           sudo ldconfig
-          rustup toolchain install nightly --profile minimal --component rust-src
+
+          # 2) nightly + rust-src + android target（缓存命中时跳过）
+          if ! rustup toolchain list | grep -q '^nightly-'; then
+            rustup toolchain install nightly --profile minimal --component rust-src
+          fi
           # aya-build 的子 cargo 用 nightly 编 bpfel-unknown-none，但也需要 android target
-          rustup target add aarch64-linux-android --toolchain nightly
-          LLVM_PREFIX=/usr/lib/llvm-23 LLVM_SYS_231_PREFIX=/usr/lib/llvm-23 \
-            cargo +nightly install bpf-linker
+          if ! rustup target list --toolchain nightly | grep -q '^aarch64-linux-android (installed)'; then
+            rustup target add aarch64-linux-android --toolchain nightly
+          fi
+
+          # 3) bpf-linker（编译最耗时，缓存命中时跳过；锁版本保证与缓存一致）
+          if ! test -x ~/.cargo/bin/bpf-linker; then
+            # bpf-linker 的 build.rs 认 LLVM_PREFIX（定位 LLVM lib 目录并输出 link-search），
+            # llvm-sys（LLVM-23，bpf-linker 以 no-llvm-linking 使用）认 LLVM_SYS_231_PREFIX
+            LLVM_PREFIX=/usr/lib/llvm-23 LLVM_SYS_231_PREFIX=/usr/lib/llvm-23 \
+              cargo +nightly install bpf-linker --version 0.11.1
+          fi
+          bpf-linker --version
 
       - name: Build rustfrida
         run: cargo +nightly build -p rust_frida --release --locked --features watch-so --target aarch64-linux-android
