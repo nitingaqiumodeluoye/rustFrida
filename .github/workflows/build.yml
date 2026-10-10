@@ -112,8 +112,9 @@ jobs:
       #    watch-so 会通过 aya-build 现场编译 ldmonitor-ebpf（bpfel-unknown-none 目标），
       #    需要：nightly 工具链 + rust-src 组件 + bpf-linker 链接器 + LLVM-23 开发库。
       #    整个 rustfrida 构建用 +nightly 跑，保证 build script 内部子 cargo 也是 nightly（-Z build-std 需要）。
-      #    llvm-sys（LLVM-23）不认 LLVM_CONFIG_PATH，必须用 LLVM_SYS_231_PREFIX 指定前缀，
-      #    否则链接时找不到 -lLLVM。同时注册运行时库搜索路径。
+      #    bpf-linker 自己的 build.rs 认 LLVM_PREFIX（定位 LLVM lib 目录并输出 link-search），
+      #    llvm-sys（LLVM-23，bpf-linker 以 no-llvm-linking 使用）认 LLVM_SYS_231_PREFIX；
+      #    同时把 llvm-23 bin 加进 PATH，两个变量都设上双保险。
       - name: Install eBPF toolchain (for watch-so)
         run: |
           set -euxo pipefail
@@ -126,7 +127,8 @@ jobs:
           echo "/usr/lib/llvm-23/lib" | sudo tee /etc/ld.so.conf.d/llvm-23.conf
           sudo ldconfig
           rustup toolchain install nightly --profile minimal --component rust-src
-          LLVM_SYS_231_PREFIX=/usr/lib/llvm-23 cargo +nightly install bpf-linker
+          LLVM_PREFIX=/usr/lib/llvm-23 LLVM_SYS_231_PREFIX=/usr/lib/llvm-23 \
+            cargo +nightly install bpf-linker
 
       - name: Build rustfrida
         run: cargo +nightly build -p rust_frida --release --locked --features watch-so --target aarch64-linux-android
