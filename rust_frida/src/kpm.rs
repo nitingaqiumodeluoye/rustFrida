@@ -1,5 +1,6 @@
 #![cfg(all(target_os = "android", target_arch = "aarch64"))]
 
+use crate::{log_verbose, log_warn};
 use std::ffi::CString;
 use std::sync::OnceLock;
 
