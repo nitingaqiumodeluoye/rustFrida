@@ -127,6 +127,8 @@ jobs:
           echo "/usr/lib/llvm-23/lib" | sudo tee /etc/ld.so.conf.d/llvm-23.conf
           sudo ldconfig
           rustup toolchain install nightly --profile minimal --component rust-src
+          # aya-build 的子 cargo 用 nightly 编 bpfel-unknown-none，但也需要 android target
+          rustup target add aarch64-linux-android --toolchain nightly
           LLVM_PREFIX=/usr/lib/llvm-23 LLVM_SYS_231_PREFIX=/usr/lib/llvm-23 \
             cargo +nightly install bpf-linker
 
