@@ -48,19 +48,38 @@ gh workflow run build.yml --repo nitingaqiumodeluoye/rustFrida
 
 ## 取产物
 
-事件驱动等待，不要盲等固定时长：
+仓库自带 `scripts/wait-ci.sh`，把「等 run → 判断结果 → 取产物」三步合成一条。
+
+```bash
+# 等当前 HEAD 的 run，完成后把产物展平到 out/ci-<sha>/
+SHA=$(git rev-parse --short=7 HEAD)
+bash scripts/wait-ci.sh --sha "$SHA" --download "out/ci-$SHA"
+
+# 只看最新一条 run（不限 sha）
+bash scripts/wait-ci.sh
+```
+
+行为：
+
+- 每次轮询都打印状态，**不会静默空转**（状态无变化时降频到约 90s 一次）
+- 硬超时，默认 1800s，`--timeout` / `TIMEOUT` 可改
+- 失败时直接列出失败步骤与 `error[...]` / `##[error]` 行，并给出完整日志命令
+- `--download` 自动展平 `gh run download` 多套的那层 artifact 目录，
+  统一为 `<dir>/rustfrida`，同时打印 `SHA256SUMS.txt` 与 push 命令
+
+退出码：`0` = success；`1` = 失败/超时。
+
+手动等价命令（不想用脚本时）：
 
 ```bash
 REPO=nitingaqiumodeluoye/rustFrida
 
-# 1) 找到这次 push 对应的 run
 gh run list --repo "$REPO" --limit 5
 
-# 2) 阻塞等待，进程一结束立即返回（拿准确退出码）
+# 阻塞等待，进程一结束立即返回（拿准确退出码）
 gh run watch <run-id> --repo "$REPO" --exit-status --interval 20
 echo "退出码: $?"
 
-# 3) 下载
 gh run download <run-id> --repo "$REPO" -D out/ci-<run-id>
 ```
 
@@ -73,6 +92,26 @@ gh run view <run-id> --repo "$REPO" --log \
   | sed 's/\x1b\[[0-9;]*m//g' \
   | grep -iE "error|warning: unused|failed"
 ```
+
+## push 前自检
+
+CI 一轮要 1.5~3 分钟，而单模块 `cargo check` 几秒就能出结果。仓库自带
+`scripts/check-module.sh`，改动某个模块后先本地过一遍：
+
+```bash
+bash scripts/check-module.sh rust_frida/src/kpm.rs
+# OK：无 error（仅 warning）
+```
+
+它用 `main.rs` + 平行模块的桩 crate 复刻真实模块布局（`logger.rs` 原样拷贝），
+因为 `logger.rs` 的日志宏是 `#[macro_export]` 的，被测模块必须自己
+`use crate::{log_warn, log_verbose};` 才能用 —— 这类作用域问题必须用真实布局才能暴露。
+
+之所以要桩而不是直接 `cargo check -p rust_frida`：`build.rs` 与 `injection.rs`
+通过 `include_bytes!` 引用 `libagent.so` 和 loader shellcode，本地缺这些产物就编不过，
+而最该检查的源码反而检查不了。
+
+> 只查编译，不查行为。最终还是以 CI 为准。
 
 ## 部署
 
