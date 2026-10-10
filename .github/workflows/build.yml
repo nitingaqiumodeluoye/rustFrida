@@ -108,8 +108,9 @@ jobs:
         run: cargo build -p agent --release --locked --target aarch64-linux-android
 
       # 3) 主程序：内嵌 bootstrapper.bin + rustfrida-loader.bin + libagent.so
+      #    启用 watch-so feature：内嵌 ldmonitor eBPF SO 加载监听能力（--watch-so）
       - name: Build rustfrida
-        run: cargo build -p rust_frida --release --locked --target aarch64-linux-android
+        run: cargo build -p rust_frida --release --locked --features watch-so --target aarch64-linux-android
 
       - name: Collect artifacts
         run: |
