@@ -1627,7 +1627,7 @@ pub(crate) fn release_owned_java_hooks(hooks: Vec<JavaHookData>) -> usize {
     let env_opt = if crate::is_raw_clone_js_thread() {
         None
     } else {
-        get_thread_env().ok()
+        unsafe { get_thread_env().ok() }
     };
     for data in &hooks {
         unsafe {
