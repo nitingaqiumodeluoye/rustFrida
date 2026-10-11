@@ -21,6 +21,22 @@ VC++ 可再发行组件包**，拷到任意 Windows x64 上直接跑。
 cargo build -p rfclient-gui --release --target x86_64-pc-windows-msvc
 ```
 
+## 使用前提
+
+GUI 只接受 `host:port`，**不会自己调 adb**。连真机前先在主机上建好端口转发
+（一次即可，转发在 adb server 存活期间一直有效）：
+
+```bash
+adb devices                       # 确认设备在线
+adb forward tcp:15819 tcp:15819
+```
+
+然后在界面里填 `127.0.0.1:15819`，服务端用了 `--token` 就把令牌也填上，
+再点左侧进程/会话表里的「注入」「接入」，或直接 spawn 一个包。
+
+> ADB 自动发现设备与自动转发（CLI 的 `-U` 那套）还没接进 GUI，core 里已经有
+> `adb::select_adb_device` / `AdbForward` 可以直接用，属于下一版的事。
+
 ## 界面
 
 ```
