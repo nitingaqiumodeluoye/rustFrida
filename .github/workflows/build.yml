@@ -128,6 +128,16 @@ jobs:
       - name: Build loader shellcode
         run: python3 loader/build_helpers.py
 
+      # loader 的 .bin 是过 objcopy --only-section=.payload 摘出来的，而
+      # helper.lds 的 .payload 只收 .text/.rodata/.data。一个不带初值的
+      # static 会落进 NOBITS（.bss）—— 不在 .bin 里、也不在 loader 被写入的
+      # 那段分配中，代码引用它却毫无提示。曾经真实踩过一次：agent_vma_name
+      # 从栈数组改成 static 时若写成裸数组，prctl(PR_SET_VMA_ANON_NAME)
+      # 拿到的就是空串，段不会被命名，maps 里反而多出一条无名匿名可执行段。
+      # 这个检查不依赖 NDK 之外的任何东西，秒级完成，失败时直接打出段表。
+      - name: Check loader shellcode layout
+        run: python3 .github/check-loader-layout.py
+
       # 2) agent：rustfrida 通过 include_bytes! 内嵌 libagent.so，必须先于主程序。
       - name: Build agent (libagent.so)
         run: cargo build -p agent --release --locked --target aarch64-linux-android

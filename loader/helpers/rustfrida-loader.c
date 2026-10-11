@@ -1299,7 +1299,23 @@ rustfrida_link_agent (int fd, const FridaLibcApi * libc, RustFridaLinkedModule *
   ElfW(Rela) * jmprel = NULL;
   size_t pltrelsz = 0;
   ElfW(Dyn) * dyn;
-  char agent_vma_name[80];
+  /* 名字缓冲区必须比 prctl 调用活得久。
+   *
+   * 5.10 一类的内核在 vma_set_name() 里【保存用户态指针】而不是拷贝字符串
+   * （Vector 的 memory_manager.cpp 注释、以及本机实测的 `[anon:<乱码>]` 都印证了
+   * 这点：内核在打印 maps 时才去解引用）。放在栈上会在 rustfrida_link_agent()
+   * 返回之后被后续调用覆盖，于是可执行段的 maps 行渲染成脏字节 —— 那比不命名更显眼。
+   *
+   * 用带初值的 static 而不是裸数组，是为了把缓冲区钉进 .data：helper.lds 的
+   * .payload 输出段只收 .text/.rodata/.data，objcopy --only-section=.payload 也只
+   * 导出这几段；全零初值会落进 .bss（NOBITS），既不在 .bin 里、也不在 loader 被
+   * 写入的那段分配中，运行时读到的就是未初始化内存。
+   *
+   * 初值 "wwb_so" 与宿主 injection.rs 里 memfd_create 的名字一致，
+   * 所以即使下面的 readlink 失败，留下的也是一个正确可用的名字。
+   * 它不是唯一的常驻来源：.data 落在 .payload 末尾，随 .bin 一起下发，
+   * 并在 loader 被写入 alloc_base 时整块驻留到进程结束。 */
+  static char agent_vma_name[80] = { 'w', 'w', 'b', '_', 's', 'o' };
 
   frida_memset (module, 0, sizeof (*module));
   rustfrida_get_fd_vma_name (fd, agent_vma_name, sizeof (agent_vma_name), libc);
@@ -1403,11 +1419,49 @@ rustfrida_link_agent (int fd, const FridaLibcApi * libc, RustFridaLinkedModule *
     }
 
     {
-      void * mapped = frida_raw_mmap ((void *) target, map_size, prot,
-          MAP_PRIVATE | MAP_FIXED, fd, file_page_start);
-      if (mapped == MAP_FAILED)
+      /* 匿名副本，不做 fd-backed 映射。
+       *
+       * 与 Vector soLoader 的 module image 同构（external/soLoader/src/memory_manager.cpp
+       * 的 `!fd_backed` 分支）：段内容从上面已读入的 file_map 拷进预留的匿名区间。
+       *
+       * 为什么必须匿名：fd-backed 段是 file-backed VMA，有两个后果都不是我们想要的 ——
+       *   1. 内核 vma_set_name() 见 vma->vm_file != NULL 直接拒绕 ANON_NAME，于是上面
+       *      rustfrida_set_vma_name() 给整段映像起的 "wwb_so" 名字落不到这些段上；
+       *   2. /proc/<pid>/map_files/<start>-<end> 会为每个 file-backed 段留下条目，
+       *      readlink 直接给出 "/memfd:wwb_so (deleted)"。
+       * karinahide 一类 KPM 的 maps 净化只擦 maps、不擦 map_files（它的 readlinkat
+       * 过滤依赖 usercopy 通道，在 CONFIG_LTO_CLANG_FULL 内核上会静默失效），于是
+       * 「maps 里没有 / map_files 里有」这个不一致本身就成了指纹：Hunter 的
+       * "missing page, suspicious execution procedure" 报的正是这些 4096 对齐的
+       * 段首/中/末页地址。匿名化后两侧同时消失，没有可比的缺口。 */
+      if (frida_syscall_3 (__NR_mprotect, target, map_size, PROT_READ | PROT_WRITE) != 0)
       {
-        rustfrida_set_error (module, libc, "map agent segment failed");
+        rustfrida_set_error (module, libc, "unprotect agent segment for copy failed");
+        goto fail;
+      }
+
+      frida_memset ((void *) target, 0, map_size);
+
+      if (phdr->p_filesz != 0)
+      {
+        /* 与 bionic linker_phdr.cpp::ElfReader::LoadSegments 一致：从
+         * page_start(p_offset) 而不是 p_offset 起拷，这样非零页偏移的段会连同
+         * 共享同一页的前缀一起带过来。copy_len 受上面 "padded segment" 检查
+         * 与 map_size 双重约束，源端不会超出 file_map。 */
+        ElfW(Addr) file_page_end =
+            rustfrida_align_up (phdr->p_offset + phdr->p_filesz, page_size);
+        size_t copy_len = (size_t) (file_page_end - file_page_start);
+
+        if (copy_len > map_size)
+          copy_len = map_size;
+        if (copy_len != 0)
+          frida_memcpy ((void *) target,
+              (const uint8_t *) file_map + file_page_start, copy_len);
+      }
+
+      if (frida_syscall_3 (__NR_mprotect, target, map_size, prot) != 0)
+      {
+        rustfrida_set_error (module, libc, "reprotect agent segment failed");
         goto fail;
       }
     }
