@@ -27,7 +27,7 @@ pub(crate) fn resolve_owner_script(target_id: u64) -> u64 {
     if owner != 0 {
         return owner;
     }
-    crate::jsapi::java::callback::registry::owner_script_of(target_id)
+    crate::jsapi::java::callback::owner_script_of(target_id)
 }
 use functions::{
     js_attach_native, js_call_native, js_diag_alloc_near, js_hook, js_hook_native, js_interceptor_attach,

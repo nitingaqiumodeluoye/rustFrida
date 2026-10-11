@@ -586,7 +586,7 @@ pub fn script_list() -> Vec<(u64, String, usize, usize, usize)> {
         .into_iter()
         .map(|record| {
             let native = jsapi::hook_api::registry::count_hooks_owned_by(record.id);
-            let java = jsapi::java::callback::registry::count_java_hooks_owned_by(record.id);
+            let java = jsapi::java::callback::count_java_hooks_owned_by(record.id);
             (record.id, record.name, native, java, record.source_len)
         })
         .collect()
@@ -625,21 +625,7 @@ pub fn script_drop(id: u64) -> Result<(usize, usize), String> {
     }
 
     // java hooks：移除 native trampoline + 释放资源
-    let java_hooks = jsapi::java::callback::registry::take_java_hooks_owned_by(id);
-    let java_count = java_hooks.len();
-    if !java_hooks.is_empty() {
-        let env_opt = if is_raw_clone_js_thread() {
-            None
-        } else {
-            jsapi::java::get_thread_env().ok()
-        };
-        for data in &java_hooks {
-            unsafe {
-                jsapi::java::remove_native_trampoline(data);
-                jsapi::java::free_java_hook_resources(data, env_opt);
-            }
-        }
-    }
+    let java_count = jsapi::java::release_owned_java_hooks(jsapi::java::callback::take_java_hooks_owned_by(id));
 
     script_registry::forget_script(id);
     drop(engine_guard);

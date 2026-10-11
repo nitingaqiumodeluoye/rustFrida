@@ -1037,6 +1037,7 @@ pub(crate) unsafe extern "C" fn js_interceptor_attach(
                 recomp_addr,
                 native_attach_data: 0,
                 mutation,
+                owner_script: crate::script_registry::current_script(),
             },
         );
     });

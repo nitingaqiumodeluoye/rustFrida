@@ -64,7 +64,7 @@ impl HookType {
 }
 
 #[derive(Clone)]
-pub(super) struct JavaHookData {
+pub(crate) struct JavaHookData {
     pub(super) art_method: u64,
     // Frida-style original method state（unhook 时恢复全部字段）
     pub(super) original_access_flags: u32,

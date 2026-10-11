@@ -1616,6 +1616,28 @@ pub(super) unsafe fn remove_native_entry_hook(data: &JavaHookData) {
     }
 }
 
+/// 按脚本卸载：释放一批 Java hook 的资源（native trampoline + JS 回调 + clone 堆内存）。
+///
+/// 供 `crate::script_drop` 调用 —— 那些底层函数只有 `jsapi::java` 内可见，
+/// 这里做一个 crate 级入口，同时统一拿一次 JNIEnv。
+pub(crate) fn release_owned_java_hooks(hooks: Vec<JavaHookData>) -> usize {
+    if hooks.is_empty() {
+        return 0;
+    }
+    let env_opt = if crate::is_raw_clone_js_thread() {
+        None
+    } else {
+        get_thread_env().ok()
+    };
+    for data in &hooks {
+        unsafe {
+            remove_native_trampoline(data);
+            free_java_hook_resources(data, env_opt);
+        }
+    }
+    hooks.len()
+}
+
 /// 移除 native trampoline (hook_remove_redirect)。
 pub(super) unsafe fn remove_native_trampoline(data: &JavaHookData) {
     if matches!(data.hook_type, callback::HookType::NativeEntry) {
