@@ -38,6 +38,46 @@ cargo build -p rfclient --release --locked --target x86_64-pc-windows-msvc
 # 产物: target/x86_64-pc-windows-msvc/release/rfclient.exe
 ```
 
+## 代码结构
+
+```
+rfclient-core/   协议与会话库（零依赖：只有 std）
+  proto.rs       帧常量、请求/响应编码、bootstrap 脚本帧
+  session.rs     Session：reqid 匹配、心跳、断连检测、事件广播
+  event.rs       Event / Disconnect：类型化的事件（不含任何打印逻辑）
+  channel.rs     端口转发（open_channel 的收发与本地 listener）
+  bootstrap.rs   引导握手（OK 行解析、令牌注入、proto 提示）
+  adb.rs         adb forward / 设备选择 / am start
+  script.rs      jseval 包装、JS 字符串字面量、哪些命令有应答
+rfclient/        CLI（clap + rustyline），只做参数解析、连接建立、终端呈现
+```
+
+拆分的目的：让 GUI（或任何其它前端）复用协议与状态机而不必引入行编辑器。
+core 里**不放** `clap`、`rustyline`，也**不调用** `std::process::exit` ——
+断连通过 `Event::Disconnected` 上报，是否退出进程由前端决定。
+
+CLI 内部有两条独立通路：
+
+- **应答**：`session.send(cmd, kind)` 返回 `Pending`，按 reqid 精确匹配那一条回复；
+- **事件**：`session.events()`（`Session::connect` 一并返回）广播日志/事件/转发/断连。
+
+因为 `rustyline::readline` 是阻塞的，CLI 必须单开一个打印线程排空事件，否则日志要
+等用户敲下一行才显示。GUI 端没有这个限制（事件循环本身就能轮询），直接用
+`Pending::try_take()` 即可。
+
+## 回归测试
+
+`scripts/rfclient-mock-server.py` 是一个假设备端，实现了 CLI 用到的四条协议路径。
+CI 的 `rfclient-regression` job 用它跑真实二进制并断言输出，用于保证重构前后行为一致：
+
+```bash
+python3 scripts/rfclient-mock-server.py 18802 session &
+printf 'jseval 1+1\nexit\n' | ./target/x86_64-pc-windows-gnu/release/rfclient.exe -H 127.0.0.1:18802
+```
+
+覆盖：`list` 多行查询、v2 tagged 应答按 reqid 回位、legacy(v1) 帧收发、
+无主 reqid 的 `[stale]` 丢弃、`forward` 系命令的纯本地处理。
+
 ## 使用
 
 ```bash

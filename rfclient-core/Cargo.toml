@@ -1,0 +1,9 @@
+[package]
+name = "rfclient-core"
+version = "0.1.0"
+edition = "2021"
+description = "rustFrida 主机端客户端核心库：协议帧、会话、端口转发（供 CLI 与 GUI 共用）"
+
+[dependencies]
+# 只保留协议/网络所需的最小依赖：本 crate 不碰终端（rustyline）也不碰 clap，
+# 这样 GUI 依赖它时不会被迫拖进一个行编辑器。

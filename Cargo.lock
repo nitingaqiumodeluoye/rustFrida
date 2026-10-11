@@ -1834,8 +1834,13 @@ name = "rfclient"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "rfclient-core",
  "rustyline",
 ]
+
+[[package]]
+name = "rfclient-core"
+version = "0.1.0"
 
 [[package]]
 name = "ring"

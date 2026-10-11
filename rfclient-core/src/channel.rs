@@ -1,13 +1,13 @@
 //! 本地端口转发（open_channel 的客户端侧）。
 //!
-//! `forward 8080 127.0.0.1:8080` 在本机监听 127.0.0.1:8080，每来一个连接就向
+//! `forward(8080, "127.0.0.1:8080")` 在本机监听 127.0.0.1:8080，每来一个连接就向
 //! **目标进程**发一个 `CHANNEL_OPEN`，由 agent 在目标进程的网络命名空间里 connect
 //! 到给定地址并双向中继字节。于是无需 `adb forward` 就能访问 app 自己的本地服务
 //! （例如 app 内嵌的 HTTP 调试端口）。
 //!
 //! 数据流：
 //! ```text
-//! 本机应用 → 127.0.0.1:8080 → rfclient ──CHANNEL_DATA──▶ agent → 目标 app 端口
+//! 本机应用 → 127.0.0.1:8080 → 本客户端 ──CHANNEL_DATA──▶ agent → 目标 app 端口
 //! ```
 //!
 //! 关键顺序约束：**必须等 `CHANNEL_OPENED(status=0)` 才能开始读本地 socket**。
@@ -18,9 +18,11 @@ use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+use crate::event::Event;
 use crate::proto::*;
 
 const LOCAL_BIND_ADDR: &str = "127.0.0.1";
@@ -32,7 +34,7 @@ struct LocalConn {
     /// OPENED 之后才开始读本地 socket（见模块头注释）。
     started: AtomicBool,
     closed: AtomicBool,
-    /// 这条通道属于哪个本地监听端口，用于 `forwards` 展示与 `unforward` 清理。
+    /// 这条通道属于哪个本地监听端口，用于列表展示与 `unforward` 清理。
     local_port: u16,
     remote: String,
 }
@@ -54,27 +56,40 @@ struct ListenerHandle {
     stop: Arc<AtomicBool>,
 }
 
+/// 一条进行中的转发（用于展示）。
+#[derive(Debug, Clone)]
+pub struct ForwardInfo {
+    pub local_port: u16,
+    pub remote: String,
+    pub active_connections: usize,
+}
+
 /// 端口转发集合：本地监听器 + 活跃通道。
 pub struct Channels {
     writer: Arc<Mutex<TcpStream>>,
+    events: Sender<Event>,
     conns: Arc<Mutex<HashMap<u32, Arc<LocalConn>>>>,
     listeners: Arc<Mutex<HashMap<u16, Arc<ListenerHandle>>>>,
     next_id: Arc<AtomicU32>,
 }
 
 impl Channels {
-    pub fn new(writer: Arc<Mutex<TcpStream>>) -> Self {
+    pub fn new(writer: Arc<Mutex<TcpStream>>, events: Sender<Event>) -> Self {
         Channels {
             writer,
+            events,
             conns: Arc::new(Mutex::new(HashMap::new())),
             listeners: Arc::new(Mutex::new(HashMap::new())),
             next_id: Arc::new(AtomicU32::new(1)),
         }
     }
 
-    /// 启动监听：`forward <local_port> <remote>`。
-    pub fn forward(&self, local_port: u16, remote: &str) -> Result<String, String> {
+    /// 启动监听：本机 `local_port` → 目标进程内的 `remote`。
+    pub fn forward(&self, local_port: u16, remote: &str) -> Result<u16, String> {
         let remote = normalize_remote(remote);
+        if remote.is_empty() {
+            return Err("远端地址为空".to_string());
+        }
         {
             let listeners = self.listeners.lock().unwrap_or_else(|e| e.into_inner());
             if listeners.contains_key(&local_port) {
@@ -102,6 +117,7 @@ impl Channels {
             );
 
         let writer = self.writer.clone();
+        let events = self.events.clone();
         let conns = self.conns.clone();
         let next_id = self.next_id.clone();
         let remote_for_thread = remote.clone();
@@ -131,36 +147,32 @@ impl Channels {
                     if let Err(e) = opened {
                         conn.shutdown();
                         conns.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
-                        crate::repl::print_line(&format!(
+                        let _ = events.send(Event::Log(format!(
                             "[forward] 发送 channel open 失败 (端口 {}): {}",
                             bound_port, e
-                        ));
+                        )));
                     }
                 }
             })
             .map_err(|e| format!("启动转发线程失败: {}", e))?;
 
-        Ok(format!(
-            "转发已启动: {}:{} -> {}（在目标进程内连接）",
-            LOCAL_BIND_ADDR, bound_port, remote
-        ))
+        Ok(bound_port)
     }
 
-    /// 停止某个本地端口的转发。
-    pub fn unforward(&self, local_port: u16) -> String {
+    /// 停止某个本地端口的转发，返回关闭的连接数。
+    pub fn unforward(&self, local_port: u16) -> Result<usize, String> {
         let handle = self
             .listeners
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&local_port);
         let Some(handle) = handle else {
-            return format!("端口 {} 没有正在进行的转发", local_port);
+            return Err(format!("端口 {} 没有正在进行的转发", local_port));
         };
         handle.stop.store(true, Ordering::Release);
         // 叫醒阻塞在 accept 上的监听线程：连一次自己。
         let _ = TcpStream::connect((LOCAL_BIND_ADDR, handle.local_port));
 
-        let mut closed = 0usize;
         let mut ids: Vec<u32> = Vec::new();
         {
             let mut conns = self.conns.lock().unwrap_or_else(|e| e.into_inner());
@@ -177,60 +189,53 @@ impl Channels {
         for id in &ids {
             let mut w = self.writer.lock().unwrap_or_else(|e| e.into_inner());
             let _ = write_channel_close(&mut *w, *id);
-            closed += 1;
         }
-        format!(
-            "已停止转发 {}:{}（关闭 {} 个连接）",
-            LOCAL_BIND_ADDR, local_port, closed
-        )
+        Ok(ids.len())
     }
 
-    /// `forwards` 列表。
-    pub fn list(&self) -> String {
+    /// 列出进行中的转发（按本地端口排序）。
+    pub fn list(&self) -> Vec<ForwardInfo> {
         let listeners = self.listeners.lock().unwrap_or_else(|e| e.into_inner());
-        if listeners.is_empty() {
-            return "没有正在进行的端口转发".to_string();
-        }
         let conns = self.conns.lock().unwrap_or_else(|e| e.into_inner());
-        let mut ports: Vec<&Arc<ListenerHandle>> = listeners.values().collect();
-        ports.sort_by_key(|l| l.local_port);
-        let mut out = String::from("本地转发：\n");
-        for l in ports {
-            let active = conns.values().filter(|c| c.local_port == l.local_port).count();
-            out.push_str(&format!(
-                "  {}:{} -> {}（活跃连接 {}）\n",
-                LOCAL_BIND_ADDR, l.local_port, l.remote, active
-            ));
-        }
-        out.trim_end().to_string()
+        let mut out: Vec<ForwardInfo> = listeners
+            .values()
+            .map(|l| ForwardInfo {
+                local_port: l.local_port,
+                remote: l.remote.clone(),
+                active_connections: conns.values().filter(|c| c.local_port == l.local_port).count(),
+            })
+            .collect();
+        out.sort_by_key(|f| f.local_port);
+        out
     }
 
-    // ── agent → 本机 的帧路由（由接收线程调用） ──
+    // ── agent → 本机 的帧路由（由会话读线程调用） ──
 
-    pub fn on_opened(&self, channel_id: u32, status: u8, message: &str) {
+    /// 处理 agent 的 `CHANNEL_OPENED`：成功则开始泵本地数据，失败则清掉该通道。
+    ///
+    /// 返回该通道请求的目标地址（未知则 `None`）。agent 的说明文本不在这里处理 ——
+    /// 它由 `Event::ChannelOpened` 带给上层，避免同一件事在两处格式化。
+    pub fn on_opened(&self, channel_id: u32, status: u8) -> Option<String> {
         let conn = self
             .conns
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(&channel_id)
             .cloned();
-        let Some(conn) = conn else { return };
+        let Some(conn) = conn else { return None };
+        let remote = conn.remote.clone();
         if status != 0 {
-            crate::repl::print_line(&format!(
-                "[forward] 目标进程连接失败 ({}): {}（状态码 {}）",
-                conn.remote,
-                if message.is_empty() { "无详细信息" } else { message },
-                status
-            ));
+            // 不在这里记日志：调用方已收到 Event::ChannelOpened，由上层统一呈现
+            // （否则同一条失败会打印两次）。
             conn.shutdown();
             self.conns
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .remove(&channel_id);
-            return;
+            return Some(remote);
         }
         if conn.started.swap(true, Ordering::AcqRel) {
-            return;
+            return Some(remote);
         }
 
         // 开闸：本地 → 目标进程方向的数据泵。
@@ -238,13 +243,15 @@ impl Channels {
             Ok(s) => match s.try_clone() {
                 Ok(c) => c,
                 Err(e) => {
-                    crate::repl::print_line(&format!("[forward] clone 本地 socket 失败: {}", e));
-                    return;
+                    let _ = self
+                        .events
+                        .send(Event::Log(format!("[forward] clone 本地 socket 失败: {}", e)));
+                    return Some(remote);
                 }
             },
             Err(e) => match e.into_inner().try_clone() {
                 Ok(c) => c,
-                Err(_) => return,
+                Err(_) => return Some(remote),
             },
         };
 
@@ -284,6 +291,7 @@ impl Channels {
             let mut w = writer.lock().unwrap_or_else(|e| e.into_inner());
             let _ = write_channel_close(&mut *w, channel_id);
         });
+        Some(remote)
     }
 
     pub fn on_data(&self, channel_id: u32, body: &[u8]) {

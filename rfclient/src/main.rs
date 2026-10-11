@@ -1,31 +1,22 @@
-//! rfclient：rustFrida 主机端客户端。
+//! rfclient — rustFrida 主机端命令行客户端。
 //!
-//! 连接设备上 `rustfrida --server --listen <addr>` 的 TCP 控制服务器，
-//! 发送引导请求（list/attach/spawn/use），随后进入帧级 REPL。
-//!
-//! 典型用法（配合 adb forward）：
-//!   adb forward tcp:15819 tcp:15819
-//!   rfclient -H 127.0.0.1:15819 list
-//!   rfclient -H 127.0.0.1:15819 attach <pid>
-//!   rfclient -H 127.0.0.1:15819 spawn com.example.app -l script.js
-//!   rfclient -H 127.0.0.1:15819 use 1
-//!   rfclient -U list
-//!   rfclient -U -f com.example.app -l script.js
-//!   rfclient -U Gadget -l script.js
-//!   rfclient -U -l script.js              # 连接已唤醒的 Gadget
+//! 协议与会话逻辑在 `rfclient_core`；本文件只做三件事：
+//! 1. 命令行解析（clap）；
+//! 2. 连接建立（直连 TCP / 经 ADB 转发 / Gadget 探测）；
+//! 3. 终端呈现（见 `repl`）。
 
-mod channel;
-mod proto;
 mod repl;
 
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::process::{Command, Stdio};
+use std::io::Write;
+use std::net::TcpStream;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 
-use crate::proto::write_bootstrap_script;
+use rfclient_core::adb::{self, AdbForward, DEFAULT_USB_DEVICE_PORT};
+use rfclient_core::bootstrap;
+use rfclient_core::Session;
 
 const CONNECT_TIMEOUT_SECS: u64 = 10;
 const PROBE_TIMEOUT_SECS: u64 = 2;
@@ -33,7 +24,6 @@ const GADGET_WAIT_SECS: u64 = 20;
 const GADGET_RETRY_MILLIS: u64 = 100;
 const DEFAULT_LOG_LINGER_SECS: u64 = 5;
 const DEFAULT_HOST: &str = "127.0.0.1:15819";
-const DEFAULT_USB_DEVICE_PORT: u16 = 15819;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -145,20 +135,14 @@ fn run(args: &Args) -> Result<i32, String> {
     result
 }
 
-/// 把认证令牌拼进引导行：服务端从引导行的 `token=<值>` 字段读取。
-fn with_token(line: &str, token: Option<&str>) -> String {
-    match token {
-        Some(t) if !t.is_empty() => format!("{} token={}", line, t),
-        _ => line.to_string(),
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UsbEndpointKind {
     Server,
     Gadget,
 }
 
+/// `-U -f <pkg>`：先看设备上是否已有 server，有就走 server spawn；
+/// 否则重启应用并等它内部的 Gadget 就绪。
 fn run_usb_spawn(args: &Args) -> Result<i32, String> {
     let package = args.spawn.as_deref().expect("spawn checked by caller");
     let forward = AdbForward::open(args.serial.as_deref(), args.device_port)?;
@@ -171,17 +155,21 @@ fn run_usb_spawn(args: &Args) -> Result<i32, String> {
         }
         Some(UsbEndpointKind::Gadget) => {
             eprintln!("[usb] 检测到 rsfrida Gadget，重新启动 {}", package);
-            launch_android_package(&forward.serial, package)?;
+            adb::launch_android_package(&forward.serial, package)?;
             wait_for_gadget(args, &host, package)
         }
         None => {
             eprintln!("[usb] 未检测到 rustfrida-server，启动 {} 并等待 Gadget", package);
-            launch_android_package(&forward.serial, package)?;
+            adb::launch_android_package(&forward.serial, package)?;
             wait_for_gadget(args, &host, package)
         }
     }
 }
 
+/// 探测设备端端点类型。
+///
+/// 判据是 `list` 响应里的 label 列：Gadget 会话的 label 固定为 `karina`
+/// （Gadget 模式没有真实包名可报）。探不通就返回 `None`，由调用方决定退路。
 fn probe_usb_endpoint(host: &str) -> Result<Option<UsbEndpointKind>, String> {
     let mut stream = match connect_tcp(host, Duration::from_secs(PROBE_TIMEOUT_SECS)) {
         Ok(stream) => stream,
@@ -191,7 +179,7 @@ fn probe_usb_endpoint(host: &str) -> Result<Option<UsbEndpointKind>, String> {
     if stream.write_all(b"list\n").is_err() {
         return Ok(None);
     }
-    let lines = match read_response_lines(&mut stream) {
+    let lines = match bootstrap::read_response_lines(&mut stream) {
         Ok(lines) => lines,
         Err(_) => return Ok(None),
     };
@@ -205,94 +193,21 @@ fn probe_usb_endpoint(host: &str) -> Result<Option<UsbEndpointKind>, String> {
     }))
 }
 
-fn launch_android_package(serial: &str, package: &str) -> Result<(), String> {
-    if package.is_empty()
-        || !package
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_'))
-    {
-        return Err(format!("无效 Android 包名 '{}'", package));
-    }
-
-    let force_stop = Command::new("adb")
-        .args(["-s", serial, "shell", "am", "force-stop", package])
-        .output()
-        .map_err(|e| format!("停止应用 {} 失败: {}", package, e))?;
-    if !force_stop.status.success() {
-        return Err(format!(
-            "停止应用 {} 失败: {}",
-            package,
-            String::from_utf8_lossy(&force_stop.stderr).trim()
-        ));
-    }
-
-    let resolved = Command::new("adb")
-        .args([
-            "-s",
-            serial,
-            "shell",
-            "cmd",
-            "package",
-            "resolve-activity",
-            "--brief",
-            package,
-        ])
-        .output()
-        .map_err(|e| format!("解析应用 {} 启动 Activity 失败: {}", package, e))?;
-    if !resolved.status.success() {
-        return Err(format!(
-            "解析应用 {} 启动 Activity 失败: {}",
-            package,
-            String::from_utf8_lossy(&resolved.stderr).trim()
-        ));
-    }
-    let component = String::from_utf8_lossy(&resolved.stdout)
-        .lines()
-        .rev()
-        .map(str::trim)
-        .find(|line| line.contains('/'))
-        .ok_or_else(|| format!("应用 {} 没有可启动的 Activity", package))?
-        .to_string();
-
-    let started = Command::new("adb")
-        .args([
-            "-s",
-            serial,
-            "shell",
-            "am",
-            "start",
-            "--user",
-            "current",
-            "-n",
-            component.as_str(),
-        ])
-        .output()
-        .map_err(|e| format!("启动应用 {} 失败: {}", package, e))?;
-    if !started.status.success() {
-        return Err(format!(
-            "启动应用 {} 失败: {}{}",
-            package,
-            String::from_utf8_lossy(&started.stdout).trim(),
-            String::from_utf8_lossy(&started.stderr).trim()
-        ));
-    }
-    Ok(())
-}
-
+/// 反复尝试连接，直到 Gadget 起好（应用启动到 Gadget 加载有延迟）。
 fn wait_for_gadget(args: &Args, host: &str, package: &str) -> Result<i32, String> {
     let deadline = Instant::now() + Duration::from_secs(GADGET_WAIT_SECS);
     let mut last_error = String::new();
     while Instant::now() < deadline {
         match connect_tcp(host, Duration::from_millis(500)) {
-            Ok(mut stream) => {
+            Ok(stream) => {
                 configure_stream(&stream, Duration::from_secs(30))?;
                 let line = if args.load_script.is_some() {
                     "gadget -l -"
                 } else {
                     "gadget"
                 };
-                let line = with_token(line, args.token.as_deref());
-                match run_interactive(&mut stream, &line, args.load_script.as_deref(), args.linger) {
+                let line = bootstrap::with_token(line, args.token.as_deref());
+                match run_interactive(stream, &line, args.load_script.as_deref(), args.linger) {
                     Ok(code) => return Ok(code),
                     Err(error) => last_error = error,
                 }
@@ -337,8 +252,8 @@ fn run_connected(args: &Args, host: &str) -> Result<i32, String> {
         } else {
             format!("spawn {}", package)
         };
-        let line = with_token(&line, args.token.as_deref());
-        return run_interactive(&mut stream, &line, args.load_script.as_deref(), args.linger);
+        let line = bootstrap::with_token(&line, args.token.as_deref());
+        return run_interactive(stream, &line, args.load_script.as_deref(), args.linger);
     }
 
     let Some(cmd) = args.cmd.as_ref() else {
@@ -347,42 +262,21 @@ fn run_connected(args: &Args, host: &str) -> Result<i32, String> {
         } else {
             "gadget".to_string()
         };
-        let line = with_token(&line, args.token.as_deref());
+        let line = bootstrap::with_token(&line, args.token.as_deref());
         eprintln!("[client] 未指定 -f/--file 或子命令，尝试连接已运行的 Gadget");
-        return run_interactive(&mut stream, &line, args.load_script.as_deref(), args.linger);
+        return run_interactive(stream, &line, args.load_script.as_deref(), args.linger);
     };
 
     match cmd {
         Cmd::List => {
-            send_bootstrap(&mut stream, "list", None)?;
-            let lines = read_response_lines(&mut stream)?;
-            if lines.is_empty() {
-                repl::print_line("(无会话)");
-            } else {
-                repl::print_line("ID\tPID\tLABEL\tSTATUS");
-                for line in &lines {
-                    repl::print_line(line);
-                }
-            }
-            Ok(0)
+            send_query(&mut stream, "list", args.token.as_deref(), "ID\tPID\tLABEL\tSTATUS", "(无会话)")
         }
         Cmd::Ps { filter } => {
             let line = match filter {
                 Some(f) if !f.is_empty() => format!("ps {}", f),
                 _ => "ps".to_string(),
             };
-            let line = with_token(&line, args.token.as_deref());
-            send_bootstrap(&mut stream, &line, None)?;
-            let lines = read_response_lines(&mut stream)?;
-            if lines.is_empty() {
-                repl::print_line("(无匹配进程)");
-            } else {
-                repl::print_line("PID\tNAME");
-                for line in &lines {
-                    repl::print_line(line);
-                }
-            }
-            Ok(0)
+            send_query(&mut stream, &line, args.token.as_deref(), "PID\tNAME", "(无匹配进程)")
         }
         Cmd::Attach { target, script } => {
             let line = if script.is_some() {
@@ -390,8 +284,8 @@ fn run_connected(args: &Args, host: &str) -> Result<i32, String> {
             } else {
                 format!("attach {}", target)
             };
-            let line = with_token(&line, args.token.as_deref());
-            run_interactive(&mut stream, &line, script.as_deref(), args.linger)
+            let line = bootstrap::with_token(&line, args.token.as_deref());
+            run_interactive(stream, &line, script.as_deref(), args.linger)
         }
         Cmd::Spawn { package, script } => {
             let line = if script.is_some() {
@@ -399,12 +293,12 @@ fn run_connected(args: &Args, host: &str) -> Result<i32, String> {
             } else {
                 format!("spawn {}", package)
             };
-            let line = with_token(&line, args.token.as_deref());
-            run_interactive(&mut stream, &line, script.as_deref(), args.linger)
+            let line = bootstrap::with_token(&line, args.token.as_deref());
+            run_interactive(stream, &line, script.as_deref(), args.linger)
         }
         Cmd::Use { session_id } => {
-            let line = with_token(&format!("use {}", session_id), args.token.as_deref());
-            run_interactive(&mut stream, &line, None, args.linger)
+            let line = bootstrap::with_token(&format!("use {}", session_id), args.token.as_deref());
+            run_interactive(stream, &line, None, args.linger)
         }
         Cmd::Gadget { script } => {
             let line = if script.is_some() {
@@ -412,206 +306,53 @@ fn run_connected(args: &Args, host: &str) -> Result<i32, String> {
             } else {
                 "gadget".to_string()
             };
-            let line = with_token(&line, args.token.as_deref());
-            run_interactive(&mut stream, &line, script.as_deref(), args.linger)
+            let line = bootstrap::with_token(&line, args.token.as_deref());
+            run_interactive(stream, &line, script.as_deref(), args.linger)
         }
     }
 }
 
-/// Frida 的 Android USB provider 通过 ADB 设备跟踪后打开设备控制通道。
-/// 这里使用 adb 命令完成等价的设备选择和临时 TCP forward，服务器协议本身不变。
-struct AdbForward {
-    serial: String,
-    local_port: u16,
-}
-
-impl AdbForward {
-    fn open(requested_serial: Option<&str>, device_port: u16) -> Result<Self, String> {
-        let serial = select_adb_device(requested_serial)?;
-        let listener = TcpListener::bind(("127.0.0.1", 0))
-            .map_err(|e| format!("为 ADB forward 分配本地端口失败: {}", e))?;
-        let local_port = listener
-            .local_addr()
-            .map_err(|e| format!("读取本地临时端口失败: {}", e))?
-            .port();
-        drop(listener);
-
-        let local = format!("tcp:{}", local_port);
-        let remote = format!("tcp:{}", device_port);
-        let output = Command::new("adb")
-            .args(["-s", serial.as_str(), "forward", local.as_str(), remote.as_str()])
-            .output()
-            .map_err(|e| format!("执行 adb forward 失败: {}（请确认 adb 在 PATH 中）", e))?;
-        if !output.status.success() {
-            return Err(format!(
-                "adb forward {} -> {} 失败: {}",
-                local,
-                remote,
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
-        }
-
-        eprintln!("[adb] {} -> 127.0.0.1:{}", serial, device_port);
-        Ok(Self { serial, local_port })
-    }
-
-    fn local_address(&self) -> String {
-        format!("127.0.0.1:{}", self.local_port)
-    }
-}
-
-impl Drop for AdbForward {
-    fn drop(&mut self) {
-        let local = format!("tcp:{}", self.local_port);
-        let _ = Command::new("adb")
-            .args([
-                "-s",
-                self.serial.as_str(),
-                "forward",
-                "--remove",
-                local.as_str(),
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    }
-}
-
-fn select_adb_device(requested_serial: Option<&str>) -> Result<String, String> {
-    let output = Command::new("adb")
-        .arg("devices")
-        .output()
-        .map_err(|e| format!("执行 adb devices 失败: {}（请确认 adb 在 PATH 中）", e))?;
-    if !output.status.success() {
-        return Err(format!(
-            "adb devices 失败: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-
-    let mut online = Vec::new();
-    let mut statuses = Vec::new();
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        let mut fields = line.split_whitespace();
-        let Some(serial) = fields.next() else { continue };
-        let Some(status) = fields.next() else { continue };
-        if serial == "List" && status == "of" {
-            continue;
-        }
-        statuses.push((serial.to_string(), status.to_string()));
-        if status == "device" {
-            online.push(serial.to_string());
+/// `list` / `ps`：发一行、读多行直到空行，然后按表格打印。
+fn send_query(
+    stream: &mut TcpStream,
+    line: &str,
+    token: Option<&str>,
+    header: &str,
+    empty_hint: &str,
+) -> Result<i32, String> {
+    let line = bootstrap::with_token(line, token);
+    bootstrap::send_bootstrap(stream, &line, None)?;
+    let lines = bootstrap::read_response_lines(stream)?;
+    if lines.is_empty() {
+        repl::print_line(empty_hint);
+    } else {
+        repl::print_line(header);
+        for l in &lines {
+            repl::print_line(l);
         }
     }
-
-    if let Some(requested) = requested_serial {
-        if online.iter().any(|serial| serial == requested) {
-            return Ok(requested.to_string());
-        }
-        let status = statuses
-            .iter()
-            .find(|(serial, _)| serial == requested)
-            .map(|(_, status)| status.as_str())
-            .unwrap_or("not found");
-        return Err(format!("ADB 设备 '{}' 不可用（状态: {}）", requested, status));
-    }
-
-    match online.as_slice() {
-        [] => Err("没有 online 的 ADB 设备".to_string()),
-        [serial] => Ok(serial.clone()),
-        [first, ..] => {
-            eprintln!("[adb] 检测到多个 online 设备，使用第一个: {}", first);
-            Ok(first.clone())
-        }
-    }
+    Ok(0)
 }
 
 /// 发送引导请求，校验 OK 后进入 REPL；返回进程退出码。
 fn run_interactive(
-    stream: &mut TcpStream,
+    stream: TcpStream,
     line: &str,
     script_path: Option<&str>,
     linger_secs: u64,
 ) -> Result<i32, String> {
-    send_bootstrap(stream, line, script_path)?;
-    let response = read_response_line(stream)?;
+    let mut stream = stream;
+    bootstrap::send_bootstrap(&mut stream, line, script_path)?;
+    let response = bootstrap::read_response_line(&mut stream)?;
     if !response.starts_with("OK") {
         repl::print_line(&response);
         return Ok(1);
     }
     repl::print_line(&response);
     // 服务端/Gadget 在 OK 行宣告 agent 协议版本（proto=N）；
-    // 拿不到时（旧服务端）交给 REPL 等 HELLO 或退回 legacy。
-    let proto_hint = parse_proto_hint(&response);
-    repl::run(stream, Duration::from_secs(linger_secs), proto_hint)?;
+    // 拿不到时（旧服务端）交给 Session 等 HELLO 或退回 legacy。
+    let proto_hint = bootstrap::parse_proto_hint(&response);
+    let (session, events) = Session::connect(stream, proto_hint)?;
+    repl::run(&Arc::new(session), events, Duration::from_secs(linger_secs))?;
     Ok(0)
-}
-
-/// 从 `OK sid=1 pid=123 proto=2` 中提取协议版本。
-fn parse_proto_hint(response: &str) -> Option<u32> {
-    response
-        .split_whitespace()
-        .find_map(|f| f.strip_prefix("proto="))
-        .and_then(|v| v.parse().ok())
-}
-
-fn send_bootstrap(stream: &mut TcpStream, line: &str, script_path: Option<&str>) -> Result<(), String> {
-    let script = match script_path {
-        Some(path) => {
-            let content = std::fs::read_to_string(path)
-                .map_err(|e| format!("读取本地脚本 '{}' 失败: {}", path, e))?;
-            let filename = std::path::Path::new(path)
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("script.js")
-                .to_string();
-            Some((filename, content))
-        }
-        None => None,
-    };
-    let mut data = line.to_string();
-    data.push('\n');
-    stream
-        .write_all(data.as_bytes())
-        .map_err(|e| format!("发送引导请求失败: {}", e))?;
-    if let Some((filename, content)) = script {
-        write_bootstrap_script(stream, &filename, &content)
-            .map_err(|e| format!("发送本地脚本失败: {}", e))?;
-    }
-    Ok(())
-}
-
-/// 读一行响应（逐字节，避免 BufReader 缓冲吞掉后续帧）。
-fn read_response_line(stream: &mut TcpStream) -> Result<String, String> {
-    let mut line = Vec::new();
-    let mut byte = [0u8; 1];
-    loop {
-        let n = stream
-            .read(&mut byte)
-            .map_err(|e| format!("读引导响应失败: {}", e))?;
-        if n == 0 {
-            if line.is_empty() {
-                return Err("服务器关闭了连接".to_string());
-            }
-            break;
-        }
-        if byte[0] == b'\n' {
-            break;
-        }
-        line.push(byte[0]);
-    }
-    Ok(String::from_utf8_lossy(&line).trim_end_matches('\r').to_string())
-}
-
-/// 读多行响应直到空行（用于 list）。
-fn read_response_lines(stream: &mut TcpStream) -> Result<Vec<String>, String> {
-    let mut lines = Vec::new();
-    loop {
-        let line = read_response_line(stream)?;
-        if line.is_empty() {
-            break;
-        }
-        lines.push(line);
-    }
-    Ok(lines)
 }

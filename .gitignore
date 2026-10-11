@@ -18,3 +18,6 @@ scripts/
 
 # ad-hoc 构建日志目录
 /out/
+
+# rfclient 交互式 REPL 的历史文件（运行时生成）
+.rfclient_history

@@ -211,6 +211,79 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  # rfclient 拆分出 rfclient-core 后，CLI 只是 core 的一个消费者。
+  # 这一步的价值取决于「行为零变化」，而这句话必须由机器检查，不能靠人工断言。
+  # 本 job 用 scripts/rfclient-mock-server.py 当假设备端，把协议里 CLI 用到的
+  # 四条路径跑一遍：bootstrap 多行响应、v2 tagged 应答路由、legacy(v1) 帧、
+  # stale（无主 reqid）丢弃。纯 std、不需要 NDK/子模块，约 1 分钟。
+  rfclient-regression:
+    name: rfclient (protocol regression)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: host-linux
+
+      - name: Build rfclient (Linux host)
+        run: cargo build -p rfclient --release --locked --target x86_64-unknown-linux-gnu
+
+      - name: Protocol regression against mock server
+        run: |
+          set -euo pipefail
+          CLI=target/x86_64-unknown-linux-gnu/release/rfclient
+          MOCK=scripts/rfclient-mock-server.py
+          fail=0
+
+          # 起 mock，等端口就绪，跑一段 CLI，断言输出包含预期片段。
+          # 参数: <端口> <模式> <子命令> <每行用;分隔的stdin> <断言1> [断言2] ...
+          # 两点约定，都是为了这个脚本本身好维护：
+          #   * 子命令必须显式给：不给子命令时 CLI 走 gadget/交互分支，
+          #     而不是 list 的 send_query 多行查询路径；
+          #   * 断言只用不含制表符的子串，避免在 YAML 里写转义。
+          check() {
+            local port="$1" mode="$2" subcmd="$3" input="$4"; shift 4
+            python3 "$MOCK" "$port" "$mode" > "/tmp/mock-$port.log" 2>&1 &
+            local mock_pid=$!
+            for _ in $(seq 1 50); do
+              if grep -q listening "/tmp/mock-$port.log" 2>/dev/null; then break; fi
+              sleep 0.1
+            done
+            local out
+            local IFS=";"
+            # shellcheck disable=SC2086
+            out="$( { for l in $input; do printf %s "$l"; echo; done; } | "$CLI" -H "127.0.0.1:$port" $subcmd 2>&1 || true )"
+            kill "$mock_pid" 2>/dev/null || true
+            for expect in "$@"; do
+              if printf %s "$out" | grep -qF -- "$expect"; then
+                echo "  ok   [$mode] $expect"
+              else
+                echo "  FAIL [$mode] 未找到: $expect"
+                printf %s "$out" | sed "s/^/      | /"
+                fail=1
+              fi
+            done
+          }
+
+          # 1) list：bootstrap 多行响应 + 表格内容（send_query 路径）
+          check 18801 list list "" "STATUS" "com.example" "active"
+          # 2) v2：HELLO 定案 + tagged 应答按 reqid 回位
+          check 18802 session "" "jseval 1+1;exit" "已连接（协议 v2" "=> echo:jseval" "协议 v2：reqid 匹配"
+          # 3) legacy：OK 行不带 proto，靠 HELLO proto=1 退回 v1
+          check 18803 legacy "" "jseval 1;exit" "已连接（协议 v1）" "=> legacy-echo:jseval" "协议 v1：对端未宣告 v2"
+          # 4) stale：无主 reqid 必须丢弃，不得误配给下一条命令
+          check 18804 stale "" "jseval 42;exit" "[stale] 丢弃迟到的 eval 响应 (reqid=9999)" "=> echo:jseval"
+          # 5) forward 命令完全在本地处理，不进 agent 命令面
+          check 18805 session "" "forwards;exit" "没有正在进行的端口转发"
+          exit "$fail"
+
   # rfclient 是跑在主机上的控制客户端，Windows 使用者需要一个原生 .exe。
   # 单独开 job 而不是在 Linux 里交叉编译：msvc 目标必须用 MSVC 工具链，
   # Linux 上做不到；windows-latest 的 standard runner 对公共仓库免费。
