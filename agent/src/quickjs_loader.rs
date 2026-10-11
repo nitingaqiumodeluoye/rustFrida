@@ -581,6 +581,7 @@ fn eval_on_java_worker_inner(
     script: String,
     filename: String,
     init_engine: bool,
+    attribute: bool,
     queue_wait_timeout_ms: u64,
 ) -> Result<String, String> {
     java_worker_verbose(format!(
