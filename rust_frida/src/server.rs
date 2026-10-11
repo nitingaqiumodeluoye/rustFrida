@@ -397,9 +397,11 @@ pub(crate) fn run_tcp_server(
         log_info!("  已启用 token 认证（rfclient 连接时需 --token <TOKEN>）");
     }
 
+    // 先转成拥有型 String，供 'static 的 accept 线程使用。
+    let token = token.map(str::to_string);
     thread::Builder::new()
         .name("wwb-tcpacc".into())
-        .spawn(move || tcp_accept_loop(listener, mgr, string_overrides, verbose, token.map(str::to_string)))
+        .spawn(move || tcp_accept_loop(listener, mgr, string_overrides, verbose, token))
         .map_err(|e| format!("spawn wwb-tcpacc 失败: {}", e))?;
     Ok(())
 }

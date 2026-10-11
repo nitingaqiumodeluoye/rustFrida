@@ -332,6 +332,7 @@ fn handle_socket_connection(stream: UnixStream, session: Arc<Session>) {
                                 while let Ok(msg) = rx.recv() {
                                     let (kind, payload) = match msg {
                                         HostToAgentMessage::Command(cmd) => (FRAME_KIND_CMD, cmd.into_bytes()),
+                                        HostToAgentMessage::RawFrame { kind, payload } => (kind, payload),
                                         #[cfg(feature = "qbdi")]
                                         HostToAgentMessage::QbdiHelper(blob) => (FRAME_KIND_QBDI_HELPER, blob),
                                     };
