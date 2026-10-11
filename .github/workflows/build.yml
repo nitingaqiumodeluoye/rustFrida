@@ -176,6 +176,11 @@ jobs:
       # rfclient 是跑在主机上的 TCP 控制客户端，不是 Android 二进制。仓库的
       # .cargo/config.toml 把默认 target 钉成了 aarch64-linux-android，所以这里
       # 必须显式指定宿主三元组，否则会被编成 arm64 而无法在主机执行。
+      # 4) rsfrida-gadget：内嵌 agent 的独立 Gadget，供 rfclient -U -f 使用。
+      #    之前不在 CI 覆盖范围内，改动物理编译错误只能在手动交叉编译时才发现。
+      - name: Build rsfrida-gadget
+        run: cargo build -p rsfrida-gadget --release --locked --target aarch64-linux-android
+
       - name: Build rfclient (host client)
         run: |
           set -euxo pipefail
@@ -190,6 +195,7 @@ jobs:
           mkdir -p dist
           cp "${OUT}/rustfrida" dist/
           cp "${OUT}/libagent.so" dist/
+          cp "${OUT}/librsfrida_gadget.so" dist/librsfrida-gadget.so
           # 内嵌的 zymbiote payload 也一并产出：便于把 CI 构建结果回写到仓库
           cp zymbiote/build/zymbiote.elf dist/
           cp "${HOST_OUT}/rfclient" dist/
