@@ -32,9 +32,10 @@ mod quickjs_loader;
 mod stalker;
 
 use crate::communication::{
-    clear_stream, flush_cached_logs, is_cmd_frame, is_qbdi_helper_frame, log_msg, log_msg_sync, register_stream,
-    send_bye, send_complete, send_eval_err, send_eval_ok, send_hello, send_rpc_err, send_rpc_ok, shutdown_log_writer,
-    shutdown_stream, start_log_writer, write_stream,
+    clear_stream, current_reqid, flush_cached_logs, is_cmd_frame, is_ping_frame, is_qbdi_helper_frame, log_msg,
+    log_msg_sync, parse_cmd_frame, register_stream, send_bye, send_complete, send_eval_err, send_eval_ok, send_hello,
+    send_pong, send_rpc_err, send_rpc_ok, set_current_reqid, shutdown_log_writer, shutdown_stream, start_log_writer,
+    write_stream,
 };
 use crate::crash_handler::install_panic_hook;
 use libc::{kill, pid_t, SIGSTOP};
@@ -208,14 +209,24 @@ pub extern "C" fn hello_entry(args_ptr: *mut c_void) -> *mut c_void {
             Ok((kind, payload))
         }) {
             Ok((kind, payload)) => {
-                if is_cmd_frame(kind) {
-                    if payload.is_empty() {
+                if is_ping_frame(kind) {
+                    // 链路保活：直接回 PONG，不进入命令分发。
+                    send_pong();
+                } else if is_cmd_frame(kind) {
+                    // 协议 v2：CMD_TAGGED 携带 4B reqid，响应帧会回填同一 reqid。
+                    // 设置线程局部后，本线程及 dispatch_js_task 派生的 JS 线程
+                    // 内所有 send_eval_* / send_rpc_* / send_complete 自动变成 tagged 帧。
+                    let (reqid, cmd_payload) = parse_cmd_frame(kind, &payload);
+                    if cmd_payload.is_empty() {
                         continue;
                     }
-                    let cmd = String::from_utf8_lossy(&payload).trim().to_string();
-                    if !cmd.is_empty() {
-                        process_cmd(&cmd);
+                    let cmd = String::from_utf8_lossy(cmd_payload).trim().to_string();
+                    if cmd.is_empty() {
+                        continue;
                     }
+                    set_current_reqid(reqid);
+                    process_cmd(&cmd);
+                    set_current_reqid(0);
                 } else if is_qbdi_helper_frame(kind) {
                     #[cfg(feature = "quickjs")]
                     quickjs_loader::install_qbdi_helper(payload);
@@ -473,7 +484,11 @@ where
     F: FnOnce() + Send + 'static,
 {
     JS_TASKS_IN_FLIGHT.fetch_add(1, Ordering::AcqRel);
+    // 继承发起线程的 reqid：JS 任务在独立线程执行，但响应帧必须回填
+    // 发起命令时的请求 ID（tagged 模式下主机端按 reqid 匹配响应）。
+    let inherited_reqid = current_reqid();
     match raw_thread::spawn_detached(b"wwb-js\0", move || {
+        set_current_reqid(inherited_reqid);
         let _raw_clone_js = quickjs_hook::mark_raw_clone_js_thread();
         if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(task)) {
             let msg = payload
@@ -547,7 +562,9 @@ fn process_cmd(command: &str) {
                 .nth(1)
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0);
+            let inherited_reqid = current_reqid();
             raw_thread::spawn_detached(b"wwb-trace\0", move || {
+                set_current_reqid(inherited_reqid);
                 match trace::gum_modify_thread(tid) {
                     Ok(pid) => {
                         write_stream(format!("clone success {}", pid).as_bytes());
