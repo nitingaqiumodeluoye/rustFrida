@@ -381,6 +381,7 @@ pub(crate) fn run_tcp_server(
     bind_addr: &str,
     string_overrides: HashMap<String, String>,
     verbose: bool,
+    token: Option<&str>,
 ) -> Result<(), String> {
     let listener = TcpListener::bind(bind_addr).map_err(|e| format!("TCP bind {} 失败: {}", bind_addr, e))?;
     let actual = listener
@@ -388,11 +389,17 @@ pub(crate) fn run_tcp_server(
         .map(|a| a.to_string())
         .unwrap_or_else(|_| bind_addr.to_string());
     log_success!("TCP 控制服务器监听 {}", actual);
-    log_info!("  rfclient -H {} list / attach <pid> / spawn <pkg> / use <sid>", actual);
+    log_info!(
+        "  rfclient -H {} list / attach <pid> / spawn <pkg> / use <sid>",
+        actual
+    );
+    if token.is_some() {
+        log_info!("  已启用 token 认证（rfclient 连接时需 --token <TOKEN>）");
+    }
 
     thread::Builder::new()
         .name("wwb-tcpacc".into())
-        .spawn(move || tcp_accept_loop(listener, mgr, string_overrides, verbose))
+        .spawn(move || tcp_accept_loop(listener, mgr, string_overrides, verbose, token.map(str::to_string)))
         .map_err(|e| format!("spawn wwb-tcpacc 失败: {}", e))?;
     Ok(())
 }
@@ -402,14 +409,16 @@ fn tcp_accept_loop(
     mgr: Arc<SessionManager>,
     string_overrides: HashMap<String, String>,
     verbose: bool,
+    token: Option<String>,
 ) {
     for stream in listener.incoming() {
         match stream {
             Ok(s) => {
                 let mgr = mgr.clone();
                 let overrides = string_overrides.clone();
+                let token = token.clone();
                 let _ = thread::Builder::new().name("wwb-tcpconn".into()).spawn(move || {
-                    if let Err(e) = handle_tcp_client(s, mgr, overrides, verbose) {
+                    if let Err(e) = handle_tcp_client(s, mgr, overrides, verbose, token.as_deref()) {
                         log_error!("TCP 客户端处理失败: {}", e);
                     }
                 });
@@ -427,6 +436,7 @@ fn handle_tcp_client(
     mgr: Arc<SessionManager>,
     string_overrides: HashMap<String, String>,
     verbose: bool,
+    token: Option<&str>,
 ) -> Result<(), String> {
     stream
         .set_read_timeout(Some(Duration::from_secs(TCP_BOOTSTRAP_TIMEOUT_SECS)))
@@ -447,6 +457,20 @@ fn handle_tcp_client(
     if parts.is_empty() {
         write_line(&write_stream, "ERR empty request")?;
         return Ok(());
+    }
+
+    // token 认证：服务器启用 --token 后，除 list 外的所有操作都需要
+    // 引导行中携带 token=<值>（恒定时间比较，防时序侧信道）。
+    if token.is_some() && parts[0] != "list" {
+        let supplied = parts
+            .iter()
+            .find_map(|p| p.strip_prefix("token="))
+            .unwrap_or("");
+        if !constant_time_eq(supplied.as_bytes(), token.unwrap().as_bytes()) {
+            write_line(&write_stream, "ERR 认证失败：token 无效或缺失")?;
+            log_warn!("TCP 客户端认证失败（{}）", stream.peer_addr().unwrap_or_else(|_| "?".parse().unwrap()));
+            return Ok(());
+        }
     }
 
     match parts[0] {
@@ -663,6 +687,18 @@ fn write_line(stream: &TcpStream, s: &str) -> Result<(), String> {
     let mut s = s.to_string();
     s.push('\n');
     write_all(stream, s.as_bytes())
+}
+
+/// 恒定时间字节比较，避免 token 比较的时序侧信道。
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 fn write_all(stream: &TcpStream, data: &[u8]) -> Result<(), String> {
@@ -1076,7 +1112,13 @@ pub(crate) fn run_server(args: &Args) {
     // 不应修改 Zygote 的系统代码映射，否则即使没有 attach 目标也会留下 COW 页。
     let listen_arg = args.listen.as_deref().unwrap_or(DEFAULT_LISTEN_ADDR);
     let bind = crate::parse_rpc_bind(listen_arg);
-    if let Err(e) = run_tcp_server(mgr.clone(), &bind, string_overrides.clone(), args.verbose) {
+    if let Err(e) = run_tcp_server(
+        mgr.clone(),
+        &bind,
+        string_overrides.clone(),
+        args.verbose,
+        args.token.as_deref(),
+    ) {
         log_error!("TCP server 启动失败: {}", e);
         std::process::exit(1);
     }

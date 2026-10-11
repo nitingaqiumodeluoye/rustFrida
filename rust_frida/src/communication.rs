@@ -21,6 +21,10 @@ const FRAME_KIND_QBDI_HELPER: u8 = 2;
 /// TCP bootstrap frame carrying a host-side script. This is consumed by the
 /// server before the session relay is established and never reaches the agent.
 pub(crate) const FRAME_KIND_BOOTSTRAP_SCRIPT: u8 = 3;
+/// 协议 v2：主机→agent 的带 reqid 命令帧与链路保活探测帧。服务器不解析，
+/// 原样转发给 agent；agent 的响应帧也原样经中继回给主机客户端。
+pub(crate) const FRAME_KIND_CMD_TAGGED: u8 = 4;
+pub(crate) const FRAME_KIND_PING: u8 = 5;
 
 const FRAME_KIND_HELLO: u8 = 0x80;
 const FRAME_KIND_LOG: u8 = 0x81;
@@ -30,6 +34,17 @@ const FRAME_KIND_EVAL_ERR: u8 = 0x84;
 const FRAME_KIND_RPC_OK: u8 = 0x85;
 const FRAME_KIND_RPC_ERR: u8 = 0x86;
 const FRAME_KIND_BYE: u8 = 0x87;
+
+/// 协议 v2 tagged 响应帧（agent→主机客户端，reqid 由客户端匹配）。
+const FRAME_KIND_EVAL_OK_TAGGED: u8 = 0x90;
+const FRAME_KIND_EVAL_ERR_TAGGED: u8 = 0x91;
+const FRAME_KIND_RPC_OK_TAGGED: u8 = 0x92;
+const FRAME_KIND_RPC_ERR_TAGGED: u8 = 0x93;
+const FRAME_KIND_COMPLETE_TAGGED: u8 = 0x94;
+/// server→主机客户端的结构化事件帧（detach 原因等），与文本 LOG 分离。
+pub(crate) const FRAME_KIND_EVENT: u8 = 0x95;
+/// agent→主机客户端的链路保活应答。
+const FRAME_KIND_PONG: u8 = 0x97;
 
 /// Agent payloads are normally small command results or log chunks. Keeping
 /// the same upper bound on both TCP and socketpair readers prevents a peer
@@ -43,6 +58,8 @@ const MAX_RELAY_BACKLOG_BYTES: usize = 4 * 1024 * 1024;
 #[derive(Clone)]
 pub(crate) enum HostToAgentMessage {
     Command(String),
+    /// 协议 v2：原样转发给 agent 的帧（CMD_TAGGED/PING）。服务器不解析内容。
+    RawFrame { kind: u8, payload: Vec<u8> },
     #[cfg(feature = "qbdi")]
     QbdiHelper(Vec<u8>),
 }
@@ -131,6 +148,15 @@ pub(crate) fn send_qbdi_helper(
     blob: Vec<u8>,
 ) -> Result<(), std::sync::mpsc::SendError<HostToAgentMessage>> {
     sender.send(HostToAgentMessage::QbdiHelper(blob))
+}
+
+/// 原样向 agent 转发一个帧（协议 v2 tagged 命令 / PING）。
+pub(crate) fn send_raw_frame(
+    sender: &Sender<HostToAgentMessage>,
+    kind: u8,
+    payload: Vec<u8>,
+) -> Result<(), std::sync::mpsc::SendError<HostToAgentMessage>> {
+    sender.send(HostToAgentMessage::RawFrame { kind, payload })
 }
 
 fn write_frame(stream: &mut dyn Write, kind: u8, payload: &[u8]) -> std::io::Result<()> {
@@ -276,6 +302,12 @@ fn handle_socket_connection(stream: UnixStream, session: Arc<Session>) {
                         } else {
                             log_success!("[#{}] Agent 已连接", session.id);
                         }
+                        // 协议版本协商：agent 会在 HELLO 载荷中宣告 proto=N。
+                        // 仅记录，当前版本与 v1 完全向后兼容。
+                        if !payload.is_empty() {
+                            let hello = String::from_utf8_lossy(&payload);
+                            log_info!("[#{}] agent protocol: {}", session.id, hello.trim());
+                        }
                         let stream_clone = match reader.try_clone() {
                             Ok(s) => s,
                             Err(e) => {
@@ -324,6 +356,17 @@ fn handle_socket_connection(stream: UnixStream, session: Arc<Session>) {
                         };
                         session.complete_state.send(candidates);
                     }
+                    // ─── 协议 v2 tagged 响应：只走 TCP 中继，不进内部 SyncChannel。───
+                    // tagged 帧只由主机客户端经 CMD_TAGGED 发起，reqid 由客户端匹配。
+                    // 设备端本地 REPL / 服务内部命令仍走 legacy 帧 + SyncChannel，两路互不干扰。
+                    FRAME_KIND_EVAL_OK_TAGGED
+                    | FRAME_KIND_EVAL_ERR_TAGGED
+                    | FRAME_KIND_RPC_OK_TAGGED
+                    | FRAME_KIND_RPC_ERR_TAGGED
+                    | FRAME_KIND_COMPLETE_TAGGED
+                    | FRAME_KIND_PONG => {
+                        forward_agent_frame(&session, kind, &payload);
+                    }
                     FRAME_KIND_EVAL_OK => {
                         session
                             .eval_state
@@ -371,6 +414,7 @@ fn handle_socket_connection(stream: UnixStream, session: Arc<Session>) {
                         break;
                     }
                     other => {
+                        forward_agent_frame(&session, other, &payload);
                         log_error!("未知 agent frame kind: {}", other);
                     }
                 };
@@ -381,6 +425,14 @@ fn handle_socket_connection(stream: UnixStream, session: Arc<Session>) {
                 } else {
                     log_error!("[#{}] Agent 连接已断开", session.id);
                 }
+                // 结构化事件：agent socket 消失（目标进程退出或被杀）。主机客户端
+                // 据此可程序化区分「会话结束」与普通文本日志。
+                forward_agent_frame(
+                    &session,
+                    FRAME_KIND_EVENT,
+                    format!("detach\treason=process-gone\tpid={}", session.pid.load(Ordering::Relaxed))
+                        .as_bytes(),
+                );
                 session.disconnected.store(true, Ordering::Release);
                 close_tcp_relay(&session, true);
                 break;
@@ -405,6 +457,11 @@ fn handle_socket_connection(stream: UnixStream, session: Arc<Session>) {
                     log_error!("可能原因: 目标进程权限不足 / agent 崩溃 / SELinux 拦截");
                     log_error!("排查: dmesg | grep -i 'deny\\|avc'  或  logcat | grep -E 'FATAL|crash'");
                 }
+                forward_agent_frame(
+                    &session,
+                    FRAME_KIND_EVENT,
+                    format!("detach\treason=socket-error\tdetail={}", e).as_bytes(),
+                );
                 session.disconnected.store(true, Ordering::Release);
                 close_tcp_relay(&session, true);
                 break;
@@ -460,6 +517,16 @@ pub(crate) fn start_tcp_relay(
                             if let Some(sender) = session.get_sender() {
                                 if let Err(e) = send_command(sender, requested) {
                                     log_error!("[#{}] 转发命令失败: {}", session.id, e);
+                                    break;
+                                }
+                            }
+                        }
+                        // 协议 v2：带 reqid 的命令与链路保活探测，原样转发给 agent，
+                        // agent 响应经 handle_socket_connection 的 tagged 分支回到本客户端。
+                        FRAME_KIND_CMD_TAGGED | FRAME_KIND_PING => {
+                            if let Some(sender) = session.get_sender() {
+                                if let Err(e) = send_raw_frame(sender, kind, payload) {
+                                    log_error!("[#{}] 转发 v2 帧失败: {}", session.id, e);
                                     break;
                                 }
                             }

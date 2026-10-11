@@ -53,6 +53,10 @@ struct Args {
     #[arg(short = 's', long = "serial", requires = "usb")]
     serial: Option<String>,
 
+    /// 设备端 rustfrida 服务器要求的认证令牌（服务端以 --token 启动时必填）
+    #[arg(long = "token", value_name = "TOKEN", env = "RFCLIENT_TOKEN")]
+    token: Option<String>,
+
     /// -U 模式下设备端 rustfrida TCP 服务器端口
     #[arg(long = "device-port", default_value_t = DEFAULT_USB_DEVICE_PORT, requires = "usb")]
     device_port: u16,
@@ -136,6 +140,14 @@ fn run(args: &Args) -> Result<i32, String> {
     let result = run_connected(args, &host);
     drop(forward);
     result
+}
+
+/// 把认证令牌拼进引导行：服务端从引导行的 `token=<值>` 字段读取。
+fn with_token(line: &str, token: Option<&str>) -> String {
+    match token {
+        Some(t) if !t.is_empty() => format!("{} token={}", line, t),
+        _ => line.to_string(),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -276,7 +288,8 @@ fn wait_for_gadget(args: &Args, host: &str, package: &str) -> Result<i32, String
                 } else {
                     "gadget"
                 };
-                match run_interactive(&mut stream, line, args.load_script.as_deref(), args.linger) {
+                let line = with_token(line, args.token.as_deref());
+                match run_interactive(&mut stream, &line, args.load_script.as_deref(), args.linger) {
                     Ok(code) => return Ok(code),
                     Err(error) => last_error = error,
                 }
@@ -321,17 +334,19 @@ fn run_connected(args: &Args, host: &str) -> Result<i32, String> {
         } else {
             format!("spawn {}", package)
         };
+        let line = with_token(&line, args.token.as_deref());
         return run_interactive(&mut stream, &line, args.load_script.as_deref(), args.linger);
     }
 
     let Some(cmd) = args.cmd.as_ref() else {
         let line = if args.load_script.is_some() {
-            "gadget -l -"
+            "gadget -l -".to_string()
         } else {
-            "gadget"
+            "gadget".to_string()
         };
+        let line = with_token(&line, args.token.as_deref());
         eprintln!("[client] 未指定 -f/--file 或子命令，尝试连接已运行的 Gadget");
-        return run_interactive(&mut stream, line, args.load_script.as_deref(), args.linger);
+        return run_interactive(&mut stream, &line, args.load_script.as_deref(), args.linger);
     };
 
     match cmd {
@@ -354,6 +369,7 @@ fn run_connected(args: &Args, host: &str) -> Result<i32, String> {
             } else {
                 format!("attach {}", target)
             };
+            let line = with_token(&line, args.token.as_deref());
             run_interactive(&mut stream, &line, script.as_deref(), args.linger)
         }
         Cmd::Spawn { package, script } => {
@@ -362,19 +378,21 @@ fn run_connected(args: &Args, host: &str) -> Result<i32, String> {
             } else {
                 format!("spawn {}", package)
             };
+            let line = with_token(&line, args.token.as_deref());
             run_interactive(&mut stream, &line, script.as_deref(), args.linger)
         }
         Cmd::Use { session_id } => {
-            let line = format!("use {}", session_id);
+            let line = with_token(&format!("use {}", session_id), args.token.as_deref());
             run_interactive(&mut stream, &line, None, args.linger)
         }
         Cmd::Gadget { script } => {
             let line = if script.is_some() {
-                "gadget -l -"
+                "gadget -l -".to_string()
             } else {
-                "gadget"
+                "gadget".to_string()
             };
-            run_interactive(&mut stream, line, script.as_deref(), args.linger)
+            let line = with_token(&line, args.token.as_deref());
+            run_interactive(&mut stream, &line, script.as_deref(), args.linger)
         }
     }
 }

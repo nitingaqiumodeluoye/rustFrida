@@ -175,4 +175,10 @@ pub(crate) struct Args {
     /// 之后进入帧级中继，主机端 REPL 与本地 REPL 功能一致。
     #[arg(long = "listen", value_name = "PORT_OR_ADDR")]
     pub(crate) listen: Option<String>,
+
+    /// TCP 控制服务器认证令牌。设置后，rfclient 必须在引导行中携带
+    /// `token=<值>` 才能执行 attach/spawn/use/gadget；list 始终允许（仅探测用）。
+    /// 未设置时不启用认证（局域网/USB 场景）。
+    #[arg(long = "token", value_name = "TOKEN")]
+    pub(crate) token: Option<String>,
 }

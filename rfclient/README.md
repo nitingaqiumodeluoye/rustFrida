@@ -61,13 +61,56 @@ rf> exit       # 仅断开主机客户端，session 保留
 rf> shutdown   # TCP 安全断开，目标进程和 hook 保留
 ```
 
+带认证的设备端启动（并连接）：
+
+```bash
+adb shell su -c "/data/local/tmp/rustfrida --server --token s3cret"
+rfclient -H 127.0.0.1:15819 --token s3cret list
+rfclient -U --token s3cret -f com.example.app
+```
+
 ## 协议
 
-- **引导**：一行文本请求（`list` / `attach <pid|name>` / `spawn <pkg> [-l -]` / `use <sid>`），
-  `-l -` 后紧跟一个脚本帧，脚本帧由主机端读取并发送；响应 `OK ...` / `ERR ...`
-  （`list` 多行 + 空行结束）
-- **中继**：引导成功后进入帧级中继，帧协议与 `rust_frida/src/communication.rs` 完全一致
-  （`1B kind + 4B LE len + payload`），主机端 REPL 与设备端本地 REPL 命令面一致
+### 引导（文本行）
+
+一行文本请求（`list` / `attach <pid|name>` / `spawn <pkg> [-l -]` / `use <sid>` / `gadget`），
+必要时附加 `token=<值>`（服务端以 `--token` 启动时）。
+`-l -` 后紧跟一个脚本帧，脚本帧由主机端读取并发送；响应 `OK ...` / `ERR ...`
+（`list` 多行 + 空行结束）。
+
+### 帧协议
+
+引导成功后进入帧级中继，帧格式与 `rust_frida/src/communication.rs`、
+`agent/src/communication.rs` 完全一致：`1B kind + 4B LE len + payload`。
+
+**v1（legacy）**——设备端本地 REPL 与旧客户端使用：
+
+| 方向 | kind | 说明 |
+| --- | --- | --- |
+| host→agent | `1` CMD | 命令文本，响应无 reqid |
+| agent→host | `0x80`~`0x87` | HELLO/LOG/COMPLETE/EVAL_OK/EVAL_ERR/RPC_OK/RPC_ERR/BYE |
+
+**v2**——主机端 rfclient 默认使用，由 agent 的 `HELLO` 载荷 `proto=2` 宣告：
+
+| 方向 | kind | 载荷 | 说明 |
+| --- | --- | --- | --- |
+| host→agent | `4` CMD_TAGGED | `4B LE reqid + 命令` | 响应回填同一 reqid |
+| host→agent | `5` PING | 空 | 链路保活探测，agent 回 PONG |
+| agent→host | `0x90`~`0x94` | `4B LE reqid + 载荷` | EVAL_OK/ERR、RPC_OK/ERR、COMPLETE |
+| server→host | `0x95` EVENT | TSV `detach\treason=…\tpid=…` | 结构化事件（会话结束原因） |
+| agent→host | `0x97` PONG | 空 | 保活应答 |
+
+要点：
+
+- **reqid 匹配**：`EVAL_OK` / `RPC_OK` 等同语义响应通过 reqid 与请求配对，超时后被
+  放弃的迟到响应会打印为 `[stale]` 并丢弃，不会污染下一条命令（修复 legacy 单槽缺陷）。
+  `reqid=0` 保留给 v1 语义，因此设备端 REPL/服务内部命令完全不受影响。
+- **心跳**：客户端空闲时每 15s 发 PING，连续 45s 无任何入站帧即判定链路半开并退出。
+- **协议协商**：agent 一律在 HELLO 里带 `proto=2`；客户端最多等 1.5s，超时或载荷不带
+  `proto=2` 时退回 v1 语义（兼容旧 agent / 旧 gadget）。
+- **认证**：`rustfrida --server --token <T>`（或 gadget 配置 `interaction.auth_token`）启用后，
+  除 `list` 外的引导请求必须携带 `token=<T>`；比对为恒定时间。客户端用 `--token`
+  或环境变量 `RFCLIENT_TOKEN` 提供。
 
 ## 说明
 
@@ -80,3 +123,7 @@ rf> shutdown   # TCP 安全断开，目标进程和 hook 保留
 - stdin 关闭时客户端会继续接收日志，默认在连续 5 秒无新消息后断开；可用 `--linger <秒>` 调整，`--linger 0` 恢复立即断开
 - TCP 客户端断开不会自动 shutdown session，可使用 `use <sid>` 重新连接；TCP 的 `shutdown` 会安全 detach，目标进程和 hook 保留
 - 同一会话被多个客户端 `use` 会互相干扰（v1 未做互斥）
+- 协议 v2 的 reqid 匹配让每条命令的响应可独立归属，`[stale]` 行表示收到了已超时请求的
+  迟到响应（属正常保护行为，不是错误）；心跳超时（默认 45s 无响应）会以退出码 1 结束，
+  可用 `--linger 0` + 手动 `use` 重连规避长时间无输出的场景
+- `--token` 也可用环境变量 `RFCLIENT_TOKEN` 提供；`list` 无需认证，便于 `-U` 探测端点类型

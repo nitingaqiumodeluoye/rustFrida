@@ -85,6 +85,9 @@ struct ListenInteraction {
     address: String,
     port: u16,
     on_load: LoadBehavior,
+    /// 可选认证令牌。设置后，除 list 外的引导请求必须携带 `token=<值>`，
+    /// 与 `rustfrida --server --token` 语义一致（同一个 rfclient 可直连两种端）。
+    auth_token: Option<String>,
 }
 
 impl Default for ListenInteraction {
@@ -97,8 +100,21 @@ impl Default for ListenInteraction {
             // sidecar config is not discoverable during the constructor. The
             // no-config path must return from dlopen so the injector can finish.
             on_load: LoadBehavior::Resume,
+            auth_token: None,
         }
     }
+}
+
+/// 恒定时间字节比较，避免 token 比较的时序侧信道。
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -157,10 +173,11 @@ pub extern "C" fn rsfrida_gadget_load() {
         let worker_gate = gate.clone();
         let address = config.interaction.address;
         let port = config.interaction.port;
+        let auth_token = config.interaction.auth_token;
         let result = std::thread::Builder::new()
             .name("karina".to_string())
             .spawn(move || {
-                if let Err(error) = run_listener(&address, port, worker_gate.clone()) {
+                if let Err(error) = run_listener(&address, port, worker_gate.clone(), auth_token) {
                     eprintln!("[karina] listener failed: {}", error);
                     worker_gate.release();
                 }
@@ -176,15 +193,18 @@ pub extern "C" fn rsfrida_gadget_load() {
     });
 }
 
-fn run_listener(address: &str, port: u16, gate: Arc<LoadGate>) -> Result<(), String> {
+fn run_listener(address: &str, port: u16, gate: Arc<LoadGate>, auth_token: Option<String>) -> Result<(), String> {
     let listener = TcpListener::bind((address, port)).map_err(|e| format!("bind {}:{}: {}", address, port, e))?;
     eprintln!("[karina] listening on {}:{}", address, port);
+    if auth_token.is_some() {
+        eprintln!("[karina] token 认证已启用");
+    }
 
     for incoming in listener.incoming() {
         match incoming {
             Ok(stream) => {
                 let _ = stream.set_nodelay(true);
-                if let Err(error) = handle_client(stream, &gate) {
+                if let Err(error) = handle_client(stream, &gate, auth_token.as_deref()) {
                     eprintln!("[karina] client error: {}", error);
                 }
             }
@@ -202,7 +222,7 @@ extern "C" fn release_load_gate(context: *mut c_void) {
     gate.release();
 }
 
-fn handle_client(mut stream: TcpStream, gate: &LoadGate) -> Result<(), String> {
+fn handle_client(mut stream: TcpStream, gate: &LoadGate, auth_token: Option<&str>) -> Result<(), String> {
     let line = read_bootstrap_line(&mut stream)?;
     let parts: Vec<&str> = line.split_whitespace().collect();
     let command = parts.first().copied().unwrap_or("");
@@ -215,6 +235,19 @@ fn handle_client(mut stream: TcpStream, gate: &LoadGate) -> Result<(), String> {
         )
         .map_err(|e| format!("write list: {}", e))?;
         return Ok(());
+    }
+
+    // 与 rustfrida --server --token 一致的认证语义：除 list 外均需 token=<值>。
+    if let Some(expected) = auth_token {
+        let supplied = parts
+            .iter()
+            .find_map(|p| p.strip_prefix("token="))
+            .unwrap_or("");
+        if !constant_time_eq(supplied.as_bytes(), expected.as_bytes()) {
+            writeln!(stream, "ERR 认证失败：token 无效或缺失")
+                .map_err(|e| format!("write auth error: {}", e))?;
+            return Ok(());
+        }
     }
 
     if !matches!(command, "gadget" | "attach" | "use") {
