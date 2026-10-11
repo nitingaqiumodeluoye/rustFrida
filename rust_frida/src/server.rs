@@ -88,6 +88,7 @@ const SERVER_CMDS: &[(&str, &str, &str)] = &[
     ("attach", "<pid|name> [-l script.js]", "按 PID 或进程名注入"),
     ("list", "", "列出所有 session"),
     ("sessions", "", "列出所有 session（同 list）"),
+    ("ps", "[filter]", "枚举设备进程（可给名字片段过滤）"),
     ("use", "<id>", "进入指定 session 的交互模式"),
     ("detach", "<id>", "断开指定 session"),
     ("detachall", "", "断开所有 session"),
@@ -372,10 +373,13 @@ fn shutdown_session(session: &Session) {
 ///
 /// 引导协议（文本行，\n 结尾）：
 ///   list                          → 每行 `id\tpid\tlabel\tstatus`，空行结束
-///   attach <pid|name> [-l script] → `OK sid=<id> pid=<pid>` / `ERR <msg>`
+///   ps [filter]                   → 每行 `pid\tname`，空行结束（枚举可注入进程）
+///   attach <pid|name> [-l script] → `OK sid=<id> pid=<pid> proto=<n>` / `ERR <msg>`
 ///   spawn <package> [-l script]   → 同上
-///   use <session_id>              → `OK sid=<id> pid=<pid>` / `ERR <msg>`
+///   use <session_id>              → `OK sid=<id> pid=<pid> proto=<n>` / `ERR <msg>`
 ///   exit                          → 关闭连接
+///
+/// 除 list 外的请求在启用 `--token` 时必须携带 `token=<值>`（ps 会暴露设备进程列表，同样受限）。
 pub(crate) fn run_tcp_server(
     mgr: Arc<SessionManager>,
     bind_addr: &str,
@@ -592,6 +596,19 @@ fn handle_tcp_client(
                     Ok(())
                 }
             }
+        }
+        // ps [filter] —— 枚举设备上可注入的进程，免得每次都去 adb shell ps。
+        // 输出格式与 list 一致（多行 + 空行结束），主机端复用行读取路径。
+        "ps" | "list-procs" | "enumerate_processes" => {
+            let filter = parts.get(1).copied();
+            let procs = crate::process::list_processes(filter);
+            let mut out = String::new();
+            for (pid, name) in &procs {
+                out.push_str(&format!("{}\t{}\n", pid, name));
+            }
+            out.push('\n');
+            write_all(&write_stream, out.as_bytes())?;
+            Ok(())
         }
         "use" => {
             if parts.len() < 2 {
@@ -1257,6 +1274,20 @@ pub(crate) fn run_server(args: &Args) {
                         // ── list / sessions ──
                         "list" | "sessions" => {
                             print_sessions(&mgr);
+                        }
+
+                        // ── ps [filter] ──
+                        "ps" => {
+                            let filter = parts.get(1).copied();
+                            let procs = crate::process::list_processes(filter);
+                            if procs.is_empty() {
+                                log_warn!("无匹配进程");
+                            } else {
+                                println!("{BOLD}{CYAN}  PID     NAME{RESET}");
+                            }
+                            for (pid, name) in &procs {
+                                println!("  {:<7} {}", pid, name);
+                            }
                         }
 
                         // ── use <id> ──

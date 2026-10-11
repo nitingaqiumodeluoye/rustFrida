@@ -29,7 +29,15 @@ pub(crate) struct RelayState {
     pub(crate) closer: Option<TcpStream>,
     pub(crate) pending: VecDeque<PendingRelayFrame>,
     pub(crate) pending_bytes: usize,
+    /// 是否采集日志/事件积压。
+    ///
+    /// 与「当前是否有 TCP 客户端」解耦：bootstrap 阶段置位，之后即使客户端
+    /// 断开也保持为 true，使无客户端期间的 LOG/EVENT 帧进入有界积压，
+    /// 客户端用 `use <sid>` 重连时按原顺序补发（对应 frida 的
+    /// AgentMessageTransmitter 持久化投递）。仅在 session 终止时清除。
     pub(crate) queue_enabled: bool,
+    /// 因超出上限而被丢弃的帧数（用于重连时告知丢失量）。
+    pub(crate) dropped_frames: u64,
 }
 
 /// 单个注入会话：一个目标进程对应一个 Session
@@ -96,28 +104,43 @@ impl Session {
                 pending: VecDeque::new(),
                 pending_bytes: 0,
                 queue_enabled: false,
+                dropped_frames: 0,
             }),
         }
     }
 
     /// 在 TCP bootstrap 开始时启用有界帧缓存。完成 bootstrap 后，通信层
     /// 会一次性安装 writer 并按接收顺序排空缓存。
+    ///
+    /// 此函数启用后 `queue_enabled` 不再因客户端断开而关闭（见 clear_relay /
+    /// detach_tcp_relay 的区分），以便 `use <sid>` 重连丢弃少日志。
     pub(crate) fn prepare_relay(&self) {
         let mut relay = self.relay.lock().unwrap_or_else(|e| e.into_inner());
         relay.writer = None;
         relay.closer = None;
         relay.pending.clear();
         relay.pending_bytes = 0;
+        relay.dropped_frames = 0;
         relay.queue_enabled = true;
     }
 
-    /// 关闭 TCP 中继并释放 bootstrap 缓存。本地 REPL 会话不受影响。
+    /// 客户端断开：释放 writer，但保留日志积压采集，便于重连补发。
+    /// 与 clear_relay 的区别：不丢弃已积压的帧，也不关闭采集开关。
+    pub(crate) fn detach_tcp_relay(&self) {
+        let mut relay = self.relay.lock().unwrap_or_else(|e| e.into_inner());
+        relay.writer = None;
+        relay.closer = None;
+    }
+
+    /// 关闭 TCP 中继并释放积压。仅在 session 终止（agent 断开/注入失败）时调用；
+    /// 本地 REPL 会话不受影响。
     pub(crate) fn clear_relay(&self) {
         let mut relay = self.relay.lock().unwrap_or_else(|e| e.into_inner());
         relay.writer = None;
         relay.closer = None;
         relay.pending.clear();
         relay.pending_bytes = 0;
+        relay.dropped_frames = 0;
         relay.queue_enabled = false;
     }
 

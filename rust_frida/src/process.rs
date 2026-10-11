@@ -811,12 +811,59 @@ pub(crate) fn any_thread_pc_in_range(pid: u32, start: u64, end: u64) -> Result<b
     Ok(false)
 }
 
+/// /proc/<pid>/cmdline 的首字段（可执行路径），取不到时返回 None。
+fn read_proc_name(pid: i32) -> Option<String> {
+    let data = std::fs::read(format!("/proc/{}/cmdline", pid)).ok()?;
+    let raw = data.split(|&b| b == 0).next()?;
+    if raw.is_empty() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(raw).into_owned())
+}
+
+/// 枚举 /proc 下所有进程的 (pid, cmdline[0])，按 pid 升序。
+/// `filter` 非空时对命令名做**大小写不敏感的子串**过滤（给主机端 `ps` 用）。
+pub(crate) fn list_processes(filter: Option<&str>) -> Vec<(i32, String)> {
+    let mut result = Vec::new();
+    let Ok(proc_dir) = std::fs::read_dir("/proc") else {
+        return result;
+    };
+
+    let needle = filter.map(|f| f.to_ascii_lowercase()).filter(|f| !f.is_empty());
+    for entry in proc_dir.flatten() {
+        let fname = entry.file_name();
+        let fname_str = fname.to_string_lossy();
+        if !fname_str.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let Ok(pid) = fname_str.parse::<i32>() else {
+            continue;
+        };
+        let Some(name) = read_proc_name(pid) else {
+            continue;
+        };
+        if let Some(ref needle) = needle {
+            if !name.to_ascii_lowercase().contains(needle.as_str()) {
+                continue;
+            }
+        }
+        result.push((pid, name));
+    }
+    result.sort_by_key(|(pid, _)| *pid);
+    result
+}
+
 /// 通过读 /proc/*/cmdline 按进程名查找 PID。
-/// 精确匹配（含末路径组件）；多匹配列出并返回错误。
+///
+/// 匹配顺序：先找精确匹配（完整 cmdline[0] 或末路径组件），找不到再退化为
+/// **大小写不敏感的子串**匹配（对应 frida `attach <名字片段>` 的习惯用法）。
+/// 多匹配时列出候选并返回错误，避免误注入。
 pub(crate) fn find_pid_by_name(name: &str) -> Result<i32, String> {
     use std::fs;
 
-    let mut matches: Vec<i32> = Vec::new();
+    let mut exact: Vec<i32> = Vec::new();
+    let mut partial: Vec<i32> = Vec::new();
+    let needle = name.to_ascii_lowercase();
     let proc_dir = fs::read_dir("/proc").map_err(|e| format!("读取 /proc 失败: {}", e))?;
 
     for entry in proc_dir.flatten() {
@@ -829,19 +876,18 @@ pub(crate) fn find_pid_by_name(name: &str) -> Result<i32, String> {
             Ok(n) => n,
             Err(_) => continue,
         };
-        let cmdline_path = format!("/proc/{}/cmdline", pid);
-        if let Ok(data) = fs::read(&cmdline_path) {
-            let proc_name = data
-                .split(|&b| b == 0)
-                .next()
-                .and_then(|s| std::str::from_utf8(s).ok())
-                .unwrap_or("");
-            let base_name = proc_name.rsplit('/').next().unwrap_or(proc_name);
-            if proc_name == name || base_name == name {
-                matches.push(pid);
-            }
+        let Some(proc_name) = read_proc_name(pid) else {
+            continue;
+        };
+        let base_name = proc_name.rsplit('/').next().unwrap_or(proc_name.as_str());
+        if proc_name == name || base_name == name {
+            exact.push(pid);
+        } else if proc_name.to_ascii_lowercase().contains(needle.as_str()) {
+            partial.push(pid);
         }
     }
+
+    let matches = if exact.is_empty() { partial } else { exact };
 
     match matches.len() {
         0 => Err(format!("未找到进程名匹配 '{}'", name)),
@@ -849,17 +895,7 @@ pub(crate) fn find_pid_by_name(name: &str) -> Result<i32, String> {
         _ => {
             log_warn!("找到多个匹配进程，请使用 --pid 指定:");
             for pid in &matches {
-                let cmdline_path = format!("/proc/{}/cmdline", pid);
-                let display = if let Ok(data) = std::fs::read(&cmdline_path) {
-                    data.split(|&b| b == 0)
-                        .filter(|s| !s.is_empty())
-                        .take(2)
-                        .flat_map(|s| std::str::from_utf8(s))
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                } else {
-                    "?".to_string()
-                };
+                let display = read_proc_name(*pid).unwrap_or_else(|| "?".to_string());
                 println!("  PID {:6}: {}", pid, display);
             }
             Err(format!("找到 {} 个匹配进程，请使用 --pid <n> 精确指定", matches.len()))

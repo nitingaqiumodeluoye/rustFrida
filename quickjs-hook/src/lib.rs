@@ -65,6 +65,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 const JS_TOP_LEVEL_EXECUTION_TIMEOUT_MS: u64 = 6_500;
+/// hook / java hook **回调**的单次执行上限。
+///
+/// 回调走 `JS_Call` 而不经过顶层 eval 的 deadline 防护，脚本里一个
+/// `while (true) {}` 会把宿主线程永久挂死（`console.log` 也不再有机会执行，
+/// `jsclean` 同样拿不到引擎锁，只能杀进程）。这里用与顶层执行相同的预算：
+/// 超过它就中断并抛异常，而不是无限挂死。
+const JS_HOOK_CALLBACK_TIMEOUT_MS: u64 = JS_TOP_LEVEL_EXECUTION_TIMEOUT_MS;
 
 static QBDI_OUTPUT_DIR: OnceLock<String> = OnceLock::new();
 static QBDI_HELPER_BLOB: Mutex<Option<Vec<u8>>> = Mutex::new(None);
@@ -191,16 +198,36 @@ struct JsExecutionDeadlineGuard {
 }
 
 impl JsExecutionDeadlineGuard {
+    /// 设置本次 JS 执行的截止时间（毫秒）。
+    ///
+    /// 嵌套时取**更早**的截止，而不是直接覆盖：
+    /// - 已有外层截止时，内层不会把它延后（否则内层会削弱外层的保护）；
+    /// - `timeout_ms == 0`（不限制）时保留外层截止，不会把保护关掉。
     fn begin(timeout_ms: u64) -> Self {
         let previous_deadline_ms = JS_EXECUTION_DEADLINE_MS.load(Ordering::Acquire);
         let deadline_ms = if timeout_ms == 0 {
-            0
+            previous_deadline_ms
         } else {
-            monotonic_ms().saturating_add(timeout_ms)
+            let requested = monotonic_ms().saturating_add(timeout_ms);
+            if previous_deadline_ms == 0 {
+                requested
+            } else {
+                requested.min(previous_deadline_ms)
+            }
         };
         JS_EXECUTION_DEADLINE_MS.store(deadline_ms, Ordering::Release);
         Self { previous_deadline_ms }
     }
+}
+
+/// 供回调路径使用：给当前 JS 调用套上执行截止时间。
+pub(crate) fn begin_js_execution_deadline(timeout_ms: u64) -> impl Drop {
+    JsExecutionDeadlineGuard::begin(timeout_ms)
+}
+
+/// hook / java hook 回调的执行上限（毫秒）。
+pub(crate) fn hook_callback_timeout_ms() -> u64 {
+    JS_HOOK_CALLBACK_TIMEOUT_MS
 }
 
 impl Drop for JsExecutionDeadlineGuard {

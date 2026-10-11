@@ -188,33 +188,44 @@ pub(crate) fn read_frame(reader: &mut dyn Read) -> std::io::Result<(u8, Vec<u8>)
     Ok((kind[0], payload))
 }
 
+/// 无 TCP 客户端时是否值得积压：只保留「主动产生」的日志与事件。
+///
+/// 响应帧（EVAL/RPC/COMPLETE，含 tagged 变体）属于某个已消失客户端的请求，
+/// 补发给新客户端只会变成 [stale] 噪声；HELLO/BYE 描述的是连接生命周期，
+/// 重连时也没意义。
+fn is_backloggable_frame(kind: u8) -> bool {
+    matches!(kind, FRAME_KIND_LOG | FRAME_KIND_EVENT)
+}
+
 /// Queue agent output while the TCP client is still waiting for its textual
 /// bootstrap response, then forward it through the single relay writer. This
 /// keeps text and binary traffic from interleaving on the same stream.
+///
+/// 无客户端时按 `queue_enabled` 做有界积压，重连后由 install_tcp_relay 补发。
 fn forward_agent_frame(session: &Session, kind: u8, payload: &[u8]) {
     let mut relay = session.relay.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(writer) = relay.writer.as_mut() {
         if let Err(e) = write_frame(writer, kind, payload) {
             log_info!("[#{}] TCP relay closed: {}", session.id, e);
+            // 写失败只摘掉 writer，保留积压采集：客户端重连后可继续收后续日志。
             relay.writer = None;
-            relay.pending.clear();
-            relay.pending_bytes = 0;
-            relay.queue_enabled = false;
+            relay.closer = None;
         }
         return;
     }
 
-    if !relay.queue_enabled {
+    if !relay.queue_enabled || !is_backloggable_frame(kind) {
         return;
     }
 
     let frame_bytes = payload.len().saturating_add(5);
     if frame_bytes > MAX_RELAY_BACKLOG_BYTES {
         log_warn!(
-            "[#{}] bootstrap relay frame too large ({} bytes), discarded",
+            "[#{}] relay frame too large ({} bytes), discarded",
             session.id,
             frame_bytes
         );
+        relay.dropped_frames = relay.dropped_frames.saturating_add(1);
         return;
     }
     while relay.pending_bytes.saturating_add(frame_bytes) > MAX_RELAY_BACKLOG_BYTES {
@@ -223,6 +234,7 @@ fn forward_agent_frame(session: &Session, kind: u8, payload: &[u8]) {
                 relay.pending_bytes = relay
                     .pending_bytes
                     .saturating_sub(frame.payload.len().saturating_add(5));
+                relay.dropped_frames = relay.dropped_frames.saturating_add(1);
             }
             None => break,
         }
@@ -240,7 +252,20 @@ fn install_tcp_relay(stream: &TcpStream, session: &Session) -> io::Result<()> {
     let mut relay = session.relay.lock().unwrap_or_else(|e| e.into_inner());
     relay.writer = Some(writer);
     relay.closer = Some(closer);
-    relay.queue_enabled = false;
+
+    // 重连补发：先告知积压量与丢弃量，再按原顺序补发，使主机端能把
+    // 「客户端不在时发生的事」与实时输出区分开。
+    let backlog_frames = relay.pending.len();
+    if backlog_frames > 0 || relay.dropped_frames > 0 {
+        let marker = format!(
+            "replay\tframes={}\tbytes={}\tdropped={}",
+            backlog_frames, relay.pending_bytes, relay.dropped_frames
+        );
+        if let Some(writer) = relay.writer.as_mut() {
+            let _ = write_frame(writer, FRAME_KIND_EVENT, marker.as_bytes());
+        }
+    }
+    relay.dropped_frames = 0;
 
     while let Some(frame) = relay.pending.pop_front() {
         relay.pending_bytes = relay
@@ -556,7 +581,8 @@ pub(crate) fn start_tcp_relay(
                     }
                 }
             }
-            session.clear_relay();
+            // 客户端断开：保留 session 与日志积压采集，`use <sid>` 重连时补发。
+            session.detach_tcp_relay();
             if let Some(cb) = on_disconnect {
                 cb();
             }

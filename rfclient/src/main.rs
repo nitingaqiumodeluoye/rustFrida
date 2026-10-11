@@ -85,6 +85,8 @@ struct Args {
 enum Cmd {
     /// 列出所有 session（输出 id/pid/label/status）
     List,
+    /// 枚举设备上可注入的进程（可给名字片段过滤）
+    Ps { filter: Option<String> },
     /// 注入已运行进程（PID 或进程名）
     Attach {
         target: String,
@@ -357,6 +359,24 @@ fn run_connected(args: &Args, host: &str) -> Result<i32, String> {
                 repl::print_line("(无会话)");
             } else {
                 repl::print_line("ID\tPID\tLABEL\tSTATUS");
+                for line in &lines {
+                    repl::print_line(line);
+                }
+            }
+            Ok(0)
+        }
+        Cmd::Ps { filter } => {
+            let line = match filter {
+                Some(f) if !f.is_empty() => format!("ps {}", f),
+                _ => "ps".to_string(),
+            };
+            let line = with_token(&line, args.token.as_deref());
+            send_bootstrap(&mut stream, &line, None)?;
+            let lines = read_response_lines(&mut stream)?;
+            if lines.is_empty() {
+                repl::print_line("(无匹配进程)");
+            } else {
+                repl::print_line("PID\tNAME");
                 for line in &lines {
                     repl::print_line(line);
                 }

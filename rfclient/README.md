@@ -36,9 +36,10 @@ adb forward tcp:15819 tcp:15819
 
 # 3. 主机端
 rfclient -H 127.0.0.1:15819 list                            # 列出会话
+rfclient -H 127.0.0.1:15819 ps com.example                  # 枚举设备进程（可省参数列全部）
 rfclient -H 127.0.0.1:15819 attach <pid>                   # 注入已运行进程
 rfclient -H 127.0.0.1:15819 spawn com.example.app -l s.js  # 从主机读取脚本并注入
-rfclient -H 127.0.0.1:15819 use 1                           # 复用会话
+rfclient -H 127.0.0.1:15819 use 1                           # 复用会话（重连会补发错过的日志）
 
 # Windows：脚本路径位于 Windows 主机，不需要推送到手机
 .\rfclient.exe -H 127.0.0.1:15819 spawn com.example.app -l .\register-natives-trace.js
@@ -73,8 +74,8 @@ rfclient -U --token s3cret -f com.example.app
 
 ### 引导（文本行）
 
-一行文本请求（`list` / `attach <pid|name>` / `spawn <pkg> [-l -]` / `use <sid>` / `gadget`），
-必要时附加 `token=<值>`（服务端以 `--token` 启动时）。
+一行文本请求（`list` / `ps [filter]` / `attach <pid|name>` / `spawn <pkg> [-l -]` / `use <sid>` / `gadget`），
+必要时附加 `token=<值>`（服务端以 `--token` 启动时；`list` 豁免）。
 `-l -` 后紧跟一个脚本帧，脚本帧由主机端读取并发送；响应 `OK ...` / `ERR ...`
 （`list` 多行 + 空行结束）。
 
@@ -99,6 +100,7 @@ rfclient -U --token s3cret -f com.example.app
 | agent→host | `0x90`~`0x94` | `4B LE reqid + 载荷` | EVAL_OK/ERR、RPC_OK/ERR、COMPLETE |
 | server→host | `0x95` EVENT | TSV `detach\treason=…\tpid=…` | 结构化事件（会话结束原因） |
 | agent→host | `0x97` PONG | 空 | 保活应答 |
+| server→host | `0x95` EVENT | TSV `replay\tframes=N\tbytes=M\tdropped=K` | 重连补发提示 |
 
 要点：
 
@@ -111,6 +113,9 @@ rfclient -U --token s3cret -f com.example.app
 - **认证**：`rustfrida --server --token <T>`（或 gadget 配置 `interaction.auth_token`）启用后，
   除 `list` 外的引导请求必须携带 `token=<T>`；比对为恒定时间。客户端用 `--token`
   或环境变量 `RFCLIENT_TOKEN` 提供。
+- **断线补投**：客户端断开后 session 仍持有有界积压（上限 4 MB，超限丢最老的帧并计数），
+  只缓存 LOG/EVENT（属于已消失客户端的响应帧不补发）。`use <sid>` 重连时先收到
+  `[event] replay frames=… dropped=…`，再按原顺序补发错过的日志，随后转入实时输出。
 
 ## 说明
 
@@ -119,6 +124,8 @@ rfclient -U --token s3cret -f com.example.app
 - `-U` 使用 `adb devices` 选择 online 设备，再自动执行临时 `adb -s <serial> forward`；客户端退出后清理该转发
 - `-U` 默认连接设备端 TCP `15819`，可用 `--device-port` 指定其他 `rustfrida --listen` 端口
 - `-U -f <包名>` 会优先使用 `rustfrida-server`；没有 server 时自动启动内置 Gadget 的应用并连接
+- `attach <名字>` 先精确匹配，再退化为大小写不敏感的子串匹配；多匹配会列出候选并要求用 PID 精确指定
+- `ps [filter]` 枚举设备进程（输出 `PID\tNAME`），免去手工 `adb shell ps | grep`
 - 已运行的 Gadget 也可用 `-U Gadget -l <脚本>` 直接连接，通常只用于诊断
 - stdin 关闭时客户端会继续接收日志，默认在连续 5 秒无新消息后断开；可用 `--linger <秒>` 调整，`--linger 0` 恢复立即断开
 - TCP 客户端断开不会自动 shutdown session，可使用 `use <sid>` 重新连接；TCP 的 `shutdown` 会安全 detach，目标进程和 hook 保留

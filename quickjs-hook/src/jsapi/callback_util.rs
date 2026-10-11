@@ -665,6 +665,10 @@ pub(crate) unsafe fn invoke_hook_callback_common_with_env(
     // 避免 SuspendThreadByPeer 超时 → SIGABRT）。
     let prev_env = ART_CHECKPOINT_ENV.swap(jni_env as usize, std::sync::atomic::Ordering::Release);
 
+    // 回调执行上限：没有这个 guard 时 `js_execution_deadline_expired()` 恒为 false，
+    // 脚本里的死循环会把宿主（可能是 app 主线程）永久挂死。嵌套时 guard 取更早的截止。
+    let _deadline_guard = crate::begin_js_execution_deadline(crate::hook_callback_timeout_ms());
+
     let global = ffi::JS_GetGlobalObject(ctx);
     let result = ffi::JS_Call(ctx, callback_dup, global, 1, &js_ctx as *const _ as *mut _);
 
