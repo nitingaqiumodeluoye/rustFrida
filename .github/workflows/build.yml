@@ -210,3 +210,61 @@ jobs:
           path: dist/*
           if-no-files-found: error
           retention-days: 30
+
+  # rfclient 是跑在主机上的控制客户端，Windows 使用者需要一个原生 .exe。
+  # 单独开 job 而不是在 Linux 里交叉编译：msvc 目标必须用 MSVC 工具链，
+  # Linux 上做不到；windows-latest 的 standard runner 对公共仓库免费。
+  #
+  # 这里不需要初始化子模块（只有 quickjs-hook 用得上），也不需要 NDK：
+  # rfclient 只依赖 clap + rustyline，全程无 bindgen / cc，仓库 .cargo/config.toml
+  # 里那堆 Android 交叉工具对它不生效（显式 --target 会覆盖 [build].target）。
+  rfclient-windows:
+    name: rfclient (Windows x86_64)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-x86_64
+
+      - name: Build rfclient (Windows x86_64)
+        # +crt-static：把 MSVC 运行库静态链进 exe，产物不依赖「VC++ 可再发行
+        # 组件包」，拷到任意 Windows x64 上可直接运行。
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: cargo build -p rfclient --release --locked --target x86_64-pc-windows-msvc
+
+      - name: Verify and collect
+        shell: pwsh
+        run: |
+          $exe = "target/x86_64-pc-windows-msvc/release/rfclient.exe"
+          if (-not (Test-Path $exe)) { throw "构建产物不存在: $exe" }
+
+          # 冒烟测试：架构不对或运行库缺失时这里会失败，
+          # 避免只凭「文件存在」就判定成功。
+          & $exe --help | Select-Object -First 3
+          if ($LASTEXITCODE -ne 0) { throw "rfclient.exe --help 退出码 $LASTEXITCODE" }
+
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item $exe dist/rfclient.exe
+          Get-Item dist/rfclient.exe | Format-List Name, Length
+          "$((Get-FileHash dist/rfclient.exe -Algorithm SHA256).Hash.ToLower())  rfclient.exe" |
+            Set-Content -Encoding ascii dist/SHA256SUMS.txt
+          Get-Content dist/SHA256SUMS.txt
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: rfclient-windows-x86_64-${{ github.sha }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30

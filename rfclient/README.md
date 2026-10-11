@@ -5,22 +5,37 @@ TCP 控制服务器，像本地 REPL 一样注入、执行脚本、调用 RPC。
 
 ## 构建
 
-> `rfclient` 是主机端二进制，已随 CI 流水线一起构建，直接取产物即可：
-> `out/ci-<run-id>/rfclient`。构建方法见 [`../doc/build.md`](../doc/build.md)。
+> `rfclient` 是主机端二进制，已随 CI 流水线一起构建。**Windows 用 `rfclient.exe`，
+> Linux 用 `rfclient`（两者同名 artifact，拿对应平台那个）**：
+> - `rfclient-windows-x86_64-<sha>/rfclient.exe`
+> - `rustfrida-aarch64-<sha>/rfclient`
 
 ```bash
 REPO=nitingaqiumodeluoye/rustFrida
 gh run watch <run-id> --repo "$REPO" --exit-status
+
+# Linux 主机（与设备端产物同一个 artifact）
 gh run download <run-id> --repo "$REPO" -D out/ci-<run-id>
 chmod +x out/ci-<run-id>/rfclient
+
+# Windows 主机
+gh run download <run-id> --repo "$REPO" -n rfclient-windows-x86_64-<sha> -D out/win
 ```
+
+Windows 产物用 `x86_64-pc-windows-msvc` + `+crt-static` 构建，MSVC 运行库已静态链入，
+**不需要安装 VC++ 可再发行组件包**，拷到任意 Windows x64 上直接跑。
 
 仅在需要本地复现 CI 失败时才手动编（仓库 `.cargo/config.toml` 默认 target 是
 `aarch64-linux-android`，必须显式指定宿主三元组）：
 
 ```bash
+# Linux
 cargo build -p rfclient --release --locked --target x86_64-unknown-linux-gnu
 # 产物: target/x86_64-unknown-linux-gnu/release/rfclient
+
+# Windows（在 Windows 上执行）
+cargo build -p rfclient --release --locked --target x86_64-pc-windows-msvc
+# 产物: target/x86_64-pc-windows-msvc/release/rfclient.exe
 ```
 
 ## 使用
