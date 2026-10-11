@@ -14,6 +14,7 @@
 //!   rfclient -U Gadget -l script.js
 //!   rfclient -U -l script.js              # 连接已唤醒的 Gadget
 
+mod channel;
 mod proto;
 mod repl;
 

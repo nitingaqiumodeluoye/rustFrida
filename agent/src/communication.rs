@@ -171,6 +171,31 @@ pub(crate) fn send_bye() {
     let _ = write_frame(stream, FRAME_KIND_BYE, &[]);
 }
 
+/// 写一个 `4B LE channel_id + body` 的帧（open_channel 用）。
+///
+/// 用**阻塞**锁（不是 `write_stream` 的 try_lock）：通道数据丢一个字节就全错了，
+/// 宁可让 TCP 背压传导回主机。
+pub(crate) fn write_channel_frame(kind: u8, channel_id: u32, body: &[u8]) {
+    let mut stream = GLOBAL_STREAM.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(stream) = stream.as_mut() else { return };
+    let mut payload = Vec::with_capacity(4 + body.len());
+    payload.extend_from_slice(&channel_id.to_le_bytes());
+    payload.extend_from_slice(body);
+    let _ = write_frame(stream, kind, &payload);
+}
+
+/// 写 `CHANNEL_OPENED`：`4B LE channel_id + 1B status + 可选消息`。
+pub(crate) fn write_channel_opened(channel_id: u32, status: u8, message: &str) {
+    let mut stream = GLOBAL_STREAM.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(stream) = stream.as_mut() else { return };
+    let bytes = message.as_bytes();
+    let mut payload = Vec::with_capacity(5 + bytes.len());
+    payload.extend_from_slice(&channel_id.to_le_bytes());
+    payload.push(status);
+    payload.extend_from_slice(bytes);
+    let _ = write_frame(stream, crate::channel::FRAME_KIND_CHANNEL_OPENED, &payload);
+}
+
 /// Write-half of the agent↔host socket, protected by Mutex to serialize messages.
 /// 控制消息 (HELLO/COMPLETE/EVAL_OK/EVAL_ERR) 直接走此 stream。
 pub static GLOBAL_STREAM: Mutex<Option<UnixStream>> = Mutex::new(None);

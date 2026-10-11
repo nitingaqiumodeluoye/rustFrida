@@ -89,6 +89,7 @@ const SERVER_CMDS: &[(&str, &str, &str)] = &[
     ("list", "", "列出所有 session"),
     ("sessions", "", "列出所有 session（同 list）"),
     ("ps", "[filter]", "枚举设备进程（可给名字片段过滤）"),
+    ("capture", "<on|off|status>", "捕获目标进程 stdout/stderr 到本连接"),
     ("use", "<id>", "进入指定 session 的交互模式"),
     ("detach", "<id>", "断开指定 session"),
     ("detachall", "", "断开所有 session"),
@@ -596,6 +597,31 @@ fn handle_tcp_client(
                     Ok(())
                 }
             }
+        }
+        // capture on|off|status —— 目标进程 stdout/stderr 捕获开关。
+        // 由 agent 实现（pipe + dup2），输出以 LOG 帧回传，与 console.log 同流。
+        "capture" => {
+            if !session.connected.load(Ordering::Acquire) {
+                return write_all(&write_stream, b"capture: 当前没有已连接的 session（先 attach/spawn/use）\n");
+            }
+            let arg = parts.get(1).copied().unwrap_or("status").to_string();
+            let sender = match session.get_sender() {
+                Some(s) => s,
+                None => return write_all(&write_stream, b"capture: session 未连接\n"),
+            };
+            // 复用 legacy EVAL_OK 通道：设备端本地 REPL 与内部命令走同一路径。
+            let replied = session
+                .eval_state
+                .clear_then_recv(std::time::Duration::from_secs(TCP_INJECT_WAIT_TIMEOUT_SECS), || {
+                    let _ = send_command(&sender, format!("capture {}", arg));
+                });
+            let text = match replied {
+                Some(Ok(t)) => t,
+                Some(Err(e)) => format!("capture failed: {}", e),
+                None => "capture: agent 未在超时内响应".to_string(),
+            };
+            write_all(&write_stream, text.as_bytes())?;
+            write_all(&write_stream, b"\n")
         }
         // ps [filter] —— 枚举设备上可注入的进程，免得每次都去 adb shell ps。
         // 输出格式与 list 一致（多行 + 空行结束），主机端复用行读取路径。

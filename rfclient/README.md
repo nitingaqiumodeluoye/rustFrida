@@ -58,9 +58,30 @@ rf> jseval '"hello" + 1'
 rf> loadjs script.js
 rf> rpccall myMethod '[1,2]'
 rf> hfl libnative.so 0x1234
+rf> jslist          # 列出已加载脚本（id / 名称 / 持有 hook 数）
+rf> jsdrop 2        # 卸载 #2 脚本注册的全部 hook（含日志归属前缀）
+rf> capture on      # 捕获目标进程 stdout/stderr 到本连接（输出带 [out] 前缀）
+rf> forward 8080    # 本机 127.0.0.1:8080 -> 目标进程内 127.0.0.1:8080
+rf> forward 9222 127.0.0.1:9222   # 访问 app 内嵌调试端口，无需 adb forward
+rf> forwards        # 查看进行中的转发
+rf> unforward 8080
 rf> exit       # 仅断开主机客户端，session 保留
 rf> shutdown   # TCP 安全断开，目标进程和 hook 保留
 ```
+
+### 多脚本与日志归属
+
+`loadjs` 每次都会登记一个单调递增的脚本 id，求值期间与 hook 回调期间的
+`console.log` 输出会带 `[script#N 文件名]` 前缀，多脚本同时运行时输出可归属。
+`jsdrop <id>` 卸载该脚本注册的全部 native/Java hook 并释放回调。
+
+语义边界：这是**单 JS 上下文**（非隔离沙箱），`jsdrop` 不清理脚本写入全局对象的
+属性。需要干净环境时用 `jsclean` 重建引擎。
+
+### 端口转发（open_channel）
+
+`forward` 的 connect 发生在**目标进程的网络命名空间**里，因此能直接访问 app 自身的
+本地服务（内嵌 HTTP 调试端口等）。需要 agent 与 server 均为本次协议版本。
 
 带认证的设备端启动（并连接）：
 
@@ -101,6 +122,10 @@ rfclient -U --token s3cret -f com.example.app
 | server→host | `0x95` EVENT | TSV `detach\treason=…\tpid=…` | 结构化事件（会话结束原因） |
 | agent→host | `0x97` PONG | 空 | 保活应答 |
 | server→host | `0x95` EVENT | TSV `replay\tframes=N\tbytes=M\tdropped=K` | 重连补发提示 |
+| host→agent | `6` CHANNEL_OPEN | `4B LE channel_id + 地址` | 请 agent 在目标进程内 connect |
+| 双向 | `0x98` CHANNEL_DATA | `4B LE channel_id + 原始字节` | 通道数据 |
+| 双向 | `0x99` CHANNEL_CLOSE | `4B LE channel_id` | 关闭通道 |
+| agent→host | `0x9A` CHANNEL_OPENED | `4B LE channel_id + 1B status + 消息` | 连接结果（0=成功） |
 
 要点：
 
@@ -116,6 +141,12 @@ rfclient -U --token s3cret -f com.example.app
 - **断线补投**：客户端断开后 session 仍持有有界积压（上限 4 MB，超限丢最老的帧并计数），
   只缓存 LOG/EVENT（属于已消失客户端的响应帧不补发）。`use <sid>` 重连时先收到
   `[event] replay frames=… dropped=…`，再按原顺序补发错过的日志，随后转入实时输出。
+
+- **多脚本归属**：`loadjs` 登记递增脚本 id，日志前缀 `[script#N 名称]`；`jslist`/`jsdrop` 管理。
+- **stdout/stderr 捕获**：agent 在目标进程里 `pipe`+`dup2` fd 1/2，输出以 LOG 帧回流（前缀 `[out]`）。
+  没人在读时管道会写满，所以捕获期间必须保持主机连接。
+- **open_channel**：`forward` 在本机监听并让 agent 在目标进程里 connect，帧在控制连接上多路复用。
+  通道中继线程在 agent 卸载前会被 `shutdown_all()` 收尾（否则会执行已 unmap 的代码）。
 
 ## 说明
 

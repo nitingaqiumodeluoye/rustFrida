@@ -24,6 +24,9 @@ pub mod safepoint;
 mod trace;
 mod vma_name;
 
+mod channel;
+mod output_capture;
+
 #[cfg(feature = "frida-gum")]
 mod memory_dump;
 #[cfg(feature = "quickjs")]
@@ -227,6 +230,10 @@ pub extern "C" fn hello_entry(args_ptr: *mut c_void) -> *mut c_void {
                     set_current_reqid(reqid);
                     process_cmd(&cmd);
                     set_current_reqid(0);
+                } else if channel::is_channel_frame(kind) {
+                    // open_channel：OPEN/DATA/CLOSE。OPEN 只占位并起后台线程连接，
+                    // 不在主循环里同步 connect（否则会卡住心跳与命令处理）。
+                    channel::handle_frame(kind, &payload);
                 } else if is_qbdi_helper_frame(kind) {
                     #[cfg(feature = "quickjs")]
                     quickjs_loader::install_qbdi_helper(payload);
@@ -245,7 +252,11 @@ pub extern "C" fn hello_entry(args_ptr: *mut c_void) -> *mut c_void {
             }
         }
     }
-    if SHOULD_EXIT.load(Ordering::Relaxed) {
+        // 通道中继线程与输出捕获线程都必须先停：它们都在执行 agent 代码，
+    // 而 agent 卸载会 unmap 这些代码。两处停止都是幂等的。
+    channel::shutdown_all();
+    let _ = output_capture::stop();
+if SHOULD_EXIT.load(Ordering::Relaxed) {
         log_msg_sync("收到 shutdown，开始退出清理\n".to_string());
     } else if SHOULD_DETACH.load(Ordering::Relaxed) {
         log_msg_sync("收到 detach，跳过目标进程内清理，准备关闭 socket\n".to_string());
@@ -733,6 +744,11 @@ fn process_cmd(command: &str) {
             Ok(_) => send_eval_ok("java_initialized"),
             Err(e) => send_eval_err(&e),
         }),
+        // capture <on|off|status> — 目标进程 stdout/stderr 捕获
+        Some("capture") => {
+            let arg = command.strip_prefix("capture").unwrap_or("").trim().to_string();
+            send_eval_ok(&output_capture::command(&arg));
+        }
         // jslist — 列出已登记脚本（id / 名称 / 持有的 hook 数）
         #[cfg(feature = "quickjs")]
         Some("jslist") => dispatch_js_task(|| {

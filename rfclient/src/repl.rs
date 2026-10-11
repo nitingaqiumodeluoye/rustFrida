@@ -26,6 +26,7 @@ use rustyline::hint::Hinter;
 use rustyline::validate::Validator;
 use rustyline::{Context, Editor, Helper};
 
+use crate::channel::Channels;
 use crate::proto::*;
 
 const EVAL_TIMEOUT_SECS: u64 = 30;
@@ -53,6 +54,16 @@ const COMMANDS: &[(&str, &str, &str)] = &[
     ("trace", "[tid]", "ptrace 指令追踪"),
     ("stalker", "[tid]", "Frida Stalker 追踪"),
     ("jhook", "", "Java/JNI hooking"),
+    ("capture", "<on|off|status>", "捕获目标进程 stdout/stderr"),
+    (
+        "forward",
+        "<local_port> [host:port]",
+        "把本机端口转发到目标进程内的服务（open_channel）",
+    ),
+    ("unforward", "<local_port>", "停止某个本地端口转发"),
+    ("forwards", "", "列出进行中的端口转发"),
+    ("jslist", "", "列出已加载脚本（id/名称/hook 数）"),
+    ("jsdrop", "<id>", "卸载某脚本注册的全部 hook"),
     ("help", "", "显示帮助"),
     ("exit", "", "断开客户端，保留 session（quit 同效）"),
     ("shutdown", "", "安全断开 TCP session，保留目标和 hook"),
@@ -198,8 +209,12 @@ pub fn run(stream: &mut TcpStream, eof_linger: Duration, proto_hint: Option<u32>
     let hello_seen = Arc::new(AtomicBool::new(false));
     let last_activity = Arc::new(AtomicU64::new(now_millis()));
 
+    // 本地端口转发（open_channel）：与接收线程共享通道表。
+    let channels = Arc::new(Channels::new(writer.clone()));
+
     let recv_ctx = RecvContext {
         registry: registry.clone(),
+        channels: channels.clone(),
         activity_tx,
         disconnected: disconnected.clone(),
         proto_v2: proto_v2.clone(),
@@ -287,6 +302,37 @@ pub fn run(stream: &mut TcpStream, eof_linger: Duration, proto_hint: Option<u32>
                 }
                 if line == "help" {
                     print_help();
+                    continue;
+                }
+                if let Some(rest) = line.strip_prefix("forward ") {
+                    let mut parts = rest.split_whitespace();
+                    let port_arg = parts.next().unwrap_or("");
+                    let remote = parts.next().unwrap_or("");
+                    match port_arg.parse::<u16>() {
+                        Ok(port) if port != 0 => {
+                            let remote = if remote.is_empty() {
+                                port.to_string()
+                            } else {
+                                remote.to_string()
+                            };
+                            match channels.forward(port, &remote) {
+                                Ok(msg) => print_line(&format!("[forward] {}", msg)),
+                                Err(e) => print_line(&format!("[forward] {}", e)),
+                            }
+                        }
+                        _ => print_line("[forward] 用法: forward <local_port> [host:port]（省略 host 视为 127.0.0.1）"),
+                    }
+                    continue;
+                }
+                if let Some(rest) = line.strip_prefix("unforward ") {
+                    match rest.trim().parse::<u16>() {
+                        Ok(port) => print_line(&format!("[forward] {}", channels.unforward(port))),
+                        Err(_) => print_line("[forward] 用法: unforward <local_port>"),
+                    }
+                    continue;
+                }
+                if line == "forwards" {
+                    print_line(&channels.list());
                     continue;
                 }
                 if line == "jsrepl" {
@@ -382,6 +428,8 @@ pub fn run(stream: &mut TcpStream, eof_linger: Duration, proto_hint: Option<u32>
         }
     }
     let _ = rl.save_history(".rfclient_history");
+    // 断连/退出前停掉本地监听与通道（否则监听线程会继续 accept 并向死连接写帧）。
+    channels.shutdown_all();
     Ok(())
 }
 
@@ -487,6 +535,12 @@ fn is_known_command(cmd: &str) -> bool {
             | "recomp-release"
             | "recomp-dry"
             | "recomp-list"
+            | "capture"
+            | "forward"
+            | "unforward"
+            | "forwards"
+            | "jslist"
+            | "jsdrop"
             | "detach"
             | "shutdown"
     )
@@ -512,6 +566,7 @@ fn wait_for_log_idle(activity_rx: &Receiver<()>, disconnected: &AtomicBool, idle
 
 struct RecvContext {
     registry: Arc<Registry>,
+    channels: Arc<Channels>,
     activity_tx: SyncSender<()>,
     disconnected: Arc<AtomicBool>,
     proto_v2: Arc<AtomicBool>,
@@ -554,6 +609,24 @@ fn receiver_loop(mut reader: TcpStream, ctx: RecvContext) {
                     }
                     // PONG 只用于保活，不打印（last_activity 已刷新）
                     FRAME_KIND_PONG => {}
+                    // open_channel：按 channel id 路由到本地转发通道。
+                    FRAME_KIND_CHANNEL_OPENED => {
+                        if let Some((id, body)) = split_channel_payload(&payload) {
+                            let status = body.first().copied().unwrap_or(1);
+                            let message = String::from_utf8_lossy(body.get(1..).unwrap_or(&[])).into_owned();
+                            ctx.channels.on_opened(id, status, &message);
+                        }
+                    }
+                    FRAME_KIND_CHANNEL_DATA => {
+                        if let Some((id, body)) = split_channel_payload(&payload) {
+                            ctx.channels.on_data(id, body);
+                        }
+                    }
+                    FRAME_KIND_CHANNEL_CLOSE => {
+                        if let Some((id, _)) = split_channel_payload(&payload) {
+                            ctx.channels.on_close(id);
+                        }
+                    }
                     FRAME_KIND_EVAL_OK_TAGGED
                     | FRAME_KIND_EVAL_ERR_TAGGED
                     | FRAME_KIND_RPC_OK_TAGGED
@@ -623,6 +696,7 @@ fn receiver_loop(mut reader: TcpStream, ctx: RecvContext) {
                     }
                     FRAME_KIND_BYE => {
                         print_line("[agent] 已断开 (BYE)");
+                        ctx.channels.shutdown_all();
                         ctx.disconnected.store(true, Ordering::Release);
                         break;
                     }
@@ -633,6 +707,7 @@ fn receiver_loop(mut reader: TcpStream, ctx: RecvContext) {
             }
             Err(e) => {
                 print_line(&format!("[agent] 连接断开: {}", e));
+                ctx.channels.shutdown_all();
                 ctx.disconnected.store(true, Ordering::Release);
                 let _ = ctx.activity_tx.try_send(());
                 break;

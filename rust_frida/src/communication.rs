@@ -43,6 +43,16 @@ const FRAME_KIND_RPC_ERR_TAGGED: u8 = 0x93;
 const FRAME_KIND_COMPLETE_TAGGED: u8 = 0x94;
 /// server→主机客户端的结构化事件帧（detach 原因等），与文本 LOG 分离。
 pub(crate) const FRAME_KIND_EVENT: u8 = 0x95;
+
+// ── open_channel（主机 ↔ agent 的 TCP 中继，见 agent/src/channel.rs） ──
+/// host→agent：`4B LE channel_id + 地址`（id=0 表示请 agent 分配）。
+pub(crate) const FRAME_KIND_CHANNEL_OPEN: u8 = 6;
+/// 双向：`4B LE channel_id + 原始字节`。
+pub(crate) const FRAME_KIND_CHANNEL_DATA: u8 = 0x98;
+/// 双向：`4B LE channel_id [+ 原因]`。
+pub(crate) const FRAME_KIND_CHANNEL_CLOSE: u8 = 0x99;
+/// agent→host：`4B LE channel_id + 1B status + 可选消息`。
+pub(crate) const FRAME_KIND_CHANNEL_OPENED: u8 = 0x9A;
 /// agent→主机客户端的链路保活应答。
 const FRAME_KIND_PONG: u8 = 0x97;
 
@@ -397,7 +407,11 @@ fn handle_socket_connection(stream: UnixStream, session: Arc<Session>) {
                     | FRAME_KIND_RPC_OK_TAGGED
                     | FRAME_KIND_RPC_ERR_TAGGED
                     | FRAME_KIND_COMPLETE_TAGGED
-                    | FRAME_KIND_PONG => {
+                    | FRAME_KIND_PONG
+                    // open_channel：agent→host 的通道帧原样透传，由客户端按 channel id 分发。
+                    | FRAME_KIND_CHANNEL_OPENED
+                    | FRAME_KIND_CHANNEL_DATA
+                    | FRAME_KIND_CHANNEL_CLOSE => {
                         forward_agent_frame(&session, kind, &payload);
                     }
                     FRAME_KIND_EVAL_OK => {
@@ -556,7 +570,12 @@ pub(crate) fn start_tcp_relay(
                         }
                         // 协议 v2：带 reqid 的命令与链路保活探测，原样转发给 agent，
                         // agent 响应经 handle_socket_connection 的 tagged 分支回到本客户端。
-                        FRAME_KIND_CMD_TAGGED | FRAME_KIND_PING => {
+                        // 协议 v2 命令/保活 + open_channel 通道帧（服务器一律不解析，原样转发）。
+                        FRAME_KIND_CMD_TAGGED
+                        | FRAME_KIND_PING
+                        | FRAME_KIND_CHANNEL_OPEN
+                        | FRAME_KIND_CHANNEL_DATA
+                        | FRAME_KIND_CHANNEL_CLOSE => {
                             if let Some(sender) = session.get_sender() {
                                 if let Err(e) = send_raw_frame(sender, kind, payload) {
                                     log_error!("[#{}] 转发 v2 帧失败: {}", session.id, e);

@@ -720,8 +720,7 @@ pub fn execute_jslist() -> String {
     let mut out = String::new();
     for (id, name, native, java, bytes) in scripts {
         out.push_str(&format!(
-            "script#{} {}	native={} java={} bytes={}
-",
+            "script#{} {}\tnative={} java={} bytes={}\n",
             id, name, native, java, bytes
         ));
     }

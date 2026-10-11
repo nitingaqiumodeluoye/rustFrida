@@ -51,6 +51,16 @@ pub const FRAME_KIND_EVENT: u8 = 0x95;
 /// 链路保活应答帧。
 pub const FRAME_KIND_PONG: u8 = 0x97;
 
+// ── open_channel（本地端口转发，见 rfclient/src/channel.rs） ──
+/// host→agent：`4B LE channel_id + 地址`（id=0 表示请 agent 分配）。
+pub const FRAME_KIND_CHANNEL_OPEN: u8 = 6;
+/// 双向：`4B LE channel_id + 原始字节`。
+pub const FRAME_KIND_CHANNEL_DATA: u8 = 0x98;
+/// 双向：`4B LE channel_id`。
+pub const FRAME_KIND_CHANNEL_CLOSE: u8 = 0x99;
+/// agent→host：`4B LE channel_id + 1B status + 可选消息`。
+pub const FRAME_KIND_CHANNEL_OPENED: u8 = 0x9A;
+
 const MAX_FRAME_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 
 pub fn write_frame(stream: &mut dyn Write, kind: u8, payload: &[u8]) -> std::io::Result<()> {
@@ -102,6 +112,36 @@ pub fn read_frame(reader: &mut dyn Read) -> std::io::Result<(u8, Vec<u8>)> {
     let mut payload = vec![0u8; len];
     reader.read_exact(&mut payload)?;
     Ok((kind[0], payload))
+}
+
+/// 拆 channel 帧载荷为 (channel_id, body)。
+pub fn split_channel_payload(payload: &[u8]) -> Option<(u32, &[u8])> {
+    if payload.len() < 4 {
+        return None;
+    }
+    let id = u32::from_le_bytes(payload[..4].try_into().unwrap());
+    Some((id, &payload[4..]))
+}
+
+/// 请求 agent 在目标进程内 connect 到 `address`，并带上本地分配的 channel id。
+pub fn write_channel_open(stream: &mut dyn Write, channel_id: u32, address: &str) -> std::io::Result<()> {
+    let mut payload = Vec::with_capacity(4 + address.len());
+    payload.extend_from_slice(&channel_id.to_le_bytes());
+    payload.extend_from_slice(address.as_bytes());
+    write_frame(stream, FRAME_KIND_CHANNEL_OPEN, &payload)
+}
+
+/// 往通道里写一段字节。
+pub fn write_channel_data(stream: &mut dyn Write, channel_id: u32, body: &[u8]) -> std::io::Result<()> {
+    let mut payload = Vec::with_capacity(4 + body.len());
+    payload.extend_from_slice(&channel_id.to_le_bytes());
+    payload.extend_from_slice(body);
+    write_frame(stream, FRAME_KIND_CHANNEL_DATA, &payload)
+}
+
+/// 关闭通道。
+pub fn write_channel_close(stream: &mut dyn Write, channel_id: u32) -> std::io::Result<()> {
+    write_frame(stream, FRAME_KIND_CHANNEL_CLOSE, &channel_id.to_le_bytes())
 }
 
 /// 拆 tagged 响应载荷为 (reqid, payload)。
