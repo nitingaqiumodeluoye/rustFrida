@@ -81,7 +81,45 @@ adb forward tcp:15819 tcp:15819
   那需要先把 GUI 的状态改成「一个连接一个面板」，属于下一版的事。
 - **结构化数据视图**。agent 目前没有 JS `send()`/`on('message')`，
   拿不到结构化的表格数据，所以脚本/进程表都只能靠解析文本应答。
+- **内嵌中文字体**。内嵌一份完整 CJK 字体 10~20 MB，exe 体积翻几倍；
+  而做子集也不可行：日志面板要显示 agent 回传的**任意**中文，字符集编译期
+  根本不知道。所以改为探测系统字体（见「中文字体」一节）。
 - **打包成单文件**。两个 exe 各自独立，没有安装器。
+
+## 中文字体
+
+界面文案与 agent 日志都是中文，而 eframe 自带字体（Ubuntu-Light / Hack）**不含汉字**。
+程序启动时会按平台探测系统中文字体并注册为兜底字体：
+
+| 平台 | 优先级 |
+| --- | --- |
+| Windows | 微软雅黑 → 等线 → 黑体 → 宋体 → 微软正黑 |
+| Linux | Noto Sans CJK → 文泉驿正黑/微米黑 |
+| macOS | 苹方 → Hiragino Sans GB → Arial Unicode |
+
+如果都没找到（精简版系统、Docker 里的 Linux），界面中的中文会显示为方块——
+此时程序会在日志区给出提示，用环境变量指定任意中文字体即可：
+
+```powershell
+$env:RFCLIENT_GUI_FONT = "C:\path\to\any-cjk-font.ttf"; .\rfclient-gui.exe
+```
+
+```bash
+RFCLIENT_GUI_FONT=/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc ./rfclient-gui
+```
+
+两个实现上的约束（见 `src/fonts.rs`）：
+
+- **交给 egui 前先校验 sfnt 容器头**（`00 01 00 00` / `true` / `ttcf` / `OTTO`）。
+  epaint 对无法解析的字体数据是直接 **panic**，垃圾字节会让程序启动即崩；
+  宁可退化成方块也不能崩。
+- **追加到字体族末尾而不是插到最前**：拉丁字母继续用 egui 自带字体，
+  只有它们没有的字形才回落。雅黑/Noto 的拉丁字形偏宽，换掉会让排版变松。
+
+字体覆盖会在首帧用 `has_glyphs` 实测（不能更早：`Context::fonts` 在第一次
+`run` 之前会 panic）：“找得到文件” 不等于 “这个字体里真有汉字”。这条检查
+也写成了单元测试，CI 里会打印实际选中的字体与覆盖结果；runner 未装中文字体时
+自动跳过并**明确打出跳过原因**，不会伪装成“验过了”。
 
 ## 实现上几个刻意的选择
 
@@ -104,5 +142,6 @@ adb forward tcp:15819 tcp:15819
 src/main.rs   eframe 启动参数（窗口尺寸、glow 后端）
 src/app.rs    界面布局与交互，把点击翻译成 Client 调用
 src/conn.rs   连接/查询/事件排空/在途命令（不依赖 egui，只靠 Wake 回调）
+src/fonts.rs  中文字体探测、魔数校验与覆盖检查
 src/logbuf.rs 日志环形缓冲与来源着色
 ```
