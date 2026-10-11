@@ -486,6 +486,9 @@ pub(crate) fn commands() -> &'static [(&'static str, &'static str, &'static str)
             ("jsclean", "", "清理 QuickJS 引擎"),
             ("jsrepl", "", "进入 JS REPL 模式（Tab 动态补全）"),
             ("%reload", "[path]", "重载脚本（jsclean+jsinit+loadjs，不退出）"),
+            ("jslist", "", "列出已加载脚本（id/名称/hook 数）"),
+            ("jsdrop", "<id>", "卸载某脚本注册的全部 hook"),
+            ("capture", "<on|off|status>", "捕获目标进程 stdout/stderr 到控制连接"),
             ("help", "", "显示此帮助信息"),
             ("exit", "", "退出程序（quit 同效）"),
         ];
