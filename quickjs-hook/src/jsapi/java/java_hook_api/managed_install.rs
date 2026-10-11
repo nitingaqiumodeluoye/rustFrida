@@ -1291,6 +1291,7 @@ unsafe fn install_managed_method_helper(
                 native_entry_hook_target: 0,
                 native_entry_trampoline: 0,
                 native_entry_critical: false,
+                owner_script: crate::script_registry::current_script(),
             },
         );
     });
@@ -1411,6 +1412,7 @@ unsafe fn install_count_orig_fast_path(
                 native_entry_hook_target: 0,
                 native_entry_trampoline: 0,
                 native_entry_critical: false,
+                owner_script: crate::script_registry::current_script(),
             },
         );
     });

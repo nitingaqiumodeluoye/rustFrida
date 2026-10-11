@@ -5,7 +5,7 @@ mod cmodule;
 mod functions;
 #[cfg(feature = "qbdi")]
 mod qbdi;
-mod registry;
+pub(crate) mod registry;
 
 use crate::context::JSContext;
 use crate::ffi;
@@ -13,6 +13,22 @@ use crate::jsapi::callback_util::set_js_u64_property;
 use crate::jsapi::util::add_cfunction_to_object;
 
 use callback::{in_flight_native_hook_callbacks, wait_for_in_flight_native_hook_callbacks};
+
+/// 解析某个 hook target 的归属脚本 id（0 = 无归属）。
+///
+/// native hook 以 target 地址为键，Java hook 以 art_method 地址为键，
+/// 两套注册表的键空间不重叠（art_method 在 Java 堆/镜像里），
+/// 因此按顺序查两个表即可，无需调用方区分类型。
+pub(crate) fn resolve_owner_script(target_id: u64) -> u64 {
+    if target_id == 0 {
+        return 0;
+    }
+    let owner = registry::owner_script_of(target_id);
+    if owner != 0 {
+        return owner;
+    }
+    crate::jsapi::java::callback::registry::owner_script_of(target_id)
+}
 use functions::{
     js_attach_native, js_call_native, js_diag_alloc_near, js_hook, js_hook_native, js_interceptor_attach,
     js_interceptor_detach_all, js_interceptor_flush, js_interceptor_replace, js_native_call, js_recomp_hook, js_unhook,

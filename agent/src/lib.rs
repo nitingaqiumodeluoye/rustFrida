@@ -329,12 +329,20 @@ fn parse_loadjs_payload(payload: &str) -> (&str, &str) {
 /// 传空字符串时退化为 `<eval>`。
 #[cfg(feature = "quickjs")]
 fn eval_and_respond(script: &str, filename: &str, empty_err: &[u8]) {
+    eval_and_respond_attributed(script, filename, empty_err, false)
+}
+
+/// `attribute=true` 时按「已加载脚本」登记（日志带 `[script#N name]` 前缀，
+/// 可被 `jsdrop` 卸载）；`jseval` 等临时表达式走 false，行为与旧版一致。
+fn eval_and_respond_attributed(script: &str, filename: &str, empty_err: &[u8], attribute: bool) {
     if script.is_empty() {
         send_eval_err(std::str::from_utf8(empty_err).unwrap_or("[quickjs] empty script"));
     } else if !quickjs_loader::is_initialized() {
         send_eval_err("[quickjs] JS 引擎未初始化，请先执行 jsinit");
     } else {
-        let result = if filename.is_empty() {
+        let result = if attribute {
+            quickjs_loader::execute_script_attributed(script, filename)
+        } else if filename.is_empty() {
             quickjs_loader::execute_script(script)
         } else {
             quickjs_loader::execute_script_with_filename(script, filename)
@@ -349,11 +357,27 @@ fn eval_and_respond(script: &str, filename: &str, empty_err: &[u8]) {
 
 #[cfg(feature = "quickjs")]
 fn eval_on_java_worker_and_respond(script: String, filename: String, init_engine: bool, empty_err: &[u8]) {
+    eval_on_java_worker_and_respond_attributed(script, filename, init_engine, empty_err, false)
+}
+
+/// 同 `eval_on_java_worker_and_respond`，`attribute=true` 时按已加载脚本登记。
+fn eval_on_java_worker_and_respond_attributed(
+    script: String,
+    filename: String,
+    init_engine: bool,
+    empty_err: &[u8],
+    attribute: bool,
+) {
     if script.is_empty() {
         send_eval_err(std::str::from_utf8(empty_err).unwrap_or("[quickjs] empty script"));
         return;
     }
-    match quickjs_loader::eval_on_java_worker(script, filename, init_engine) {
+    let result = if attribute {
+        quickjs_loader::eval_on_java_worker_attributed(script, filename, init_engine)
+    } else {
+        quickjs_loader::eval_on_java_worker(script, filename, init_engine)
+    };
+    match result {
         Ok(result) => send_eval_ok(&result),
         Err(e) => send_eval_err(&e),
     }
@@ -404,9 +428,9 @@ fn init_js_and_respond() {
 #[cfg(feature = "quickjs")]
 fn init_eval_and_respond(script: &str, filename: &str) {
     match quickjs_loader::init() {
-        Ok(_) => eval_and_respond(script, filename, b"[quickjs] Error: empty script"),
+        Ok(_) => eval_and_respond_attributed(script, filename, b"[quickjs] Error: empty script", true),
         Err(ref e) if e.contains("已初始化") => {
-            eval_and_respond(script, filename, b"[quickjs] Error: empty script")
+            eval_and_respond_attributed(script, filename, b"[quickjs] Error: empty script", true)
         }
         Err(e) => send_eval_err(&e),
     }
@@ -659,11 +683,12 @@ fn process_cmd(command: &str) {
                 .or_else(|| command.strip_prefix("java_loadjs_init"))
                 .unwrap_or("");
             let (filename, script) = parse_loadjs_payload(rest);
-            eval_on_java_worker_and_respond(
+            eval_on_java_worker_and_respond_attributed(
                 script.to_string(),
                 filename.to_string(),
                 true,
                 b"[quickjs] Error: empty script",
+                true,
             );
         }
         #[cfg(feature = "quickjs")]
@@ -674,11 +699,12 @@ fn process_cmd(command: &str) {
                 .or_else(|| command.strip_prefix("java_loadjs"))
                 .unwrap_or("");
             let (filename, script) = parse_loadjs_payload(rest);
-            eval_on_java_worker_and_respond(
+            eval_on_java_worker_and_respond_attributed(
                 script.to_string(),
                 filename.to_string(),
                 true,
                 b"[quickjs] Error: empty script",
+                true,
             );
         }
         #[cfg(feature = "quickjs")]
@@ -707,6 +733,33 @@ fn process_cmd(command: &str) {
             Ok(_) => send_eval_ok("java_initialized"),
             Err(e) => send_eval_err(&e),
         }),
+        // jslist — 列出已登记脚本（id / 名称 / 持有的 hook 数）
+        #[cfg(feature = "quickjs")]
+        Some("jslist") => dispatch_js_task(|| {
+            if !quickjs_loader::is_initialized() {
+                send_eval_err("JS 引擎未初始化，请先执行 jsinit");
+            } else {
+                send_eval_ok(&quickjs_loader::execute_jslist());
+            }
+        }),
+        // jsdrop <id> — 卸载脚本注册的全部 hook 并注销登记项
+        #[cfg(feature = "quickjs")]
+        Some("jsdrop") => {
+            let arg = command.strip_prefix("jsdrop").unwrap_or("").trim().to_string();
+            dispatch_js_task(move || {
+                let id = match arg.strip_prefix('#').unwrap_or(&arg).parse::<u64>() {
+                    Ok(v) if v != 0 => v,
+                    _ => {
+                        send_eval_err("jsdrop: 用法 jsdrop <script_id>（id 见 jslist）");
+                        return;
+                    }
+                };
+                match quickjs_loader::execute_jsdrop(id) {
+                    Ok(msg) => send_eval_ok(&msg),
+                    Err(e) => send_eval_err(&e),
+                }
+            });
+        }
         #[cfg(feature = "quickjs")]
         Some("loadjs") => {
             // 支持两种格式:
@@ -724,9 +777,17 @@ fn process_cmd(command: &str) {
             let filename = filename.to_string();
             let script = script.to_string();
             if quickjs_loader::is_java_worker_started() {
-                eval_on_java_worker_and_respond(script, filename, true, b"[quickjs] Error: empty script");
+                eval_on_java_worker_and_respond_attributed(
+                    script,
+                    filename,
+                    true,
+                    b"[quickjs] Error: empty script",
+                    true,
+                );
             } else {
-                dispatch_js_task(move || eval_and_respond(&script, &filename, b"[quickjs] Error: empty script"));
+                dispatch_js_task(move || {
+                    eval_and_respond_attributed(&script, &filename, b"[quickjs] Error: empty script", true)
+                });
             }
         }
         #[cfg(feature = "quickjs")]

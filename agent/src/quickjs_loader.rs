@@ -74,6 +74,9 @@ enum JavaWorkerTask {
         script: String,
         filename: String,
         init_engine: bool,
+        /// true = 作为「已加载脚本」登记并归属日志（loadjs 系列）；
+        /// false = 临时表达式（jseval），不登记、日志无归属前缀。
+        attribute: bool,
         reply: mpsc::Sender<Result<String, String>>,
     },
     ReadyProbe,
@@ -303,7 +306,10 @@ pub fn init() -> Result<(), String> {
 
     // 先设置 console callback，确保引擎初始化期间的日志（如 [jniIds]）能通过 socket 输出
     set_console_callback(|msg| {
-        write_stream(format!("[JS] {}", msg).as_bytes());
+        // 脚本归属前缀：`loadjs` 求值期间与 hook 回调期间由引擎侧标注，
+        // 多脚本场景下据此区分输出来源（无归属时为空）。
+        let prefix = quickjs_hook::script_log_prefix();
+        write_stream(format!("[JS] {}{}", prefix, msg).as_bytes());
     });
 
     // 初始化 JS 引擎（complete_script 依赖它）
@@ -326,6 +332,7 @@ unsafe extern "C" fn java_worker_native_loop(
             script,
             filename,
             init_engine,
+            attribute,
             reply,
         } => {
             java_worker_verbose(format!(
@@ -334,7 +341,7 @@ unsafe extern "C" fn java_worker_native_loop(
                 filename,
                 init_engine
             ));
-            let result = run_eval_task(&script, &filename, init_engine);
+            let result = run_eval_task(&script, &filename, init_engine, attribute);
             JAVA_WORKER_EVAL_IN_FLIGHT.store(false, Ordering::Release);
             java_worker_verbose(format!(
                 "[java worker] eval completed: file={} ok={}",
@@ -377,7 +384,7 @@ unsafe extern "C" fn java_worker_native_loop(
     }
 }
 
-fn run_eval_task(script: &str, filename: &str, init_engine: bool) -> Result<String, String> {
+fn run_eval_task(script: &str, filename: &str, init_engine: bool, attribute: bool) -> Result<String, String> {
     if init_engine {
         match init() {
             Ok(()) => {}
@@ -387,7 +394,9 @@ fn run_eval_task(script: &str, filename: &str, init_engine: bool) -> Result<Stri
         arm_java_ready_monitor();
     }
 
-    if filename.is_empty() {
+    if attribute {
+        execute_script_attributed(script, filename)
+    } else if filename.is_empty() {
         execute_script(script)
     } else {
         execute_script_with_filename(script, filename)
@@ -481,7 +490,10 @@ pub fn start_java_worker() -> Result<(), String> {
     }
     init_hook_runtime()?;
     set_console_callback(|msg| {
-        write_stream(format!("[JS] {}", msg).as_bytes());
+        // 脚本归属前缀：`loadjs` 求值期间与 hook 回调期间由引擎侧标注，
+        // 多脚本场景下据此区分输出来源（无归属时为空）。
+        let prefix = quickjs_hook::script_log_prefix();
+        write_stream(format!("[JS] {}{}", prefix, msg).as_bytes());
     });
     // The lifecycle lock guarantees that no other start/stop path can publish
     // an eval while a genuinely new worker is being initialized.
@@ -606,6 +618,7 @@ fn eval_on_java_worker_inner(
         script,
         filename,
         init_engine,
+        attribute,
         reply: tx,
     });
     let timeout_ms = if init_engine {
@@ -626,7 +639,16 @@ fn eval_on_java_worker_inner(
 }
 
 pub fn eval_on_java_worker(script: String, filename: String, init_engine: bool) -> Result<String, String> {
-    eval_on_java_worker_inner(script, filename, init_engine, 0)
+    eval_on_java_worker_inner(script, filename, init_engine, false, 0)
+}
+
+/// 同 `eval_on_java_worker`，但作为「已加载脚本」登记并归属日志。
+pub fn eval_on_java_worker_attributed(
+    script: String,
+    filename: String,
+    init_engine: bool,
+) -> Result<String, String> {
+    eval_on_java_worker_inner(script, filename, init_engine, true, 0)
 }
 
 pub fn eval_on_java_worker_wait(
@@ -635,7 +657,17 @@ pub fn eval_on_java_worker_wait(
     init_engine: bool,
     queue_wait_timeout_ms: u64,
 ) -> Result<String, String> {
-    eval_on_java_worker_inner(script, filename, init_engine, queue_wait_timeout_ms)
+    eval_on_java_worker_inner(script, filename, init_engine, false, queue_wait_timeout_ms)
+}
+
+/// 同 `eval_on_java_worker_wait`，但作为「已加载脚本」登记并归属日志。
+pub fn eval_on_java_worker_wait_attributed(
+    script: String,
+    filename: String,
+    init_engine: bool,
+    queue_wait_timeout_ms: u64,
+) -> Result<String, String> {
+    eval_on_java_worker_inner(script, filename, init_engine, true, queue_wait_timeout_ms)
 }
 
 pub fn install_qbdi_helper(blob: Vec<u8>) {
@@ -658,6 +690,56 @@ pub fn execute_script_with_filename(script: &str, filename: &str) -> Result<Stri
     }
 
     load_script_with_filename(script, filename)
+}
+
+/// 作为「已加载脚本」求值：先登记脚本 id，再在该脚本归属作用域内执行。
+///
+/// 求值期间（含 hook 回调，由引擎侧标注）的 console 输出会带上
+/// `[script#N name]` 前缀；该 id 可用于 `jsdrop` 卸载脚本注册的 hook。
+pub fn execute_script_attributed(script: &str, filename: &str) -> Result<String, String> {
+    if !ENGINE_INITIALIZED.load(Ordering::SeqCst) {
+        return Err("JS 引擎未初始化，请先执行 jsinit".to_string());
+    }
+    let name = if filename.trim().is_empty() { "<eval>" } else { filename.trim() };
+    let script_id = quickjs_hook::script_register(name, script.len());
+    let _scope = quickjs_hook::script_scope(script_id);
+    if filename.is_empty() {
+        quickjs_hook::load_script(script)
+    } else {
+        quickjs_hook::load_script_with_filename(script, filename)
+    }
+}
+
+/// 列出已登记脚本；每行 `id	名称	native=N java=M bytes=K`。
+pub fn execute_jslist() -> String {
+    let scripts = quickjs_hook::script_list();
+    if scripts.is_empty() {
+        return "no scripts loaded".to_string();
+    }
+    let mut out = String::new();
+    for (id, name, native, java, bytes) in scripts {
+        out.push_str(&format!(
+            "script#{} {}	native={} java={} bytes={}
+",
+            id, name, native, java, bytes
+        ));
+    }
+    out
+}
+
+/// 卸载某个脚本注册的全部 hook 并注销其登记项。
+///
+/// 语义边界（单 JS 上下文，非沙箱）：只卸载 hook + 释放回调；
+/// 脚本写入全局对象的属性不会被清理。
+pub fn execute_jsdrop(id: u64) -> Result<String, String> {
+    if !ENGINE_INITIALIZED.load(Ordering::SeqCst) {
+        return Err("JS 引擎未初始化，请先执行 jsinit".to_string());
+    }
+    let (native, java) = quickjs_hook::script_drop(id)?;
+    Ok(format!(
+        "drop script#{} ok: native_hooks={} java_hooks={}",
+        id, native, java
+    ))
 }
 
 /// Get tab-completion candidates for the given prefix from the live JS engine.

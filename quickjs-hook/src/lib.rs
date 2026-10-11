@@ -33,6 +33,7 @@ pub mod jsapi;
 mod raw_thread;
 pub mod recomp;
 pub mod runtime;
+mod script_registry;
 pub mod value;
 
 pub use completion::complete_script;
@@ -59,6 +60,7 @@ pub use jsapi::java::start_java_worker_thread;
 pub use jsapi::java::{cut_java_hooks, drain_thunk_in_flight, free_java_hooks};
 pub use jsapi::memory::cleanup_wxshadow_patches;
 pub use runtime::JSRuntime;
+pub use script_registry::script_log_prefix;
 pub use value::JSValue;
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -564,4 +566,82 @@ pub fn cleanup_engine() {
     if let Ok(mut engine) = JS_ENGINE.lock() {
         *engine = None;
     }
+}
+
+// ────────────────────────── 脚本级生命周期 ──────────────────────────
+
+/// 登记一个新脚本，返回其 id。id 单调递增，0 保留为「无归属」。
+pub fn script_register(name: &str, source_len: usize) -> u64 {
+    script_registry::register_script(name, source_len)
+}
+
+/// 进入某个脚本的归属作用域（求值期间与 hook 回调期间使用）。
+pub fn script_scope(id: u64) -> impl Drop {
+    script_registry::enter_script(id)
+}
+
+/// 列出已登记脚本：`(id, 名称, native hook 数, java hook 数, 源字节数)`。
+pub fn script_list() -> Vec<(u64, String, usize, usize, usize)> {
+    script_registry::list_scripts()
+        .into_iter()
+        .map(|record| {
+            let native = jsapi::hook_api::registry::count_hooks_owned_by(record.id);
+            let java = jsapi::java::callback::registry::count_java_hooks_owned_by(record.id);
+            (record.id, record.name, native, java, record.source_len)
+        })
+        .collect()
+}
+
+/// 卸载某个脚本：移除其注册的全部 hook（native + java）并释放回调。
+///
+/// 与 `dispatch_rpc` 一致，这里自行获取全局 JS 引擎锁并**持锁到大功告成**：
+/// 释放回调要访问 JSContext，且必须与任何求值互斥。若其它线程正持有引擎锁
+/// （如 hook 回调中），这里会等待它结束（回调有 6.5s deadline 兜底）。
+///
+/// 注意：不清理该脚本写入全局对象的属性（单上下文共享），
+/// 因此无法重新加载同名脚本后得到干净环境。
+#[allow(unsafe_code)]
+pub fn script_drop(id: u64) -> Result<(usize, usize), String> {
+    if id == 0 {
+        return Err("script_drop: 无效脚本 id 0".to_string());
+    }
+    if script_registry::script_name(id).is_none() {
+        return Err(format!("script_drop: 脚本 #{} 不存在（已卸载？）", id));
+    }
+
+    let engine_guard = JS_ENGINE.lock().map_err(|_| "script_drop: JS 引擎锁中毒".to_string())?;
+    if engine_guard.is_none() {
+        return Err("script_drop: JS 引擎未初始化".to_string());
+    }
+
+    // native hooks：抹掉 hook 字节 + 释放 JS 回调
+    let native_hooks = jsapi::hook_api::registry::take_hooks_owned_by(id);
+    let native_count = native_hooks.len();
+    for (addr, data) in &native_hooks {
+        unsafe {
+            jsapi::hook_api::remove_single_hook(*addr, data);
+            jsapi::hook_api::free_hook_callback(data);
+        }
+    }
+
+    // java hooks：移除 native trampoline + 释放资源
+    let java_hooks = jsapi::java::callback::registry::take_java_hooks_owned_by(id);
+    let java_count = java_hooks.len();
+    if !java_hooks.is_empty() {
+        let env_opt = if is_raw_clone_js_thread() {
+            None
+        } else {
+            jsapi::java::get_thread_env().ok()
+        };
+        for data in &java_hooks {
+            unsafe {
+                jsapi::java::remove_native_trampoline(data);
+                jsapi::java::free_java_hook_resources(data, env_opt);
+            }
+        }
+    }
+
+    script_registry::forget_script(id);
+    drop(engine_guard);
+    Ok((native_count, java_count))
 }

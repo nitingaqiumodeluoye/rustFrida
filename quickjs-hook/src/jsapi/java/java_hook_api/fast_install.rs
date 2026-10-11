@@ -128,6 +128,7 @@ pub(in crate::jsapi::java) unsafe fn install_fast_hook_with_env(
                 native_entry_hook_target: 0,
                 native_entry_trampoline: 0,
                 native_entry_critical: false,
+                owner_script: crate::script_registry::current_script(),
             },
         );
     });

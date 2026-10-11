@@ -486,6 +486,8 @@ pub(crate) unsafe extern "C" fn attach_on_enter_wrapper(
     };
 
     let ctx = ctx_usize as *mut ffi::JSContext;
+    // 日志归属：onEnter 里的 console 输出归到这个 hook 的注册脚本。
+    let _script_scope = crate::script_scope(super::resolve_owner_script(target_addr));
     // mutation:true → 修改型 hook（onEnter 会改入参）: 自旋预算 300ms，绝不丢；
     // 默认观察型: 预算 10ms，耗尽即丢（透传原函数）。deferred 重放机制已退役。
     let mutation = hook_mutation;
@@ -575,6 +577,8 @@ pub(crate) unsafe extern "C" fn attach_on_leave_wrapper(
     }
 
     let ctx = ctx_usize as *mut ffi::JSContext;
+    // 日志归属：onLeave 同理。
+    let _script_scope = crate::script_scope(super::resolve_owner_script(target_addr));
     let _js_guard = match acquire_js_engine_for_callback(ctx, "interceptor.onLeave", target_addr, if hook_mutation2 { 150 } else { 5 }) {
         Some(g) => g,
         None => {

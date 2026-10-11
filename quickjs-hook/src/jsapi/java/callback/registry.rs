@@ -112,6 +112,9 @@ pub(super) struct JavaHookData {
     /// true when the native entry uses @CriticalNative ABI:
     /// x0+ are Java primitive args directly, no JNIEnv*/jclass receiver.
     pub(super) native_entry_critical: bool,
+    /// 创建该 hook 的脚本 id（0 = 非脚本来源）。
+    /// 用于日志归属（回调里的 console 输出）与 `jsdrop <id>` 按脚本卸载。
+    pub(super) owner_script: u64,
 }
 
 unsafe impl Send for JavaHookData {}
@@ -119,6 +122,54 @@ unsafe impl Sync for JavaHookData {}
 
 /// Global Java hook registry keyed by art_method address
 pub(super) static JAVA_HOOK_REGISTRY: Mutex<Option<HashMap<u64, JavaHookData>>> = Mutex::new(None);
+
+/// 取出某脚本注册的全部 Java hook（从注册表里删除并返回）。
+/// 与 native 版本同理：真实卸载/释放由上层在持有 JS 引擎锁时执行。
+pub(crate) fn take_java_hooks_owned_by(script_id: u64) -> Vec<JavaHookData> {
+    if script_id == 0 {
+        return Vec::new();
+    }
+    let mut guard = JAVA_HOOK_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(registry) = guard.as_mut() else {
+        return Vec::new();
+    };
+    let owned: Vec<u64> = registry
+        .iter()
+        .filter(|(_, data)| data.owner_script == script_id)
+        .map(|(addr, _)| *addr)
+        .collect();
+    owned
+        .into_iter()
+        .filter_map(|addr| registry.remove(&addr))
+        .collect()
+}
+
+/// 查询某个 art_method 上 hook 的归属脚本 id（0 = 无/未知）。
+pub(crate) fn owner_script_of(art_method: u64) -> u64 {
+    let guard = JAVA_HOOK_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+    guard
+        .as_ref()
+        .and_then(|registry| registry.get(&art_method))
+        .map(|data| data.owner_script)
+        .unwrap_or(0)
+}
+
+/// 统计某脚本当前持有的 Java hook 数量。
+pub(crate) fn count_java_hooks_owned_by(script_id: u64) -> usize {
+    if script_id == 0 {
+        return 0;
+    }
+    let guard = JAVA_HOOK_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+    guard
+        .as_ref()
+        .map(|registry| {
+            registry
+                .values()
+                .filter(|data| data.owner_script == script_id)
+                .count()
+        })
+        .unwrap_or(0)
+}
 
 /// Java hook 在途计数 —— 只在"JS callback 实际执行中"时 ≠ 0。
 ///

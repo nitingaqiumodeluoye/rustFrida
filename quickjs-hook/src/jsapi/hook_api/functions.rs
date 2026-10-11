@@ -186,6 +186,7 @@ unsafe fn install_hook(
                 recomp_addr,
                 native_attach_data: 0,
                 mutation: false,
+                owner_script: crate::script_registry::current_script(),
             },
         );
     });
@@ -396,6 +397,7 @@ pub(crate) unsafe extern "C" fn js_hook_native(
                 recomp_addr,
                 native_attach_data: 0,
                 mutation: false,
+                owner_script: crate::script_registry::current_script(),
             },
         );
     });
@@ -597,6 +599,7 @@ pub(crate) unsafe extern "C" fn js_attach_native(
                 recomp_addr,
                 native_attach_data,
                 mutation: false,
+                owner_script: crate::script_registry::current_script(),
             },
         );
     });

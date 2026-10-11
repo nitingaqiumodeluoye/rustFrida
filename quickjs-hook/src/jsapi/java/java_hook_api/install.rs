@@ -379,6 +379,7 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook(
                     native_entry_hook_target: 0,
                     native_entry_trampoline: 0,
                     native_entry_critical: is_critical_native,
+                    owner_script: crate::script_registry::current_script(),
                 },
             );
         });
@@ -513,6 +514,7 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook(
                 native_entry_hook_target: 0,
                 native_entry_trampoline: 0,
                 native_entry_critical: false,
+                owner_script: crate::script_registry::current_script(),
             },
         );
     });
@@ -838,6 +840,7 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook_quick(
                 native_entry_hook_target: 0,
                 native_entry_trampoline: 0,
                 native_entry_critical: false,
+                owner_script: crate::script_registry::current_script(),
             },
         );
     });

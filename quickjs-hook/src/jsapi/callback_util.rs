@@ -669,6 +669,10 @@ pub(crate) unsafe fn invoke_hook_callback_common_with_env(
     // 脚本里的死循环会把宿主（可能是 app 主线程）永久挂死。嵌套时 guard 取更早的截止。
     let _deadline_guard = crate::begin_js_execution_deadline(crate::hook_callback_timeout_ms());
 
+    // 日志归属：切到注册该 hook 的脚本作用域，使回调里的 console 输出带
+    // `[script#N name]` 前缀。target 未登记（如内部 hook）时为 0，不产生前缀。
+    let _script_scope = crate::script_scope(crate::jsapi::hook_api::resolve_owner_script(target_id));
+
     let global = ffi::JS_GetGlobalObject(ctx);
     let result = ffi::JS_Call(ctx, callback_dup, global, 1, &js_ctx as *const _ as *mut _);
 

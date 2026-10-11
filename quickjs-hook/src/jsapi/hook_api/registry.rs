@@ -83,6 +83,9 @@ pub(crate) struct HookData {
     pub(crate) recomp_addr: u64,          // Recomp 模式下的重编译地址
     pub(crate) native_attach_data: usize, // attachNative callback storage (Box<NativeAttachCallbacks>)
     pub(crate) mutation: bool,            // 修改型 hook（onEnter 会改入参）: engine-busy 时自旋等待 300ms 绝不丢弃; 观察型(默认 false)自旋 10ms 耗尽即丢
+    /// 创建该 hook 的脚本 id（0 = 非脚本来源）。
+    /// 用于日志归属（回调里的 console 输出）与 `jsdrop <id>` 按脚本卸载。
+    pub(crate) owner_script: u64,
 }
 
 // SAFETY: HookData only contains Copy types now (usize, [u8; 16])
@@ -92,6 +95,58 @@ unsafe impl Sync for HookData {}
 
 /// Global hook registry
 pub(crate) static HOOK_REGISTRY: Mutex<Option<HashMap<u64, HookData>>> = Mutex::new(None);
+
+/// 取出某脚本注册的全部 native hook（从注册表里删除并返回）。
+///
+/// 真正的 `hook_remove` / `qjs_free_value` 由 `crate::script_drop` 在持有
+/// JS 引擎锁时执行，这里只负责摘表，避免持锁顺序问题。
+pub(crate) fn take_hooks_owned_by(script_id: u64) -> Vec<(u64, HookData)> {
+    if script_id == 0 {
+        return Vec::new();
+    }
+    let mut guard = HOOK_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(registry) = guard.as_mut() else {
+        return Vec::new();
+    };
+    let owned: Vec<u64> = registry
+        .iter()
+        .filter(|(_, data)| data.owner_script == script_id)
+        .map(|(addr, _)| *addr)
+        .collect();
+    owned
+        .into_iter()
+        .filter_map(|addr| registry.remove(&addr).map(|data| (addr, data)))
+        .collect()
+}
+
+/// 查询某个 target 地址上 hook 的归属脚本 id（0 = 无/未知）。
+///
+/// hook 回调进入时据此切到对应脚本作用域，使回调里的 console 输出可归属。
+pub(crate) fn owner_script_of(target: u64) -> u64 {
+    let guard = HOOK_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+    guard
+        .as_ref()
+        .and_then(|registry| registry.get(&target))
+        .map(|data| data.owner_script)
+        .unwrap_or(0)
+}
+
+/// 统计某脚本当前持有的 native hook 数量。
+pub(crate) fn count_hooks_owned_by(script_id: u64) -> usize {
+    if script_id == 0 {
+        return 0;
+    }
+    let guard = HOOK_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+    guard
+        .as_ref()
+        .map(|registry| {
+            registry
+                .values()
+                .filter(|data| data.owner_script == script_id)
+                .count()
+        })
+        .unwrap_or(0)
+}
 
 /// Initialize hook registry
 pub(crate) fn init_registry() {
