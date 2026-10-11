@@ -233,7 +233,7 @@ pub(crate) fn handle_data(payload: &[u8]) {
     if writer.write_all(body).is_err() {
         drop(writer);
         handle_close(payload);
-    }
+    };
 }
 
 /// 处理双方任一侧发起的 `CHANNEL_CLOSE`。
@@ -250,7 +250,7 @@ pub(crate) fn handle_close(payload: &[u8]) {
     // 关掉 socket，读线程随即退出（它不会重复发 CLOSE，因为条目已被摘除）。
     if let Ok(writer) = channel.writer.lock() {
         let _ = writer.shutdown(Shutdown::Both);
-    }
+    };
 }
 
 /// 关闭全部通道（agent 卸载/退出前调用），并阻止后续新建。
@@ -265,7 +265,7 @@ pub(crate) fn shutdown_all() {
     for (_, channel) in channels {
         if let Ok(writer) = channel.writer.lock() {
             let _ = writer.shutdown(Shutdown::Both);
-        }
+        };
     }
 }
 
