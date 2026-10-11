@@ -213,7 +213,7 @@ jobs:
 
   # rfclient 拆分出 rfclient-core 后，CLI 只是 core 的一个消费者。
   # 这一步的价值取决于「行为零变化」，而这句话必须由机器检查，不能靠人工断言。
-  # 本 job 用 scripts/rfclient-mock-server.py 当假设备端，把协议里 CLI 用到的
+  # 本 job 用 rfclient/tests/mock-server.py 当假设备端，把协议里 CLI 用到的
   # 四条路径跑一遍：bootstrap 多行响应、v2 tagged 应答路由、legacy(v1) 帧、
   # stale（无主 reqid）丢弃。纯 std、不需要 NDK/子模块，约 1 分钟。
   rfclient-regression:
@@ -239,7 +239,7 @@ jobs:
         run: |
           set -euo pipefail
           CLI=target/x86_64-unknown-linux-gnu/release/rfclient
-          MOCK=scripts/rfclient-mock-server.py
+          MOCK=rfclient/tests/mock-server.py
           fail=0
 
           # 起 mock，等端口就绪，跑一段 CLI，断言输出包含预期片段。
@@ -250,12 +250,21 @@ jobs:
           #   * 断言只用不含制表符的子串，避免在 YAML 里写转义。
           check() {
             local port="$1" mode="$2" subcmd="$3" input="$4"; shift 4
-            python3 "$MOCK" "$port" "$mode" > "/tmp/mock-$port.log" 2>&1 &
+            # -u 关掉缓冲：否则就绪探测可能读到空日志，表现为「连接被拒」而非真实原因。
+            python3 -u "$MOCK" "$port" "$mode" > "/tmp/mock-$port.log" 2>&1 &
             local mock_pid=$!
-            for _ in $(seq 1 50); do
-              if grep -q listening "/tmp/mock-$port.log" 2>/dev/null; then break; fi
+            local ready=0
+            for _ in $(seq 1 100); do
+              if grep -q listening "/tmp/mock-$port.log" 2>/dev/null; then ready=1; break; fi
               sleep 0.1
             done
+            if [ "$ready" != 1 ]; then
+              echo "  FAIL [$mode] mock 未能监听 $port，其日志："
+              cat "/tmp/mock-$port.log" | sed "s/^/      | /"
+              kill "$mock_pid" 2>/dev/null || true
+              fail=1
+              return
+            fi
             local out
             local IFS=";"
             # shellcheck disable=SC2086

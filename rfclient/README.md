@@ -67,11 +67,11 @@ CLI 内部有两条独立通路：
 
 ## 回归测试
 
-`scripts/rfclient-mock-server.py` 是一个假设备端，实现了 CLI 用到的四条协议路径。
+`rfclient/tests/mock-server.py` 是一个假设备端，实现了 CLI 用到的四条协议路径。
 CI 的 `rfclient-regression` job 用它跑真实二进制并断言输出，用于保证重构前后行为一致：
 
 ```bash
-python3 scripts/rfclient-mock-server.py 18802 session &
+python3 -u rfclient/tests/mock-server.py 18802 session &
 printf 'jseval 1+1\nexit\n' | ./target/x86_64-pc-windows-gnu/release/rfclient.exe -H 127.0.0.1:18802
 ```
 
