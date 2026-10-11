@@ -54,11 +54,34 @@ pub struct App {
 
     /// 最近一次操作的反馈：(文本, 是否为错误, 设置时刻)。
     notice: Option<(String, bool, Instant)>,
+
+    /// 字体覆盖检查是否已做过。
+    ///
+    /// 必须等到首帧才能做：`Context::fonts` 在第一次 `run()` 之前会 panic。
+    font_checked: bool,
 }
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let log = LogBuf::new();
+
+        // 先装中文字体再写日志：eframe 自带字体不含汉字，不装的话连下面这几行
+        // 提示自己都是方块（用户看到的第一眼就是乱码）。
+        match crate::fonts::load_cjk() {
+            Ok(font) => match crate::fonts::install(&cc.egui_ctx, &font) {
+                Ok(()) => log.push(
+                    Tag::Client,
+                    format!(
+                        "中文字体：{}（{:.1} MiB）",
+                        font.path.display(),
+                        font.size_mib()
+                    ),
+                ),
+                Err(e) => log.push(Tag::Error, format!("中文字体注册失败: {}", e)),
+            },
+            Err(e) => log.push(Tag::Error, e),
+        }
+
         log.push(Tag::Client, "就绪。填好地址与令牌后，用左侧按钮连接目标。");
         log.push(
             Tag::Client,
@@ -89,6 +112,7 @@ impl App {
             log_filter: String::new(),
             auto_scroll: true,
             notice: None,
+            font_checked: false,
         }
     }
 
@@ -209,6 +233,23 @@ impl App {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // 首帧之后才验证字体："找得到文件" 不等于 "这个字体里真有汉字"，
+        // 而字体一旦缺字，界面上所有中文都会是方块 —— 必须给用户一句可操作的话，
+        // 而不是让他对着一屏方块猜。
+        if !self.font_checked {
+            self.font_checked = true;
+            if !crate::fonts::covers_cjk(ui.ctx()) {
+                self.log.push(
+                    Tag::Error,
+                    format!(
+                        "当前字体无法显示中文，界面中文会是方块。\n\
+                         设置环境变量 {} 指向任意中文字体文件（.ttf/.ttc/.otf）后重启即可。",
+                        crate::fonts::ENV_OVERRIDE
+                    ),
+                );
+            }
+        }
+
         self.poll();
 
         egui::Panel::top("rf-top").show(ui, |ui| self.top_bar(ui));

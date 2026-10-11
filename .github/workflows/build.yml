@@ -342,6 +342,14 @@ jobs:
           cargo build -p rfclient --release --locked --target x86_64-pc-windows-msvc
           cargo build -p rfclient-gui --release --locked --target x86_64-pc-windows-msvc
 
+      - name: Unit tests (rfclient-gui)
+        # 字体测试是这里最值钱的一条：它把字体真的装进 egui 并检查汉字覆盖，
+        # 直接对应「界面中文是否显示为方块」。runner 上没装中文字体时该用例
+        # 自动跳过（不算失败），有装就是一次真实的端到端验证。
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: cargo test -p rfclient-gui --locked --target x86_64-pc-windows-msvc
+
       - name: Verify and collect
         shell: pwsh
         run: |

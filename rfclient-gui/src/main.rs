@@ -16,6 +16,7 @@
 
 mod app;
 mod conn;
+mod fonts;
 mod logbuf;
 
 use eframe::egui;
