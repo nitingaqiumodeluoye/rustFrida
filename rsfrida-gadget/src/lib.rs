@@ -271,7 +271,7 @@ fn handle_client(mut stream: TcpStream, gate: &LoadGate, auth_token: Option<&str
     }
     let has_script = script.is_some();
 
-    writeln!(stream, "OK sid=0 pid={}", std::process::id()).map_err(|e| format!("write OK: {}", e))?;
+    writeln!(stream, "OK sid=0 pid={} proto=2", std::process::id()).map_err(|e| format!("write OK: {}", e))?;
     stream.flush().map_err(|e| format!("flush OK: {}", e))?;
     if !has_script {
         gate.release();

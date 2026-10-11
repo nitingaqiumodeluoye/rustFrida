@@ -519,8 +519,19 @@ fn run_interactive(
         return Ok(1);
     }
     repl::print_line(&response);
-    repl::run(stream, Duration::from_secs(linger_secs))?;
+    // 服务端/Gadget 在 OK 行宣告 agent 协议版本（proto=N）；
+    // 拿不到时（旧服务端）交给 REPL 等 HELLO 或退回 legacy。
+    let proto_hint = parse_proto_hint(&response);
+    repl::run(stream, Duration::from_secs(linger_secs), proto_hint)?;
     Ok(0)
+}
+
+/// 从 `OK sid=1 pid=123 proto=2` 中提取协议版本。
+fn parse_proto_hint(response: &str) -> Option<u32> {
+    response
+        .split_whitespace()
+        .find_map(|f| f.strip_prefix("proto="))
+        .and_then(|v| v.parse().ok())
 }
 
 fn send_bootstrap(stream: &mut TcpStream, line: &str, script_path: Option<&str>) -> Result<(), String> {

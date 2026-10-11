@@ -54,6 +54,10 @@ pub(crate) struct Session {
     pub(crate) connected: AtomicBool,
     pub(crate) disconnected: AtomicBool,
     pub(crate) shutdown_requested: AtomicBool,
+    /// agent 在 HELLO 帧里宣告的协议版本（0 = 未知/legacy）。
+    /// 用于在 attach/spawn/use 的文本 OK 响应里告知主机客户端，
+    /// 使协议协商不依赖「客户端恰好在连接时收到过 HELLO」。
+    pub(crate) agent_proto: std::sync::atomic::AtomicU32,
     /// Marks sessions created through the TCP control plane. Transport
     /// ownership is separate from target cleanup: closing the server still
     /// performs the normal agent shutdown before releasing loader mappings.
@@ -83,6 +87,7 @@ impl Session {
             connected: AtomicBool::new(false),
             disconnected: AtomicBool::new(false),
             shutdown_requested: AtomicBool::new(false),
+            agent_proto: std::sync::atomic::AtomicU32::new(0),
             tcp_owned: AtomicBool::new(false),
             failed: AtomicBool::new(false),
             relay: Mutex::new(RelayState {
@@ -207,6 +212,11 @@ impl Session {
 
     pub(crate) fn is_connected(&self) -> bool {
         self.connected.load(Ordering::Acquire) && !self.disconnected.load(Ordering::Acquire)
+    }
+
+    /// agent 宣告的协议版本（0 = 未知）。
+    pub(crate) fn agent_proto(&self) -> u32 {
+        self.agent_proto.load(Ordering::Acquire)
     }
 
     pub(crate) fn get_sender(&self) -> Option<&Sender<HostToAgentMessage>> {

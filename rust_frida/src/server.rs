@@ -546,7 +546,15 @@ fn handle_tcp_client(
             // 等待注入结果（注入可能含 pre-resume 脚本加载，给足超时）
             match rx.recv_timeout(Duration::from_secs(TCP_INJECT_WAIT_TIMEOUT_SECS)) {
                 Ok(Ok(pid)) => {
-                    if let Err(e) = write_line(&write_stream, &format!("OK sid={} pid={}", session.id, pid)) {
+                    if let Err(e) = write_line(
+                        &write_stream,
+                        &format!(
+                            "OK sid={} pid={} proto={}",
+                            session.id,
+                            pid,
+                            session.agent_proto()
+                        ),
+                    ) {
                         session.clear_relay();
                         log_info!(
                             "[#{}] TCP 客户端在 bootstrap 完成前断开，session 保留；可用 use {} 重新连接",
@@ -618,7 +626,12 @@ fn handle_tcp_client(
             session.mark_tcp_owned();
             write_line(
                 &write_stream,
-                &format!("OK sid={} pid={}", id, session.pid.load(Ordering::Relaxed)),
+                &format!(
+                    "OK sid={} pid={} proto={}",
+                    id,
+                    session.pid.load(Ordering::Relaxed),
+                    session.agent_proto()
+                ),
             )?;
             // 复用已有会话：只中继，不 shutdown（会话归属其创建者）
             let _ = stream.set_read_timeout(None);

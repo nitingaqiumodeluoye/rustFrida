@@ -302,10 +302,17 @@ fn handle_socket_connection(stream: UnixStream, session: Arc<Session>) {
                         } else {
                             log_success!("[#{}] Agent 已连接", session.id);
                         }
-                        // 协议版本协商：agent 会在 HELLO 载荷中宣告 proto=N。
-                        // 仅记录，当前版本与 v1 完全向后兼容。
+                        // 协议版本协商：agent 在 HELLO 载荷中宣告 proto=N，
+                        // 记录到 session 供 attach/spawn/use 的 OK 响应回传。
                         if !payload.is_empty() {
                             let hello = String::from_utf8_lossy(&payload);
+                            for field in hello.split_whitespace() {
+                                if let Some(v) = field.strip_prefix("proto=") {
+                                    if let Ok(proto) = v.parse::<u32>() {
+                                        session.agent_proto.store(proto, Ordering::Release);
+                                    }
+                                }
+                            }
                             log_info!("[#{}] agent protocol: {}", session.id, hello.trim());
                         }
                         let stream_clone = match reader.try_clone() {

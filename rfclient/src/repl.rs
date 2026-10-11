@@ -178,7 +178,10 @@ fn now_millis() -> u64 {
 }
 
 /// 进入交互式 REPL，直到用户退出或连接断开。
-pub fn run(stream: &mut TcpStream, eof_linger: Duration) -> Result<(), String> {
+///
+/// `proto_hint` 是引导 OK 行里服务端宣告的 agent 协议版本：Some(2) 直接启用 v2，
+/// 不依赖 HELLO 到达时机；None（旧服务端）则等 HELLO 或退回 legacy。
+pub fn run(stream: &mut TcpStream, eof_linger: Duration, proto_hint: Option<u32>) -> Result<(), String> {
     // 清除读/写超时：中继后 agent 可能长时间无输出（日志/交互），不能被之前设置的 30s 超时打断
     let _ = stream.set_read_timeout(None);
     let _ = stream.set_write_timeout(None);
@@ -238,7 +241,11 @@ pub fn run(stream: &mut TcpStream, eof_linger: Duration) -> Result<(), String> {
         });
     }
 
-    // 等待协议协商：HELLO 承载 proto 版本，超时则按 legacy 处理。
+    // 协议协商：OK 行已宣告 proto 时直接定案；否则等 HELLO（Gadget 路径/旧服务端）。
+    if proto_hint == Some(2) {
+        proto_v2.store(true, Ordering::Release);
+        hello_seen.store(true, Ordering::Release);
+    }
     let deadline = Instant::now() + Duration::from_millis(HELLO_WAIT_MILLIS);
     while !hello_seen.load(Ordering::Acquire) && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(20));
