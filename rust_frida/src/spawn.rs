@@ -1168,13 +1168,8 @@ fn spawn_and_wait_hello(package: &str) -> Result<SpawnHello, String> {
 ///
 /// 每个未还原的 zygote 都要登记一次：子进程是从哪一个 zygote fork 出来的无法预知。
 ///
-/// 优先只登记 `parent_zygote`（hello 报回来的 ppid，与 `revert_child_patch_by_ppid`
-/// 用的是同一个来源）：karinahide 的区间表 `KARINA_MAX_RANGES = 256` 且条目按 uid
-/// 只增不减，按全部 zygote 登记会让每个新 app 占掉 N 个槽。匹配不到时退回全部，
-/// 宁可多占槽也不漏隐藏。
-///
 /// 失败只告警：隐藏是额外保险，不应让注入失败。
-fn hide_zymbiote_payload_from_app(package: &str, app_pid: u32, parent_zygote: u32) {
+fn hide_zymbiote_payload_from_app(package: &str, app_pid: u32) {
     let Some(uid) = crate::kpm::lookup_package_uid(package) else {
         log_warn!(
             "隐藏 payload 页: 无法从 packages.list 解析 {} 的 uid，跳过（Hunter 类检测可能仍会命中）",
@@ -1192,19 +1187,11 @@ fn hide_zymbiote_payload_from_app(package: &str, app_pid: u32, parent_zygote: u3
     // payload 页 ≤ 一页，且 loc.base 已做过页对齐检查（find_payload_location）。
     let pages: Vec<u64> = match ZYGOTE_PATCHES.get() {
         Some(lock) => match lock.lock() {
-            Ok(patches) => {
-                let page_of = |p: &ZygotePatch| p.payload_base & !(page_size - 1);
-                // 优先只取 fork 出本子进程的那个 zygote；匹配不到时退回全部未还原项。
-                let mut sel: Vec<u64> = patches
-                    .iter()
-                    .filter(|p| !p.restored && p.pid == parent_zygote)
-                    .map(page_of)
-                    .collect();
-                if sel.is_empty() {
-                    sel = patches.iter().filter(|p| !p.restored).map(page_of).collect();
-                }
-                sel
-            }
+            Ok(patches) => patches
+                .iter()
+                .filter(|p| !p.restored)
+                .map(|p| p.payload_base & !(page_size - 1))
+                .collect(),
             Err(_) => return,
         },
         None => return,
@@ -1244,7 +1231,7 @@ pub(crate) fn spawn_and_inject(
 
     // payload 页是 zygote 注入时留下的、随 fork 继承到子进程。必须在子进程被
     // resume（读到 maps）之前登记隐藏；此刻子进程仍阻塞在 zymbiote 的 recv(ACK)。
-    hide_zymbiote_payload_from_app(package, hello.pid, hello.ppid);
+    hide_zymbiote_payload_from_app(package, hello.pid);
 
     // 属性伪装: mount 在 capset hook 中完成，remap 在 setArgV0 中完成
 
