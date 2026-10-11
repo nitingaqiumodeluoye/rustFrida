@@ -348,7 +348,9 @@ jobs:
         # 自动跳过（不算失败），有装就是一次真实的端到端验证。
         env:
           RUSTFLAGS: -C target-feature=+crt-static
-        run: cargo test -p rfclient-gui --locked --target x86_64-pc-windows-msvc
+        # --nocapture：让字体测试把「用了哪个字体」或「因环境跳过」打出来。
+        # 否则跳过与通过在日志里长得一样，等于不知道 CI 到底验没验。
+        run: cargo test -p rfclient-gui --locked --target x86_64-pc-windows-msvc -- --nocapture
 
       - name: Verify and collect
         shell: pwsh

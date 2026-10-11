@@ -257,8 +257,21 @@ mod tests {
         // 不需要窗口、也不需要 GPU 光栅化，所以 CI 里也能跑。
         let Ok(font) = load_cjk() else {
             // 环境里没装任何中文字体：跳过（同样让 load_cjk 的返回路径被覆盖到）。
+            //
+            // 必须**把跳过说出来**：静默跳过会让人以为「CI 验过字体了」，
+            // 实际什么都没验 —— 那比没有测试更坏。CI 里用 --nocapture 跑就能看到这行。
+            println!(
+                "[字体测试] 跳过：本机没有可用的中文字体候选（环境问题，非代码问题）。可用 {} 指定。",
+                ENV_OVERRIDE
+            );
             return;
         };
+        println!(
+            "[字体测试] 使用 {}（{:.1} MiB）",
+            font.path.display(),
+            font.size_mib()
+        );
+
         let ctx = egui::Context::default();
         install(&ctx, &font).expect("注册字体不该失败");
 
@@ -270,6 +283,10 @@ mod tests {
         // FullOutput 带着字体图集的纹理增量，直接 drop 会 panic
         //（egui 要求调用方显式处置）。测试里没有渲染器，故声明为「不应用」。
         output.drop_without_applying_deltas();
+        println!(
+            "[字体测试] proportional 与 monospace 的 has_glyphs(\"{}\") = {}",
+            CJK_PROBE, covered
+        );
         assert!(
             covered,
             "字体 {} 能载入，但不含中文字形（界面仍会是方块）",
@@ -286,6 +303,11 @@ mod tests {
             if let Some(font) = try_load(&path, &mut why) {
                 assert!(looks_like_sfnt(&font.bytes));
                 assert!(font.size_mib() > 0.1, "字体文件太小，可能是占位文件");
+                println!(
+                    "[字体测试] 首选候选 {}（{:.1} MiB）",
+                    font.path.display(),
+                    font.size_mib()
+                );
                 return;
             }
         }
