@@ -1149,78 +1149,6 @@ fn spawn_and_wait_hello(package: &str) -> Result<SpawnHello, String> {
 }
 
 /// Spawn 注入主入口
-/// 把 zymbiote payload 所在页从 app uid 视角的 maps / map_files 里隐藏。
-///
-/// 为什么需要它，而不是靠已有的 `wwb_` 机制：
-///   - payload 页是「**文件-backed**（libstagefright.so 段尾页）+ COW 脏」的形态。
-///     maps 记录里仍然写着库路径，所以：
-///       * `prctl(PR_SET_VMA_ANON_NAME)` 那种匿名映射命名对它无效（文件映射的
-///         maps 行显示路径，不显示 anon name）；
-///       * karinahide 的 `wwb_` 文本 marker 规则也盖不住它。
-///   - 检测器（如 Hunter 的 "missing page, suspicious execution procedure"）
-///     正是用 `mincore()` + 与 backing 文件比对发现这种“驻留但不属于文件”的页。
-///   - 其余执行映射都已有 `wwb_` 名字（`wwb_loader` / `wwb_so` / `wwb_hook_pool`
-///     / `wwb_hook_exec` / `wwb_recomp_*`），不需要在这里重复处理。
-///
-/// 必须用**包名对应的 uid**、而不是子进程当前 uid：调用点还在 zymbiote 阻塞
-/// 阶段（阻塞在 setArgV0），uid 要到之后的 `selinux_android_setcontext` 才落地，
-/// 此刻 `/proc/<pid>/status` 读出来的还不是 app uid。
-///
-/// 每个未还原的 zygote 都要登记一次：子进程是从哪一个 zygote fork 出来的无法预知。
-///
-/// 失败只告警：隐藏是额外保险，不应让注入失败。
-fn hide_zymbiote_payload_from_app(package: &str, app_pid: u32) {
-    let Some(uid) = crate::kpm::lookup_package_uid(package) else {
-        log_warn!(
-            "隐藏 payload 页: 无法从 packages.list 解析 {} 的 uid，跳过（Hunter 类检测可能仍会命中）",
-            package
-        );
-        return;
-    };
-
-    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
-    if page_size == 0 || (page_size & (page_size - 1)) != 0 {
-        log_warn!("隐藏 payload 页: 非法 page_size {}", page_size);
-        return;
-    }
-
-    // payload 页 ≤ 一页，且 loc.base 已做过页对齐检查（find_payload_location）。
-    let pages: Vec<u64> = match ZYGOTE_PATCHES.get() {
-        Some(lock) => match lock.lock() {
-            Ok(patches) => patches
-                .iter()
-                .filter(|p| !p.restored)
-                .map(|p| p.payload_base & !(page_size - 1))
-                .collect(),
-            Err(_) => return,
-        },
-        None => return,
-    };
-
-    if pages.is_empty() {
-        return;
-    }
-
-    for start in pages {
-        match crate::kpm::hide_range(uid, start, start + page_size) {
-            Ok(()) => log_verbose!(
-                "已隐藏 payload 页: uid={} 0x{:x}-0x{:x} (app pid={})",
-                uid,
-                start,
-                start + page_size,
-                app_pid
-            ),
-            Err(e) => log_warn!(
-                "隐藏 payload 页 0x{:x}-0x{:x} (uid={}) 失败: {}",
-                start,
-                start + page_size,
-                uid,
-                e
-            ),
-        }
-    }
-}
-
 pub(crate) fn spawn_and_inject(
     package: &str,
     string_overrides: &HashMap<String, String>,
@@ -1228,10 +1156,6 @@ pub(crate) fn spawn_and_inject(
     log_info!("Spawn 模式: 准备注入 {}", package);
 
     let hello = spawn_and_wait_hello(package)?;
-
-    // payload 页是 zygote 注入时留下的、随 fork 继承到子进程。必须在子进程被
-    // resume（读到 maps）之前登记隐藏；此刻子进程仍阻塞在 zymbiote 的 recv(ACK)。
-    hide_zymbiote_payload_from_app(package, hello.pid);
 
     // 属性伪装: mount 在 capset hook 中完成，remap 在 setArgV0 中完成
 
