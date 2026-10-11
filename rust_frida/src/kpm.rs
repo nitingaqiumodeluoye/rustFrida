@@ -91,7 +91,7 @@ fn describe_errno(errno: i32) -> &'static str {
 /// 格式（空白分隔）：`<name> <uid> <debuggable> <dataDir> <seinfo> [gids…]`
 ///
 /// rustfrida 以 uid 0 运行，读得到这个文件；读不到时返回 None 交给调用方兜底。
-fn lookup_package_uid(package: &str) -> Option<u32> {
+pub(crate) fn lookup_package_uid(package: &str) -> Option<u32> {
     for path in [PACKAGES_LIST, PACKAGES_LIST_TMP] {
         let content = match std::fs::read_to_string(path) {
             Ok(v) => v,
@@ -361,5 +361,41 @@ pub(crate) fn madvise_dontneed(pid: i32, start: usize, len: usize) -> Result<(),
     }
 
     let args = format!("madvise {} 0x{:x} 0x{:x}", pid, start, len);
+    control(KARINAHIDE, &args)
+}
+
+/// karinahide 的 maps 隐藏规则只对 app uid 生效（`karinahide.c` 的
+/// `KARINA_MIN_APP_UID`，`karina_filter_seq_file` 开头 `if (uid < ...) return;`）。
+const KARINA_MIN_APP_UID: u32 = 10000;
+
+/// 请 karinahide 把 `[start, end)` 从 `reader_uid` 视角的 `/proc/<pid>/maps`
+/// 与 `/proc/<pid>/map_files` 里隐藏。
+///
+/// 走 ctl0 的 `add <uid> <start> <end>` 分支 → `karina_add_range()`，语义：
+///   - 登记为 **uid 级**条目（`pid = 0`）。匹配用 `karina_range_matches`：
+///     `range->uid == 读方 uid`，pid 不限 —— 正是需要的行为，因为读方（app 自己
+///     读 `/proc/self/maps`）与 VMA 宿主是同一个 uid。
+///   - 命中后 `karina_filter_seq_file` 丢弃该条记录，并把区间记入 `marked_ranges`，
+///     于是 map_files 的 getdents64 目录项与 readlinkat 一起返回 `-ENOENT`。
+///   - 同 uid 下已被现有条目完整覆盖时直接返回 0、不占新槽，所以重复调用是安全的。
+///
+/// 粒度注意：命中判据是「VMA 区间与登记区间**有重叠**」，丢弃的单位是**整条 maps
+/// 记录（整个 VMA）**，不是登记的那一小段。把区间落在某个库的段内，会让该段的整条
+/// 记录从 app 视角消失（库的其它段仍在）。这是 seq_file 行级过滤固有的粒度。
+///
+/// 表容量 `KARINA_MAX_RANGES = 256`，条目按 uid 记账且只增不减（只有 ctl0 clear
+/// 回收），所以调用方应尽量登记少量、稳定的区间。
+pub(crate) fn hide_range(reader_uid: u32, start: u64, end: u64) -> Result<(), String> {
+    if end <= start {
+        return Err(format!("隐藏区间无效: 0x{:x}-0x{:x}", start, end));
+    }
+    if reader_uid < KARINA_MIN_APP_UID {
+        return Err(format!(
+            "隐藏区间只对 app uid(>={}) 生效，收到 uid={}（root/shell 读 maps 本来就不会被过滤）",
+            KARINA_MIN_APP_UID, reader_uid
+        ));
+    }
+
+    let args = format!("add {} 0x{:x} 0x{:x}", reader_uid, start, end);
     control(KARINAHIDE, &args)
 }
