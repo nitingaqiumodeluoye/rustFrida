@@ -20,6 +20,29 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # SELinux 补丁规则不变量。
+  #
+  # 这是一次真实问题的回归守卫，不是假想：RULES 用 `domain` 属性作源
+  # （成员是【所有域】，含 app_zygote），其中
+  #     ("domain", "tmpfs", "dir", &["?mounton","read","open","getattr","search"])
+  # 让任何域都能 opendir+readdir 列举 /mnt、/mnt/obb、/mnt/asec（label 为
+  # u:object_r:tmpfs:s0），实测导致 TrustAttestor 误报
+  # system.permission.boundary（L1 BREACH）—— 重启后同一台设备 PASS，
+  # 证明是 rustfrida 自己踩出来的误报。修法是 tmpfs:dir 只留 getattr。
+  #
+  # 单独开一个 job 而不是塞进 build：一是不需要 NDK/子模块，秒级完成；
+  # 二是它是独立状态，以后有人加规则把它踩回来时，一眼能看出是哪一条挂的。
+  selinux-policy-guard:
+    name: selinux policy guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check SELinux patch rules
+        run: python3 .github/check-selinux-rules.py
+
   build:
     name: agent + rustfrida
     runs-on: ubuntu-latest

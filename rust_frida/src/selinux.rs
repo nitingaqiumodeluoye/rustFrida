@@ -91,12 +91,22 @@ const RULES: &[(&str, &str, &str, &[&str])] = &[
         "file",
         &["read", "open", "getattr", "?map"],
     ),
-    (
-        "domain",
-        "tmpfs",
-        "dir",
-        &["?mounton", "read", "open", "getattr", "search"],
-    ),
+    // tmpfs:dir 只保留 getattr（+ 部分内核存在的 ?mounton）。
+    //
+    // 为什么不再给 read / open / search：
+    //   源类型用的是 `domain` 属性，等于给【所有域】授权。而 /mnt、/mnt/obb、
+    //   /mnt/asec 的 label 正是 u:object_r:tmpfs:s0，一旦放开 dir 的
+    //   read/open/search，任何域（含 app_zygote）都能 opendir + readdir 列举
+    //   这些目录 —— 这正是完整性检测判定「权限边界越权」的特征，会让
+    //   TrustAttestor 之类的 App 报 system.permission.boundary（实测复现过）。
+    //
+    // 为什么去掉不影响功能：
+    //   agent SO 是通过 memfd 的【fd + SCM_RIGHTS】交给目标进程的，走
+    //   /proc/self/fd/N（路径各段属 procfs），不需要按路径遍历 tmpfs 目录；
+    //   目标进程要的是 tmpfs【file】的 read/open/execute/map（上面那条规则保留）。
+    //   属性伪装那条路径的 bind mount 目标是 /dev/__properties__，类型是
+    //   properties_device（上一条规则覆盖），也不是 tmpfs 目录。
+    ("domain", "tmpfs", "dir", &["?mounton", "getattr"]),
     // mount 需要 sys_admin capability
     ("domain", "domain", "capability", &["?sys_admin"]),
 ];
