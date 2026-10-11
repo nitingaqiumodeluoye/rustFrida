@@ -251,14 +251,18 @@ jobs:
 
           # 冒烟测试：架构不对或运行库缺失时这里会失败，
           # 避免只凭「文件存在」就判定成功。
-          & $exe --help | Select-Object -First 3
-          if ($LASTEXITCODE -ne 0) { throw "rfclient.exe --help 退出码 $LASTEXITCODE" }
+          # 必须先让进程跑完再取退出码：`| Select-Object -First N` 会提前打断管道
+          # （PowerShell 取消上游命令），$LASTEXITCODE 会取不到值。
+          $help = & $exe --help
+          $code = $LASTEXITCODE
+          $help | Select-Object -First 3
+          if ($code -ne 0) { throw "rfclient.exe --help 失败，退出码 $code" }
 
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item $exe dist/rfclient.exe
           Get-Item dist/rfclient.exe | Format-List Name, Length
-          "$((Get-FileHash dist/rfclient.exe -Algorithm SHA256).Hash.ToLower())  rfclient.exe" |
-            Set-Content -Encoding ascii dist/SHA256SUMS.txt
+          $hash = (Get-FileHash dist/rfclient.exe -Algorithm SHA256).Hash.ToLower()
+          Set-Content -Encoding ascii dist/SHA256SUMS.txt -Value "$hash  rfclient.exe"
           Get-Content dist/SHA256SUMS.txt
 
       - name: Upload artifacts
