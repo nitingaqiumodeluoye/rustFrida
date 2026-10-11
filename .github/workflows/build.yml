@@ -268,7 +268,7 @@ jobs:
             local out
             local IFS=";"
             # shellcheck disable=SC2086
-            out="$( { for l in $input; do printf %s "$l"; echo; done; } | "$CLI" -H "127.0.0.1:$port" $subcmd 2>&1 || true )"
+            out="$( { for l in $input; do printf %s "$l"; echo; done; } | "$CLI" -H "127.0.0.1:$port" --token=secret $subcmd 2>&1 || true )"
             kill "$mock_pid" 2>/dev/null || true
             for expect in "$@"; do
               if printf %s "$out" | grep -qF -- "$expect"; then
@@ -289,7 +289,10 @@ jobs:
           check 18803 legacy "" "jseval 1;exit" "已连接（协议 v1）" "=> legacy-echo:jseval" "协议 v1：对端未宣告 v2"
           # 4) stale：无主 reqid 必须丢弃，不得误配给下一条命令
           check 18804 stale "" "jseval 42;exit" "[stale] 丢弃迟到的 eval 响应 (reqid=9999)" "=> echo:jseval"
-          # 5) forward 命令完全在本地处理，不进 agent 命令面
+          # 5) ps：走 query::list_processes 新路径；mock 把收到的整行回显成进程名，
+          #    所以断言 token=secret 就等于验证了「令牌确实注入到了引导行」。
+          check 18806 ps ps "" "4242" "token=secret" "PID"
+          # 6) forward 命令完全在本地处理，不进 agent 命令面
           check 18805 session "" "forwards;exit" "没有正在进行的端口转发"
           exit "$fail"
 

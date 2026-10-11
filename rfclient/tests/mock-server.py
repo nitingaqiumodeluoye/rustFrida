@@ -9,6 +9,7 @@
 
 mode:
     list      -- 只回 list 的多行文本响应
+    ps        -- 回 PID/NAME 表，并把收到的整行回显成进程名（用于断言令牌已注入）
     session   -- 回 OK（含 proto=2），帧模式：HELLO/LOG + 对 tagged 命令回应答
     legacy    -- 回 OK（不带 proto），HELLO 声明 proto=1，用 legacy 帧收发
     stale     -- 同 session，但额外先发一个 reqid 不匹配的应答（验证 stale 丢弃）
@@ -56,6 +57,14 @@ def serve(conn: socket.socket, mode: str) -> None:
     if mode == "list":
         # 会话表：LABEL 列非 karina → 判定为 server
         conn.sendall("ID\tPID\tLABEL\tSTATUS\n1\t1234\tcom.example\tactive\n\n".encode())
+        return
+
+    if mode == "ps":
+        # 把收到的引导行原样作为进程名回显：这样「令牌有没有带上」
+        # 就变成一条可直接断言的输出，不必去猜请求内容。
+        conn.sendall("PID\tNAME\n".encode())
+        conn.sendall(("4242\t" + line + "\n").encode())
+        conn.sendall(b"\n")
         return
 
     # 交互模式：先回 OK 行（带 proto=2 提示），再发帧

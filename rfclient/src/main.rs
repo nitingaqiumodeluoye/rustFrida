@@ -2,26 +2,25 @@
 //!
 //! 协议与会话逻辑在 `rfclient_core`；本文件只做三件事：
 //! 1. 命令行解析（clap）；
-//! 2. 连接建立（直连 TCP / 经 ADB 转发 / Gadget 探测）；
+//! 2. 连接建立（直连 TCP / 经 ADB 转发 / Gadget 竞态重试）；
 //! 3. 终端呈现（见 `repl`）。
 
 mod repl;
 
-use std::io::Write;
-use std::net::TcpStream;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 
 use rfclient_core::adb::{self, AdbForward, DEFAULT_USB_DEVICE_PORT};
-use rfclient_core::bootstrap;
-use rfclient_core::Session;
+use rfclient_core::query::{self, OpenError, ProcessRow, SessionRow};
 
 const CONNECT_TIMEOUT_SECS: u64 = 10;
 const PROBE_TIMEOUT_SECS: u64 = 2;
 const GADGET_WAIT_SECS: u64 = 20;
 const GADGET_RETRY_MILLIS: u64 = 100;
+/// Gadget 重试期间的建连超时：应用刚启动时端口可能刚 listen，短超时能更快进入下一轮。
+const GADGET_CONNECT_TIMEOUT_MILLIS: u64 = 500;
 const DEFAULT_LOG_LINGER_SECS: u64 = 5;
 const DEFAULT_HOST: &str = "127.0.0.1:15819";
 
@@ -121,6 +120,7 @@ fn run(args: &Args) -> Result<i32, String> {
         return run_usb_spawn(args);
     }
 
+    // -U 模式下临时建立 adb forward，退出时由 AdbForward 的 Drop 清理。
     let forward = if args.usb {
         Some(AdbForward::open(args.serial.as_deref(), args.device_port)?)
     } else {
@@ -171,21 +171,11 @@ fn run_usb_spawn(args: &Args) -> Result<i32, String> {
 /// 判据是 `list` 响应里的 label 列：Gadget 会话的 label 固定为 `karina`
 /// （Gadget 模式没有真实包名可报）。探不通就返回 `None`，由调用方决定退路。
 fn probe_usb_endpoint(host: &str) -> Result<Option<UsbEndpointKind>, String> {
-    let mut stream = match connect_tcp(host, Duration::from_secs(PROBE_TIMEOUT_SECS)) {
-        Ok(stream) => stream,
+    let rows = match query::list_sessions(host, None, Duration::from_secs(PROBE_TIMEOUT_SECS)) {
+        Ok(rows) => rows,
         Err(_) => return Ok(None),
     };
-    configure_stream(&stream, Duration::from_secs(PROBE_TIMEOUT_SECS))?;
-    if stream.write_all(b"list\n").is_err() {
-        return Ok(None);
-    }
-    let lines = match bootstrap::read_response_lines(&mut stream) {
-        Ok(lines) => lines,
-        Err(_) => return Ok(None),
-    };
-    let is_gadget = lines
-        .iter()
-        .any(|line| line.split('\t').nth(2) == Some("karina"));
+    let is_gadget = rows.iter().any(|row| row.label == "karina");
     Ok(Some(if is_gadget {
         UsbEndpointKind::Gadget
     } else {
@@ -197,21 +187,16 @@ fn probe_usb_endpoint(host: &str) -> Result<Option<UsbEndpointKind>, String> {
 fn wait_for_gadget(args: &Args, host: &str, package: &str) -> Result<i32, String> {
     let deadline = Instant::now() + Duration::from_secs(GADGET_WAIT_SECS);
     let mut last_error = String::new();
+    let line = if args.load_script.is_some() {
+        "gadget -l -"
+    } else {
+        "gadget"
+    };
     while Instant::now() < deadline {
-        match connect_tcp(host, Duration::from_millis(500)) {
-            Ok(stream) => {
-                configure_stream(&stream, Duration::from_secs(30))?;
-                let line = if args.load_script.is_some() {
-                    "gadget -l -"
-                } else {
-                    "gadget"
-                };
-                let line = bootstrap::with_token(line, args.token.as_deref());
-                match run_interactive(stream, &line, args.load_script.as_deref(), args.linger) {
-                    Ok(code) => return Ok(code),
-                    Err(error) => last_error = error,
-                }
-            }
+        let connect_timeout = Duration::from_millis(GADGET_CONNECT_TIMEOUT_MILLIS);
+        match open_interactive(host, line, args, args.load_script.as_deref(), connect_timeout) {
+            Ok(code) => return Ok(code),
+            // 建连/握手失败都当作「还没起好」继续等；只有超时才真正报错。
             Err(error) => last_error = error,
         }
         std::thread::sleep(Duration::from_millis(GADGET_RETRY_MILLIS));
@@ -222,27 +207,7 @@ fn wait_for_gadget(args: &Args, host: &str, package: &str) -> Result<i32, String
     ))
 }
 
-fn connect_tcp(host: &str, timeout: Duration) -> Result<TcpStream, String> {
-    let address = host
-        .parse()
-        .map_err(|_| format!("无效地址 '{}'（应为 host:port）", host))?;
-    TcpStream::connect_timeout(&address, timeout).map_err(|e| format!("连接 {} 失败: {}", host, e))
-}
-
-fn configure_stream(stream: &TcpStream, timeout: Duration) -> Result<(), String> {
-    stream
-        .set_read_timeout(Some(timeout))
-        .map_err(|e| format!("set_read_timeout: {}", e))?;
-    stream
-        .set_write_timeout(Some(timeout))
-        .map_err(|e| format!("set_write_timeout: {}", e))?;
-    Ok(())
-}
-
 fn run_connected(args: &Args, host: &str) -> Result<i32, String> {
-    let mut stream = connect_tcp(host, Duration::from_secs(CONNECT_TIMEOUT_SECS))?;
-    configure_stream(&stream, Duration::from_secs(30))?;
-
     if let Some(package) = args.spawn.as_ref() {
         if args.cmd.is_some() {
             return Err("-f/--file 不能与子命令同时使用".to_string());
@@ -252,31 +217,38 @@ fn run_connected(args: &Args, host: &str) -> Result<i32, String> {
         } else {
             format!("spawn {}", package)
         };
-        let line = bootstrap::with_token(&line, args.token.as_deref());
-        return run_interactive(stream, &line, args.load_script.as_deref(), args.linger);
+        return open_interactive(
+            host,
+            &line,
+            args,
+            args.load_script.as_deref(),
+            Duration::from_secs(CONNECT_TIMEOUT_SECS),
+        );
     }
 
     let Some(cmd) = args.cmd.as_ref() else {
-        let line = if args.load_script.is_some() {
-            "gadget -l -".to_string()
-        } else {
-            "gadget".to_string()
-        };
-        let line = bootstrap::with_token(&line, args.token.as_deref());
         eprintln!("[client] 未指定 -f/--file 或子命令，尝试连接已运行的 Gadget");
-        return run_interactive(stream, &line, args.load_script.as_deref(), args.linger);
+        return open_interactive(
+            host,
+            "gadget",
+            args,
+            args.load_script.as_deref(),
+            Duration::from_secs(CONNECT_TIMEOUT_SECS),
+        );
     };
 
+    let connect_timeout = Duration::from_secs(CONNECT_TIMEOUT_SECS);
     match cmd {
+        // list / ps 是「问一句就走」的查询：连一次、读表格、不建会话。
         Cmd::List => {
-            send_query(&mut stream, "list", args.token.as_deref(), "ID\tPID\tLABEL\tSTATUS", "(无会话)")
+            let rows = query::list_sessions(host, args.token.as_deref(), connect_timeout)?;
+            print_session_rows(&rows);
+            Ok(0)
         }
         Cmd::Ps { filter } => {
-            let line = match filter {
-                Some(f) if !f.is_empty() => format!("ps {}", f),
-                _ => "ps".to_string(),
-            };
-            send_query(&mut stream, &line, args.token.as_deref(), "PID\tNAME", "(无匹配进程)")
+            let rows = query::list_processes(host, filter.as_deref(), args.token.as_deref(), connect_timeout)?;
+            print_process_rows(&rows);
+            Ok(0)
         }
         Cmd::Attach { target, script } => {
             let line = if script.is_some() {
@@ -284,8 +256,7 @@ fn run_connected(args: &Args, host: &str) -> Result<i32, String> {
             } else {
                 format!("attach {}", target)
             };
-            let line = bootstrap::with_token(&line, args.token.as_deref());
-            run_interactive(stream, &line, script.as_deref(), args.linger)
+            open_interactive(host, &line, args, script.as_deref(), connect_timeout)
         }
         Cmd::Spawn { package, script } => {
             let line = if script.is_some() {
@@ -293,66 +264,73 @@ fn run_connected(args: &Args, host: &str) -> Result<i32, String> {
             } else {
                 format!("spawn {}", package)
             };
-            let line = bootstrap::with_token(&line, args.token.as_deref());
-            run_interactive(stream, &line, script.as_deref(), args.linger)
+            open_interactive(host, &line, args, script.as_deref(), connect_timeout)
         }
-        Cmd::Use { session_id } => {
-            let line = bootstrap::with_token(&format!("use {}", session_id), args.token.as_deref());
-            run_interactive(stream, &line, None, args.linger)
-        }
+        Cmd::Use { session_id } => open_interactive(
+            host,
+            &format!("use {}", session_id),
+            args,
+            None,
+            connect_timeout,
+        ),
         Cmd::Gadget { script } => {
             let line = if script.is_some() {
-                "gadget -l -".to_string()
+                "gadget -l -"
             } else {
-                "gadget".to_string()
+                "gadget"
             };
-            let line = bootstrap::with_token(&line, args.token.as_deref());
-            run_interactive(stream, &line, script.as_deref(), args.linger)
+            open_interactive(host, &line, args, script.as_deref(), connect_timeout)
         }
     }
 }
 
-/// `list` / `ps`：发一行、读多行直到空行，然后按表格打印。
-fn send_query(
-    stream: &mut TcpStream,
+/// 引导 + 建会话 + 进 REPL，返回进程退出码。
+///
+/// 三类结果分开处置，与重构前逐字一致：
+/// - 成功 → 打印 OK 行，进 REPL；
+/// - 服务端拒绝（非 OK 行）→ 原样打印该行，退出码 1（不是 Err，避免被
+///   Gadget 重试循环当成「没起好」而无休止重试）；
+/// - 链路失败 → Err，由调用方决定是重试还是上报。
+fn open_interactive(
+    host: &str,
     line: &str,
-    token: Option<&str>,
-    header: &str,
-    empty_hint: &str,
-) -> Result<i32, String> {
-    let line = bootstrap::with_token(line, token);
-    bootstrap::send_bootstrap(stream, &line, None)?;
-    let lines = bootstrap::read_response_lines(stream)?;
-    if lines.is_empty() {
-        repl::print_line(empty_hint);
-    } else {
-        repl::print_line(header);
-        for l in &lines {
-            repl::print_line(l);
-        }
-    }
-    Ok(0)
-}
-
-/// 发送引导请求，校验 OK 后进入 REPL；返回进程退出码。
-fn run_interactive(
-    stream: TcpStream,
-    line: &str,
+    args: &Args,
     script_path: Option<&str>,
-    linger_secs: u64,
+    connect_timeout: Duration,
 ) -> Result<i32, String> {
-    let mut stream = stream;
-    bootstrap::send_bootstrap(&mut stream, line, script_path)?;
-    let response = bootstrap::read_response_line(&mut stream)?;
-    if !response.starts_with("OK") {
-        repl::print_line(&response);
-        return Ok(1);
+    match query::open_session(host, line, args.token.as_deref(), script_path, connect_timeout) {
+        Ok(opened) => {
+            repl::print_line(&opened.ok_line);
+            let session = Arc::new(opened.session);
+            repl::run(&session, opened.events, Duration::from_secs(args.linger))?;
+            Ok(0)
+        }
+        Err(OpenError::Rejected(reason)) => {
+            repl::print_line(&reason);
+            Ok(1)
+        }
+        Err(OpenError::Transport(e)) => Err(e),
     }
-    repl::print_line(&response);
-    // 服务端/Gadget 在 OK 行宣告 agent 协议版本（proto=N）；
-    // 拿不到时（旧服务端）交给 Session 等 HELLO 或退回 legacy。
-    let proto_hint = bootstrap::parse_proto_hint(&response);
-    let (session, events) = Session::connect(stream, proto_hint)?;
-    repl::run(&Arc::new(session), events, Duration::from_secs(linger_secs))?;
-    Ok(0)
+}
+
+fn print_session_rows(rows: &[SessionRow]) {
+    if rows.is_empty() {
+        repl::print_line("(无会话)");
+        return;
+    }
+    repl::print_line("ID\tPID\tLABEL\tSTATUS");
+    for row in rows {
+        repl::print_line(&row.to_line());
+    }
+}
+
+fn print_process_rows(rows: &[ProcessRow]) {
+    if rows.is_empty() {
+        repl::print_line("(无匹配进程)");
+        return;
+    }
+    repl::print_line("PID\tNAME");
+    for row in rows {
+        repl::print_line(&row.to_line());
+    }
 }
