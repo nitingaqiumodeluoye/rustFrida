@@ -1,0 +1,27 @@
+[package]
+name = "rfclient-gui"
+version = "0.1.0"
+edition = "2021"
+description = "rustFrida 主机端图形客户端：复用 rfclient-core 的协议与会话实现"
+
+[[bin]]
+name = "rfclient-gui"
+path = "src/main.rs"
+
+[dependencies]
+rfclient-core = { path = "../rfclient-core" }
+
+# 刻意选 glow（OpenGL）而不是默认的 wgpu：
+#  - 依赖树小很多，CI 构建更快；
+#  - 不要求 DX12/Vulkan，老显卡、虚拟机和远程桌面里也能起来（调试工具的使用场景）。
+# 需要配合 NativeOptions::renderer = Renderer::Glow 一起用。
+eframe = { version = "0.36", default-features = false, features = [
+    "default_fonts",
+    "glow",
+    "wayland",
+    "x11",
+] }
+egui_extras = "0.36"
+
+# 选脚本文件用系统原生对话框（Windows 上走 Win32，不引入额外运行时）。
+rfd = "0.17"

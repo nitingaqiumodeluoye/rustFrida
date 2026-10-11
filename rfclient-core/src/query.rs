@@ -34,6 +34,81 @@ pub struct SessionRow {
     pub status: String,
 }
 
+/// `jslist` 应答里的一项。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptEntry {
+    pub id: u64,
+    pub name: String,
+    pub native_hooks: usize,
+    pub java_hooks: usize,
+    pub bytes: usize,
+}
+
+impl ScriptEntry {
+    /// 脚本持有的 hook 总数（卸载前想知道「会拆掉多少东西」）。
+    pub fn hook_count(&self) -> usize {
+        self.native_hooks + self.java_hooks
+    }
+}
+
+/// 解析 agent `jslist` 的文本应答。
+///
+/// 格式（见 agent/src/quickjs_loader.rs::execute_jslist）：
+/// ```text
+/// script#1 name.js\tnative=1 java=0 bytes=1234
+/// ```
+/// 空表回的是 `no scripts loaded`。
+///
+/// 解析放在 core 而不是 GUI 里：这是**协议格式知识**，CLI 与 GUI 都有权依赖，
+/// 各自再写一遍就迟早会不一致。
+///
+/// 容错取向：认不出的行跳过（而不是报错）—— 多出一个字段总比整张表打不开好。
+pub fn parse_script_list(text: &str) -> Vec<ScriptEntry> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = line.trim_end();
+        let Some(rest) = line.strip_prefix("script#") else {
+            continue;
+        };
+        // "1 name.js\tnative=1 java=0 bytes=1234"
+        let (id_part, tail) = match rest.split_once(char::is_whitespace) {
+            Some(parts) => parts,
+            None => (rest, ""),
+        };
+        let Ok(id) = id_part.parse::<u64>() else {
+            continue;
+        };
+        let (name, stats) = match tail.split_once('\t') {
+            Some((name, stats)) => (name.to_string(), stats),
+            // 没有制表符时整个 tail 就是名字，统计字段全部缺省。
+            None => (tail.to_string(), ""),
+        };
+        let mut entry = ScriptEntry {
+            id,
+            name,
+            native_hooks: 0,
+            java_hooks: 0,
+            bytes: 0,
+        };
+        for field in stats.split_whitespace() {
+            let Some((key, value)) = field.split_once('=') else {
+                continue;
+            };
+            let Ok(value) = value.parse::<usize>() else {
+                continue;
+            };
+            match key {
+                "native" => entry.native_hooks = value,
+                "java" => entry.java_hooks = value,
+                "bytes" => entry.bytes = value,
+                _ => {}
+            }
+        }
+        out.push(entry);
+    }
+    out
+}
+
 impl SessionRow {
     /// 还原成服务端的原始行，保证 CLI 输出与重构前逐字节一致。
     pub fn to_line(&self) -> String {
@@ -192,4 +267,85 @@ pub fn open_session(
         session,
         events,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn 空表返回空列表() {
+        assert!(parse_script_list("no scripts loaded").is_empty());
+        assert!(parse_script_list("").is_empty());
+    }
+
+    #[test]
+    fn 解析正常条目() {
+        let entries = parse_script_list("script#7 hook.js\tnative=3 java=2 bytes=1024\n");
+        assert_eq!(entries.len(), 1);
+        let e = &entries[0];
+        assert_eq!(e.id, 7);
+        assert_eq!(e.name, "hook.js");
+        assert_eq!(e.native_hooks, 3);
+        assert_eq!(e.java_hooks, 2);
+        assert_eq!(e.bytes, 1024);
+        assert_eq!(e.hook_count(), 5);
+    }
+
+    #[test]
+    fn 文件名带空格时整段归名字() {
+        // 制表符才是名字与统计字段的分界，名字里的空格不能被当成分隔。
+        let entries = parse_script_list("script#1 my script.js\tnative=0 java=0 bytes=8\n");
+        assert_eq!(entries[0].name, "my script.js");
+        assert_eq!(entries[0].hook_count(), 0);
+    }
+
+    #[test]
+    fn 多行与混合内容() {
+        let text = "script#1 a.js\tnative=1 java=0 bytes=10\n\
+                    script#2 b.js\tnative=0 java=4 bytes=20\n";
+        let entries = parse_script_list(text);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].id, 1);
+        assert_eq!(entries[1].id, 2);
+        assert_eq!(entries[1].java_hooks, 4);
+    }
+
+    #[test]
+    fn 无法识别的行被跳过而不是整体失败() {
+        // 目标是「多一个字段也比整张表打不开好」：坏行跳过，好行照收。
+        let text = "not a script line\nscript#3 c.js\tnative=9 java=9 bytes=9\n";
+        let entries = parse_script_list(text);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, 3);
+    }
+
+    #[test]
+    fn 缺少统计字段时只填名字() {
+        // 没有制表符 ⇒ 整段都是名字，统计字段保持 0（而不是把名字丢掉）。
+        let entries = parse_script_list("script#5 bare.js");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, 5);
+        assert_eq!(entries[0].name, "bare.js");
+        assert_eq!(entries[0].bytes, 0);
+        assert_eq!(entries[0].hook_count(), 0);
+    }
+
+    #[test]
+    fn 会话行与进程行可往返() {
+        let row = parse_session_row("3\t1234\tcom.example\tactive");
+        assert_eq!(row.to_line(), "3\t1234\tcom.example\tactive");
+        let proc = parse_process_row("4242\tcom.example");
+        assert_eq!(proc.to_line(), "4242\tcom.example");
+    }
+
+    #[test]
+    fn 标签里混进制表符时不丢字段() {
+        // 协议没有转义机制；用 splitn 保证余下部分并入 status 而不是把行拆散。
+        let row = parse_session_row("1\t2\tweird\tlabel\tactive");
+        assert_eq!(row.id, 1);
+        assert_eq!(row.pid, 2);
+        assert_eq!(row.label, "weird");
+        assert_eq!(row.status, "label\tactive");
+    }
 }

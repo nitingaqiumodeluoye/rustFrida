@@ -296,13 +296,22 @@ jobs:
           check 18805 session "" "forwards;exit" "没有正在进行的端口转发"
           exit "$fail"
 
+      - name: Unit tests (rfclient-core)
+        # 协议文本格式的解析放在 core（CLI 与 GUI 共用），它是纯函数，
+        # 正好用单元测试钉住行为：多一个字段、缺字段、名字里带空格、
+        # 制表符混进 label ⋯ 这些边界都不该让整张表打不开。
+        run: cargo test -p rfclient-core --locked --target x86_64-unknown-linux-gnu
+
   # rfclient 是跑在主机上的控制客户端，Windows 使用者需要一个原生 .exe。
   # 单独开 job 而不是在 Linux 里交叉编译：msvc 目标必须用 MSVC 工具链，
   # Linux 上做不到；windows-latest 的 standard runner 对公共仓库免费。
   #
   # 这里不需要初始化子模块（只有 quickjs-hook 用得上），也不需要 NDK：
-  # rfclient 只依赖 clap + rustyline，全程无 bindgen / cc，仓库 .cargo/config.toml
+  # rfclient / rfclient-gui 全程无 bindgen / cc，仓库 .cargo/config.toml
   # 里那堆 Android 交叉工具对它不生效（显式 --target 会覆盖 [build].target）。
+  #
+  # 两个产物同出一个 job：共用同一份 cargo 缓存与工具链，且它们的依赖树
+  # 高度重叠（都依赖 rfclient-core），分开跑只是让缓存互相冷启动。
   rfclient-windows:
     name: rfclient (Windows x86_64)
     runs-on: windows-latest
@@ -321,12 +330,17 @@ jobs:
         with:
           key: windows-x86_64
 
-      - name: Build rfclient (Windows x86_64)
+      - name: Build rfclient + rfclient-gui (Windows x86_64)
         # +crt-static：把 MSVC 运行库静态链进 exe，产物不依赖「VC++ 可再发行
         # 组件包」，拷到任意 Windows x64 上可直接运行。
+        #
+        # eframe 用 glow（OpenGL）后端而不是默认的 wgpu：不要求 DX12/Vulkan，
+        # 虚拟机、远程桌面、老显卡上都能起来 —— 调试工具经常就在那些环境里跑。
         env:
           RUSTFLAGS: -C target-feature=+crt-static
-        run: cargo build -p rfclient --release --locked --target x86_64-pc-windows-msvc
+        run: |
+          cargo build -p rfclient --release --locked --target x86_64-pc-windows-msvc
+          cargo build -p rfclient-gui --release --locked --target x86_64-pc-windows-msvc
 
       - name: Verify and collect
         shell: pwsh
@@ -343,11 +357,19 @@ jobs:
           $help | Select-Object -First 3
           if ($code -ne 0) { throw "rfclient.exe --help 失败，退出码 $code" }
 
+          # GUI 只做「文件存在 + 能加载」级别的检查：它需要窗口系统与 OpenGL，
+          # 在无头 runner 上启动必然失败，那属于环境而不是代码问题。
+          $gui = "target/x86_64-pc-windows-msvc/release/rfclient-gui.exe"
+          if (-not (Test-Path $gui)) { throw "构建产物不存在: $gui" }
+
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item $exe dist/rfclient.exe
-          Get-Item dist/rfclient.exe | Format-List Name, Length
-          $hash = (Get-FileHash dist/rfclient.exe -Algorithm SHA256).Hash.ToLower()
-          Set-Content -Encoding ascii dist/SHA256SUMS.txt -Value "$hash  rfclient.exe"
+          Copy-Item $gui dist/rfclient-gui.exe
+          Get-ChildItem dist/*.exe | Format-Table Name, Length
+          $lines = Get-ChildItem dist/*.exe | ForEach-Object {
+            "$((Get-FileHash $_ -Algorithm SHA256).Hash.ToLower())  $($_.Name)"
+          }
+          Set-Content -Encoding ascii dist/SHA256SUMS.txt -Value $lines
           Get-Content dist/SHA256SUMS.txt
 
       - name: Upload artifacts

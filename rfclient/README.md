@@ -22,7 +22,11 @@ chmod +x out/ci-<run-id>/rfclient
 gh run download <run-id> --repo "$REPO" -n rfclient-windows-x86_64-<sha> -D out/win
 ```
 
-Windows 产物用 `x86_64-pc-windows-msvc` + `+crt-static` 构建，MSVC 运行库已静态链入，
+Windows artifact 里同时含图形客户端 `rfclient-gui.exe`（见
+[`../rfclient-gui/README.md`](../rfclient-gui/README.md)），两者共用
+[`../rfclient-core`](../rfclient-core) 的协议实现。
+
+两个 exe 都用 `x86_64-pc-windows-msvc` + `+crt-static` 构建，MSVC 运行库已静态链入，
 **不需要安装 VC++ 可再发行组件包**，拷到任意 Windows x64 上直接跑。
 
 仅在需要本地复现 CI 失败时才手动编（仓库 `.cargo/config.toml` 默认 target 是

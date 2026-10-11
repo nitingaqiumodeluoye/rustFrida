@@ -14,6 +14,7 @@ members = [
     "quickjs-hook",
     "rfclient",
     "rfclient-core",
+    "rfclient-gui",
 ]
 # We miss our linux_no_std example from the default members since `cargo check`
 # and `cargo test` both attempt to link the `std` library into it in error.

@@ -57,7 +57,10 @@ pub mod session;
 
 pub use channel::{Channels, ForwardInfo};
 pub use event::{ChannelOpened, Disconnect, Event};
-pub use query::{list_processes, list_sessions, open_session, OpenError, Opened, ProcessRow, SessionRow};
+pub use query::{
+    list_processes, list_sessions, open_session, parse_script_list, OpenError, Opened, ProcessRow,
+    ScriptEntry, SessionRow,
+};
 pub use session::{
     Pending, Reply, ReplyKind, Session, HEARTBEAT_INTERVAL_SECS, HEARTBEAT_TIMEOUT_SECS, HELLO_WAIT_MILLIS,
 };
