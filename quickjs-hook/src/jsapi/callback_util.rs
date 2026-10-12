@@ -172,6 +172,26 @@ impl Drop for JsEngineCallbackGuard {
     }
 }
 
+/// Acquire JS_ENGINE lock for a native Interceptor hook callback (blocking).
+///
+/// 与 `acquire_js_engine_for_callback` 不同: 阻塞等待直到拿到引擎锁, 保证回调不丢。
+/// 同线程重入(回调内又触发同一 hook)复用当前 owner, 避免自死锁。
+/// 仅用于 Interceptor onEnter/onLeave; Java 路径仍用 try_lock 版本(见 678d635)。
+pub(crate) unsafe fn acquire_js_engine_blocking(ctx: *mut ffi::JSContext) -> JsEngineCallbackGuard {
+    let current_thread = crate::current_thread_id_u64();
+    if crate::JS_ENGINE_OWNER_THREAD.load(std::sync::atomic::Ordering::Acquire) == current_thread {
+        ffi::qjs_update_stack_top(ctx);
+        return JsEngineCallbackGuard::Reentrant;
+    }
+    let g = match crate::JS_ENGINE.lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    crate::mark_js_engine_owner_current_thread();
+    ffi::qjs_update_stack_top(ctx);
+    JsEngineCallbackGuard::Locked { _guard: g }
+}
+
 /// Acquire JS_ENGINE lock for a hook callback.
 ///
 /// Same-thread reentrant callbacks reuse the current JS engine owner context.

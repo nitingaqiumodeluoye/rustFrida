@@ -6,7 +6,7 @@
 use crate::ffi;
 use crate::ffi::hook as hook_ffi;
 use crate::jsapi::callback_util::{
-    acquire_js_engine_for_callback, get_js_u64_property_atom, handle_js_exception, hot_atoms,
+    acquire_js_engine_blocking, get_js_u64_property_atom, handle_js_exception, hot_atoms,
     invoke_hook_callback_common, js_u64_to_js_number_or_bigint, js_value_to_u64_or_zero, set_js_cfunction_property,
     set_js_u64_property_atom,
 };
@@ -30,9 +30,6 @@ static IN_FLIGHT_NATIVE_HOOK_CALLBACKS_CV: Condvar = Condvar::new();
 
 /// 防重入早退日志限流计数（前 4 条直出，之后每 200 条记一录）。
 static REENTER_LOG_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-/// attach 模式 onEnter 引擎忙 bypass 日志限流计数。
-static ATTACH_BYPASS_LOG_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// 每 target 首次 dispatch 记录一次（诊断事件是否到达分发层）。
 static ATTACH_DISPATCH_LOGGED: Mutex<Vec<u64>> = Mutex::new(Vec::new());
@@ -469,7 +466,7 @@ pub(crate) unsafe extern "C" fn attach_on_enter_wrapper(
             ));
         }
     }
-    let (ctx_usize, has_on_enter, has_on_leave, on_enter_bytes, hook_mutation) = {
+    let (ctx_usize, has_on_enter, has_on_leave, on_enter_bytes) = {
         let guard = match HOOK_REGISTRY.lock() {
             Ok(g) => g,
             Err(_) => return,
@@ -482,34 +479,14 @@ pub(crate) unsafe extern "C" fn attach_on_enter_wrapper(
             Some(d) => d,
             None => return,
         };
-        (data.ctx, data.has_on_enter, data.has_on_leave, data.callback_bytes, data.mutation)
+        (data.ctx, data.has_on_enter, data.has_on_leave, data.callback_bytes)
     };
 
     let ctx = ctx_usize as *mut ffi::JSContext;
     // 日志归属：onEnter 里的 console 输出归到这个 hook 的注册脚本。
     let _script_scope = crate::script_scope(super::resolve_owner_script(target_addr));
-    // mutation:true → 修改型 hook（onEnter 会改入参）: 自旋预算 300ms，绝不丢；
-    // 默认观察型: 预算 10ms，耗尽即丢（透传原函数）。deferred 重放机制已退役。
-    let mutation = hook_mutation;
-    let _js_guard = match acquire_js_engine_for_callback(ctx, "interceptor.onEnter", target_addr, if mutation { 150 } else { 5 }) {
-        Some(g) => g,
-        None => {
-            // 自旋耗尽: 本次 onEnter 未执行（透传原函数）。
-            // 观察型: 允许丢弃（本次日志缺口 <0.2%）;
-            // 修改型(mutation:true 已等满 300ms): 参数修改丢失, 大字告警（功能失守事件）。
-            let n = ATTACH_BYPASS_LOG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if mutation {
-                crate::jsapi::console::output_message(&format!(
-                    "[hook][严重][MUTATION LOST] engine busy 等待300ms超时 — 本次 onEnter 未执行，原参数已透传，修改丢失 (target={target_addr:#x})"
-                ));
-            } else if n < 4 || n % 200 == 0 {
-                crate::jsapi::console::output_message(&format!(
-                    "[hook] bypassed reason=engine-busy(attach.onEnter) target={target_addr:#x} — 自旋耗尽，已丢弃（观察型）"
-                ));
-            }
-            return;
-        }
-    };
+    // 阻塞取锁: 回调不丢(见 callback_util::acquire_js_engine_blocking)。
+    let _js_guard = acquire_js_engine_blocking(ctx);
 
     let js_ctx = build_invocation_ctx(ctx, ctx_ptr);
 
@@ -555,7 +532,7 @@ pub(crate) unsafe extern "C" fn attach_on_leave_wrapper(
 
     let target_addr = user_data as u64;
 
-    let (ctx_usize, on_leave_bytes, has_on_leave, hook_mutation2) = {
+    let (ctx_usize, on_leave_bytes, has_on_leave) = {
         let guard = match HOOK_REGISTRY.lock() {
             Ok(g) => g,
             Err(_) => return,
@@ -568,7 +545,7 @@ pub(crate) unsafe extern "C" fn attach_on_leave_wrapper(
             Some(d) => d,
             None => return,
         };
-        (data.ctx, data.on_leave_bytes, data.has_on_leave, data.mutation)
+        (data.ctx, data.on_leave_bytes, data.has_on_leave)
     };
 
     if !has_on_leave {
@@ -579,17 +556,7 @@ pub(crate) unsafe extern "C" fn attach_on_leave_wrapper(
     let ctx = ctx_usize as *mut ffi::JSContext;
     // 日志归属：onLeave 同理。
     let _script_scope = crate::script_scope(super::resolve_owner_script(target_addr));
-    let _js_guard = match acquire_js_engine_for_callback(ctx, "interceptor.onLeave", target_addr, if hook_mutation2 { 150 } else { 5 }) {
-        Some(g) => g,
-        None => {
-            if hook_mutation2 {
-                crate::jsapi::console::output_message(&format!(
-                    "[hook][严重][MUTATION LOST] engine busy 等待300ms超时 — 本次 onLeave 未执行 (target={:#x})", target_addr
-                ));
-            }
-            return;
-        }
-    };
+    let _js_guard = acquire_js_engine_blocking(ctx);
 
     // pop on_enter 留下的 this 对象；若 !has_on_enter 或 stack 意外为空，新建一个
     let js_ctx = match invocation_pop() {
