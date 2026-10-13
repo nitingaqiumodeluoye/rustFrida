@@ -46,6 +46,20 @@ pub(crate) const STEALTH_NORMAL: i32 = StealthMode::Normal as i32;
 pub(crate) const STEALTH_WXSHADOW: i32 = StealthMode::WxShadow as i32;
 pub(crate) const STEALTH_RECOMP: i32 = StealthMode::Recomp as i32;
 
+/// 参数省略时使用的默认 stealth 模式：无痕（wxshadow）。
+///
+/// 为什么默认 WxShadow：它走内核 shadow 页，原始页字节一个都不改，
+/// `/proc/self/mem` 读回原字节、CRC 校验也过；Recomp 要多占重编译页
+/// 并依赖 ART 页翻译，Normal 则直接改原始字节（CRC / maps 扫描可见）。
+///
+/// 装不上时**不降级**：C 层 `patch_target` 在 stealth==1 失败时直接返回
+/// `HOOK_ERROR_WXSHADOW_FAILED`，明确拒绝退回 mprotect（降级会改原始字节并把页
+/// 改成 RWX，CRC / /proc/self/maps 都能发现）。调用方须把这个错误如实抛给脚本，
+/// 不要静默继续。
+///
+/// 需要旧行为（普通 inline hook）时显式传 `0` / `false` / `Hook.NORMAL`。
+pub(crate) const DEFAULT_STEALTH_MODE: StealthMode = StealthMode::WxShadow;
+
 impl StealthMode {
     /// 从 JS 参数解析 stealth 模式
     /// - 0 / false / omitted → Normal

@@ -34,13 +34,20 @@ use super::PAC_STRIP_MASK;
 // Stealth 全局开关（支持 Normal / WxShadow / Recomp 三种模式）
 // ============================================================================
 
+use crate::jsapi::hook_api::registry::DEFAULT_STEALTH_MODE;
 use crate::jsapi::hook_api::StealthMode;
 
 /// 全局 stealth 模式。
 /// Normal=0  无 stealth
 /// WxShadow=1  内核 shadow page patch
 /// Recomp=2  页级重编译，在重编译页上 hook
-static STEALTH_MODE: AtomicU8 = AtomicU8::new(StealthMode::Normal as u8);
+///
+/// 初值取 `DEFAULT_STEALTH_MODE`（无痕 wxshadow），使脚本不写 `Java.setStealth()`
+/// 时也走无痕：host 端的 `detect_java_stealth_mode` 只在脚本显式声明时才预发送
+/// `javastealth N`，所以“没声明”与“声明了 stealth”之间原本会差一档，
+/// 而 ART 钩子一旦装上就不允许再改模式（`Java.setStealth()` 会直接报错），
+/// 因此默认值必须在这里就定成无痕。
+static STEALTH_MODE: AtomicU8 = AtomicU8::new(DEFAULT_STEALTH_MODE as u8);
 
 /// pre-resume artinit「精简预装」开关。
 ///
@@ -623,6 +630,18 @@ pub(super) fn ensure_art_controller_initialized(
         maybe_install_raw_clone_executor_loop_hook(env);
         return;
     }
+
+    // 把 Rust 侧的 stealth 模式同步到 C 层。
+    //
+    // C 层 `g_stealth_mode` 初值是 0(Normal)，只能靠 `hook_set_stealth_mode()` 更新，
+    // 而那条调用链此前只发生在两条显式路径上：脚本 / host 预扫描里的
+    // `Java.setStealth()`。默认值改成 wxshadow 后，若不在这里推一次，就会出现
+    // Rust 侧 `prepare_hook_target` 按 wxshadow 给出 sflag=1、而 C 侧 oat_patch 仍按
+    // Normal 走 mprotect 直写的分裂——那正是“默认无痕”最不能接受的静默降级。
+    //
+    // 位置选择：此处是 ART 钩子安装的统一入口，且上面的 `is_some()` 保证只进一次，
+    // 所以是能同时满足“先同步、后装钩”与“不重复打日志”的位置。
+    set_stealth_mode(stealth_mode());
 
     output_verbose("[artController] 开始安装三层拦截矩阵...");
 

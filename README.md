@@ -606,6 +606,7 @@ attachNative(open, {
     onEnter: cm.on_enter,
     onLeave: cm.on_leave,
     data: state,
+    // 不写 mode 就是默认的无痕 WxShadow；Hook.NORMAL 是显式退回 mprotect 直写
     mode: Hook.NORMAL
 });
 ```
@@ -728,12 +729,27 @@ Interceptor.flush();           // no-op，兼容脚本
 
 ### Stealth 模式
 
+**默认就是无痕（WxShadow）**：不传第三个参数时走内核 shadow 页，原始页字节一个都不改，
+`/proc/self/mem` 读回原字节、CRC 校验也过。
+
 ```js
-hook(target, callback, Hook.NORMAL)     // 0: mprotect 直写（默认）
-hook(target, callback, Hook.WXSHADOW)   // 1: 内核 shadow 页，/proc/mem 不可见
+hook(target, callback, Hook.WXSHADOW)   // 1: 内核 shadow 页，/proc/mem 不可见（默认）
 hook(target, callback, 1)               // 数字也行
 hook(target, callback, true)            // true = WXSHADOW
+hook(target, callback, Hook.NORMAL)     // 0: mprotect 直写（显式退回旧行为）
+hook(target, callback, false)           // false = NORMAL
 ```
+
+**装不上不降级**：内核不支持 wxshadow（`prctl(0x57580006)` 失败，比如 KPM 未加载、
+目标页是 2MB PMD 映射且拆分也失败）时，`hook()` 直接抛异常，**不会**偷偷退回 mprotect。
+这是故意的：降级会改原始内存字节并把页改成 RWX，CRC 校验 / `/proc/self/maps` 扫描都能发现，
+静默降级比装不上更危险。
+
+需要普通 inline hook 时显式传 `Hook.NORMAL` / `0` / `false`。
+
+同一条默认值适用于全部 native hook 入口：`hook()`、`Interceptor.attach()`、
+`Interceptor.replace()`、`hookNative()`、`attachNative()`（位置参数与 options 对象的 `mode` 字段）。
+唯一例外是 `recompHook()`，它是 `Hook.RECOMP` 的便捷形式。
 
 ### API 速查
 
@@ -1169,13 +1185,19 @@ var MyCls = Java.findClassWithLoader(loaders[0], "com.example.MyClass");
 
 ### Stealth 模式（Java hook）
 
+**默认就是无痕（WxShadow）**，不用显式调 `Java.setStealth()`：ART controller 初始化时
+会把默认模式同步到 C 层，所以 OAT patch / 方法路由全都走 shadow 页，不存在
+“Rust 侧按无痕、C 侧还按 mprotect” 的分裂。
+
 ```js
-Java.setStealth(0);  // Normal: mprotect 直写
-Java.setStealth(1);  // WxShadow: shadow 页，CRC 校验不可见
+Java.setStealth(1);  // WxShadow: shadow 页，CRC 校验不可见（默认）
+Java.setStealth(0);  // Normal: mprotect 直写（显式退回旧行为）
+Java.setStealth(2);  // Recomp: 页级重编译
 Java.getStealth();   // 查询当前模式 (0/1/2)
 ```
 
-须在 `Java.use().impl` 之前设置。
+须在 `Java.use().impl` 之前设置。与 native 侧一致，wxshadow 装不上时**不降级**：
+`prepare_hook_target_strict` 会跳过该 hook 并打日志，不会回退到 mprotect。
 
 ### Deopt API
 
@@ -1384,7 +1406,7 @@ Interceptor.attach(Jni.addr("RegisterNatives"), {
             console.log("  " + (m.name || "<null>") + " " + (m.sig || "<null>") + " → " + where);
         }
     }
-}, Hook.WXSHADOW);
+});   // 不传第三个参数 = 默认无痕（WxShadow）
 ```
 
 ---
@@ -1663,7 +1685,8 @@ Trace 文件默认输出到 `/data/data/<package>/trace_bundle.pb`，配合 qbdi
 - **Java 字段访问必须用 `.value`：** `obj.field` 返回 FieldWrapper，`obj.field.value` 才是真实值
 - **`Java.choose` 的 wrapper 仅在 `onMatch` 内有效**，跨回调保留需要自己提取字段值
 - Spawn 模式下 Java hook 必须放在 `Java.ready(fn)` 里（`Java.classLoaders()` / `Java.choose` 同理）
-- `Java.setStealth()` 必须在 `Java.use().impl` 之前调用
+- `Java.setStealth()` 必须在 `Java.use().impl` 之前调用；不调则默认 WxShadow（无痕），要 mprotect 直写就显式 `Java.setStealth(0)`
+- **native hook / Java hook 默认都是无痕（WxShadow）**：内核不支持时 hook 直接失败（native 抛异常、Java 跳过安装），不会静默降级成可检测的 mprotect 写；确认 KPM/自定义内核已就绪再跑
 - `callNative()` 仅支持整数/指针参数（最多 6 个），需要浮点/任意签名用 `NativeFunction`
 - 自修改代码后需 `Memory.flushCodeCache(addr, size)` 清 I-cache
 

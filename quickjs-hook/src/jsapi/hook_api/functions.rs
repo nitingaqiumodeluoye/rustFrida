@@ -16,7 +16,9 @@ use super::callback::{
     native_attach_on_leave_wrapper, NativeAttachCallbacks,
 };
 use super::cmodule::is_cmodule_code_address;
-use super::registry::{hook_error_message, init_registry, HookData, HookKind, StealthMode, HOOK_OK, HOOK_REGISTRY};
+use super::registry::{
+    hook_error_message, init_registry, HookData, HookKind, StealthMode, DEFAULT_STEALTH_MODE, HOOK_OK, HOOK_REGISTRY,
+};
 use crate::jsapi::callback_util::with_registry_mut;
 
 unsafe fn finalize_recomp_hook_slot(
@@ -60,6 +62,7 @@ pub(crate) unsafe extern "C" fn js_hook(
     let callback_arg = JSValue(*argv.add(1));
 
     // 解析 stealth 模式：0=Normal, 1/true=WxShadow, 2=Recomp
+    // 省略第三个参数 → DEFAULT_STEALTH_MODE（无痕 wxshadow）
     let mode = if argc >= 3 {
         let mode_arg = JSValue(*argv.add(2));
         match mode_arg.to_i64(ctx) {
@@ -69,7 +72,7 @@ pub(crate) unsafe extern "C" fn js_hook(
             None => StealthMode::Normal,
         }
     } else {
-        StealthMode::Normal
+        DEFAULT_STEALTH_MODE
     };
 
     install_hook(ctx, ptr_arg, callback_arg, mode)
@@ -333,7 +336,7 @@ pub(crate) unsafe extern "C" fn js_hook_native(
     let mode = if argc >= 4 {
         parse_stealth_mode(ctx, JSValue(*argv.add(3)))
     } else {
-        StealthMode::Normal
+        DEFAULT_STEALTH_MODE
     };
 
     init_registry();
@@ -462,7 +465,7 @@ pub(crate) unsafe extern "C" fn js_attach_native(
                 js_value_to_u64_or_zero(ctx, data_prop)
             };
             let parsed_mode = if mode_prop.is_undefined() || mode_prop.is_null() {
-                StealthMode::Normal
+                DEFAULT_STEALTH_MODE
             } else {
                 parse_stealth_mode(ctx, mode_prop)
             };
@@ -495,7 +498,7 @@ pub(crate) unsafe extern "C" fn js_attach_native(
         let parsed_mode = if argc >= 4 {
             parse_stealth_mode(ctx, JSValue(*argv.add(3)))
         } else {
-            StealthMode::Normal
+            DEFAULT_STEALTH_MODE
         };
         (on_enter, 0, data, parsed_mode)
     };
@@ -891,7 +894,7 @@ pub(crate) unsafe extern "C" fn js_interceptor_attach(
     let mode = if argc >= 3 {
         parse_stealth_mode(ctx, JSValue(*argv.add(2)))
     } else {
-        StealthMode::Normal
+        DEFAULT_STEALTH_MODE
     };
 
     let addr = match extract_pointer_address(ctx, ptr_arg, "Interceptor.attach") {
@@ -1067,7 +1070,7 @@ pub(crate) unsafe extern "C" fn js_interceptor_replace(
     let mode = if argc >= 3 {
         parse_stealth_mode(ctx, JSValue(*argv.add(2)))
     } else {
-        StealthMode::Normal
+        DEFAULT_STEALTH_MODE
     };
     install_hook(ctx, ptr_arg, replacement_arg, mode)
 }
