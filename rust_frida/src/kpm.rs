@@ -282,7 +282,7 @@ fn probe_authorization(uid: u32) -> Result<i64, String> {
     ))
 }
 
-fn control(module: &str, args: &str) -> Result<(), String> {
+pub(crate) fn control(module: &str, args: &str) -> Result<(), String> {
     let key =
         CString::new(SUPERCALL_KEY).map_err(|e| format!("KernelPatch key 无效: {}", e))?;
     let module = CString::new(module).map_err(|e| format!("KPM 名称无效: {}", e))?;
@@ -342,6 +342,96 @@ fn control(module: &str, args: &str) -> Result<(), String> {
         describe_errno(errno),
         auth_note
     ))
+}
+
+/// 发一条 ctl0 命令,并把内核写回的 `out_msg` 内容取回来。
+///
+/// 与 [`control`] 的区别在**取数**:`out_msg` 必须是调用方与子进程共享的同一块
+/// 物理页,否则内核写进去的内容在子进程 `_exit` 之后就丢了。
+///
+/// 为什么普通 `Vec<u8>` / 栈缓冲不行:`supercall_as` 会 `fork` 出子进程去降权执行
+/// supercall,而 fork 之后父子各自持有私有 COW 页 —— 内核 `copy_to_user` 写的是
+/// 子进程那一份,父进程读不到。
+///
+/// 所以这里用 `MAP_SHARED | MAP_ANONYMOUS`:
+///   - `MAP_SHARED` 让父子映射**同一物理页**,子进程里的写入父进程直接可见;
+///   - `MAP_ANONYMOUS` 免去临时文件;
+///   - 映射成功后立刻 `write_bytes(0)` 整块写一遍 —— 既清零,又**保证页驻留**。
+///     这是内核侧的硬约束:`module_control0()` 全程持 `rcu_read_lock()`
+///     (KernelPatch 的 `patch/module/module.c:618`),RCU 读侧临界区不能睡眠,
+///     而用户页缺页处理会睡。
+///
+/// 返回 `out_capacity` 字节的原始内容(不做 NUL 截断,由调用方按自己的协议解释)。
+pub(crate) fn control_shared(
+    module: &str,
+    args: &str,
+    out_capacity: usize,
+) -> Result<Vec<u8>, String> {
+    if out_capacity == 0 {
+        return control(module, args).map(|_| Vec::new());
+    }
+
+    let key =
+        CString::new(SUPERCALL_KEY).map_err(|e| format!("KernelPatch key 无效: {}", e))?;
+    let module_c = CString::new(module).map_err(|e| format!("KPM 名称无效: {}", e))?;
+    let args_c = CString::new(args).map_err(|e| format!("KPM 参数无效: {}", e))?;
+
+    let uid = trusted_manager_uid();
+
+    // 页对齐容量:内核按 outlen 字节写,给一个整页最省事。
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as usize;
+    let cap = out_capacity.div_ceil(page_size) * page_size;
+
+    let page = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            cap,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    if page == libc::MAP_FAILED {
+        return Err(format!(
+            "control_shared: mmap({} 字节) 失败: {}",
+            cap,
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    // 整块写一遍:清零 + 强制页驻留(内核侧在 RCU 上下文里不能缺页)。
+    unsafe { std::ptr::write_bytes(page as *mut u8, 0, cap) };
+
+    let result = supercall_as(
+        uid,
+        &key,
+        SUPERCALL_KPM_CONTROL,
+        module_c.as_ptr() as usize,
+        args_c.as_ptr() as usize,
+        page as usize,
+        cap,
+    );
+
+    // 无论成败都要先把内容取出来再解除映射 —— 失败时内核可能已写了部分数据。
+    let mut out = vec![0u8; cap];
+    unsafe { std::ptr::copy_nonoverlapping(page as *const u8, out.as_mut_ptr(), cap) };
+    unsafe { libc::munmap(page, cap) };
+
+    let (ret, errno) = result.map_err(|e| {
+        format!("KernelPatch ctl0 {} {} 失败: {}", module, args, e)
+    })?;
+
+    if ret < 0 {
+        return Err(ctl_error_detail(module, args, uid, ret, errno));
+    }
+
+    // 按内核回报的实际长度截断;ret == 0 的模块(karinahide)没有长度语义,
+    // 就原样返回整块(调用方自行按 NUL 截断)。
+    if ret > 0 && (ret as usize) < out.len() {
+        out.truncate(ret as usize);
+    }
+    Ok(out)
 }
 
 /// Ask karinahide to drop MADV_DONTNEED pages in another process without a

@@ -3,6 +3,7 @@
 mod args;
 mod communication;
 mod http_rpc;
+mod hwbp;
 mod injection;
 mod kpm;
 mod logger;
