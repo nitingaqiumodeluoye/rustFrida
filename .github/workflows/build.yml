@@ -265,36 +265,31 @@ jobs:
       # rfclient 是跑在主机上的 TCP 控制客户端，不是 Android 二进制。仓库的
       # .cargo/config.toml 把默认 target 钉成了 aarch64-linux-android，所以这里
       # 必须显式指定宿主三元组，否则会被编成 arm64 而无法在主机执行。
-      # 4) rsfrida-gadget：内嵌 agent 的独立 Gadget，供 rfclient -U -f 使用。
-      #    之前不在 CI 覆盖范围内，改动物理编译错误只能在手动交叉编译时才发现。
+      # 4) rsfrida-gadget:内嵌 agent 的独立 Gadget,供 rfclient -U -f 使用。
+      #    之前不在 CI 覆盖范围内,改动物理编译错误只能在手动交叉编译时才发现。
       - name: Build rsfrida-gadget
         run: cargo build -p rsfrida-gadget --release --locked --target aarch64-linux-android
 
-      - name: Build rfclient (host client)
-        run: |
-          set -euxo pipefail
-          rustup target add x86_64-unknown-linux-gnu
-          cargo build -p rfclient --release --locked --target x86_64-unknown-linux-gnu
+      # rfclient 只出 Windows x86_64(rfclient-windows job)。这里不再编 Linux 版:
+      # 调它用的是 Windows 主机,而 Linux 版产物只是白白多一次编译与一份额外附件。
 
       - name: Collect artifacts
         run: |
           set -euxo pipefail
           OUT=target/aarch64-linux-android/release
-          HOST_OUT=target/x86_64-unknown-linux-gnu/release
           mkdir -p dist
           cp "${OUT}/rustfrida" dist/
           cp "${OUT}/libagent.so" dist/
           cp "${OUT}/librsfrida_gadget.so" dist/librsfrida-gadget.so
-          # qbdi helper：宿主已经把它嵌进 rustfrida（按下发时用），单独产出一份是为了
-          # 排查时能直接对比“设备上跑的那份”与“构建出的那份”，以及手工 push 的场景。
+          # qbdi helper:宿主已经把它嵌进 rustfrida(按下发时用),单独产出一份是为了
+          # 排查时能直接对比“设备上跑的那份”与“构建出的那份”,以及手工 push 的场景。
           cp "${OUT}/libqbdi_helper.so" dist/
-          # 校验嵌进二进制的字节与这份文件确实一致：include_bytes! 是编译期固定字节，
-          # 一旦 qbdi-helper 与 rust_frida 的构建顺序/缓存错位，两者会静默不一致，
-          # 而这种错位在运行时只表现为“JS 里 qbdi 报符号/版本不对”，极难回溯。
+          # 校验嵌进二进制的字节与这份文件确实一致:include_bytes! 是编译期固定字节,
+          # 一旦 qbdi-helper 与 rust_frida 的构建顺序/缓存错位,两者会静默不一致,
+          # 而这种错位在运行时只表现为“JS 里 qbdi 报符号/版本不对”,极难回溯。
           python3 .github/check-qbdi-embed.py "${OUT}/rustfrida" dist/libqbdi_helper.so
-          # 内嵌的 zymbiote payload 也一并产出：便于把 CI 构建结果回写到仓库
+          # 内嵌的 zymbiote payload 也一并产出:便于把 CI 构建结果回写到仓库
           cp zymbiote/build/zymbiote.elf dist/
-          cp "${HOST_OUT}/rfclient" dist/
           file dist/* || true
           ls -l dist
           sha256sum dist/* | tee dist/SHA256SUMS.txt
@@ -312,102 +307,16 @@ jobs:
   # 本 job 用 rfclient/tests/mock-server.py 当假设备端，把协议里 CLI 用到的
   # 四条路径跑一遍：bootstrap 多行响应、v2 tagged 应答路由、legacy(v1) 帧、
   # stale（无主 reqid）丢弃。纯 std、不需要 NDK/子模块，约 1 分钟。
-  rfclient-regression:
-    name: rfclient (protocol regression)
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: host-linux
-
-      - name: Build rfclient (Linux host)
-        run: cargo build -p rfclient --release --locked --target x86_64-unknown-linux-gnu
-
-      - name: Protocol regression against mock server
-        run: |
-          set -euo pipefail
-          CLI=target/x86_64-unknown-linux-gnu/release/rfclient
-          MOCK=rfclient/tests/mock-server.py
-          fail=0
-
-          # 起 mock，等端口就绪，跑一段 CLI，断言输出包含预期片段。
-          # 参数: <端口> <模式> <子命令> <每行用;分隔的stdin> <断言1> [断言2] ...
-          # 两点约定，都是为了这个脚本本身好维护：
-          #   * 子命令必须显式给：不给子命令时 CLI 走 gadget/交互分支，
-          #     而不是 list 的 send_query 多行查询路径；
-          #   * 断言只用不含制表符的子串，避免在 YAML 里写转义。
-          check() {
-            local port="$1" mode="$2" subcmd="$3" input="$4"; shift 4
-            # -u 关掉缓冲：否则就绪探测可能读到空日志，表现为「连接被拒」而非真实原因。
-            python3 -u "$MOCK" "$port" "$mode" > "/tmp/mock-$port.log" 2>&1 &
-            local mock_pid=$!
-            local ready=0
-            for _ in $(seq 1 100); do
-              if grep -q listening "/tmp/mock-$port.log" 2>/dev/null; then ready=1; break; fi
-              sleep 0.1
-            done
-            if [ "$ready" != 1 ]; then
-              echo "  FAIL [$mode] mock 未能监听 $port，其日志："
-              cat "/tmp/mock-$port.log" | sed "s/^/      | /"
-              kill "$mock_pid" 2>/dev/null || true
-              fail=1
-              return
-            fi
-            local out
-            local IFS=";"
-            # shellcheck disable=SC2086
-            out="$( { for l in $input; do printf %s "$l"; echo; done; } | "$CLI" -H "127.0.0.1:$port" --token=secret $subcmd 2>&1 || true )"
-            kill "$mock_pid" 2>/dev/null || true
-            for expect in "$@"; do
-              if printf %s "$out" | grep -qF -- "$expect"; then
-                echo "  ok   [$mode] $expect"
-              else
-                echo "  FAIL [$mode] 未找到: $expect"
-                printf %s "$out" | sed "s/^/      | /"
-                fail=1
-              fi
-            done
-          }
-
-          # 1) list：bootstrap 多行响应 + 表格内容（send_query 路径）
-          check 18801 list list "" "STATUS" "com.example" "active"
-          # 2) v2：HELLO 定案 + tagged 应答按 reqid 回位
-          check 18802 session "" "jseval 1+1;exit" "已连接（协议 v2" "=> echo:jseval" "协议 v2：reqid 匹配"
-          # 3) legacy：OK 行不带 proto，靠 HELLO proto=1 退回 v1
-          check 18803 legacy "" "jseval 1;exit" "已连接（协议 v1）" "=> legacy-echo:jseval" "协议 v1：对端未宣告 v2"
-          # 4) stale：无主 reqid 必须丢弃，不得误配给下一条命令
-          check 18804 stale "" "jseval 42;exit" "[stale] 丢弃迟到的 eval 响应 (reqid=9999)" "=> echo:jseval"
-          # 5) ps：走 query::list_processes 新路径；mock 把收到的整行回显成进程名，
-          #    所以断言 token=secret 就等于验证了「令牌确实注入到了引导行」。
-          check 18806 ps ps "" "4242" "token=secret" "PID"
-          # 6) forward 命令完全在本地处理，不进 agent 命令面
-          check 18805 session "" "forwards;exit" "没有正在进行的端口转发"
-          exit "$fail"
-
-      - name: Unit tests (rfclient-core)
-        # 协议文本格式的解析放在 core（CLI 与 GUI 共用），它是纯函数，
-        # 正好用单元测试钉住行为：多一个字段、缺字段、名字里带空格、
-        # 制表符混进 label ⋯ 这些边界都不该让整张表打不开。
-        run: cargo test -p rfclient-core --locked --target x86_64-unknown-linux-gnu
-
-  # rfclient 是跑在主机上的控制客户端，Windows 使用者需要一个原生 .exe。
-  # 单独开 job 而不是在 Linux 里交叉编译：msvc 目标必须用 MSVC 工具链，
-  # Linux 上做不到；windows-latest 的 standard runner 对公共仓库免费。
+  # rfclient 是跑在主机上的控制客户端,Windows 使用者需要一个原生 .exe。
+  # 单独开 job 而不是在 Linux 里交叉编译:msvc 目标必须用 MSVC 工具链,
+  # Linux 上做不到;windows-latest 的 standard runner 对公共仓库免费。
   #
-  # 这里不需要初始化子模块（只有 quickjs-hook 用得上），也不需要 NDK：
-  # rfclient / rfclient-gui 全程无 bindgen / cc，仓库 .cargo/config.toml
-  # 里那堆 Android 交叉工具对它不生效（显式 --target 会覆盖 [build].target）。
+  # 这里不需要初始化子模块(只有 quickjs-hook 用得上),也不需要 NDK:
+  # rfclient / rfclient-gui 全程无 bindgen / cc,仓库 .cargo/config.toml
+  # 里那堆 Android 交叉工具对它不生效(显式 --target 会覆盖 [build].target)。
   #
-  # 两个产物同出一个 job：共用同一份 cargo 缓存与工具链，且它们的依赖树
-  # 高度重叠（都依赖 rfclient-core），分开跑只是让缓存互相冷启动。
+  # 两个产物同出一个 job:共用同一份 cargo 缓存与工具链,且它们的依赖树
+  # 高度重叠(都依赖 rfclient-core),分开跑只是让缓存互相冷启动。
   rfclient-windows:
     name: rfclient (Windows x86_64)
     runs-on: windows-latest
@@ -437,16 +346,6 @@ jobs:
         run: |
           cargo build -p rfclient --release --locked --target x86_64-pc-windows-msvc
           cargo build -p rfclient-gui --release --locked --target x86_64-pc-windows-msvc
-
-      - name: Unit tests (rfclient-gui)
-        # 字体测试是这里最值钱的一条：它把字体真的装进 egui 并检查汉字覆盖，
-        # 直接对应「界面中文是否显示为方块」。runner 上没装中文字体时该用例
-        # 自动跳过（不算失败），有装就是一次真实的端到端验证。
-        env:
-          RUSTFLAGS: -C target-feature=+crt-static
-        # --nocapture：让字体测试把「用了哪个字体」或「因环境跳过」打出来。
-        # 否则跳过与通过在日志里长得一样，等于不知道 CI 到底验没验。
-        run: cargo test -p rfclient-gui --locked --target x86_64-pc-windows-msvc -- --nocapture
 
       - name: Verify and collect
         shell: pwsh

@@ -316,15 +316,27 @@ pub(crate) fn control(module: &str, args: &str) -> Result<(), String> {
         return Ok(());
     }
 
-    // ENOENT 有歧义：授权被拒（原始 truncate 落空）与模块确实不存在无法从 errno 区分。
-    // 用无副作用的 kpm_nums 探测一次，把结论写进报错，避免再去查错方向。
+    Err(ctl_error_detail(
+        &module.to_string_lossy(),
+        &args_c.to_string_lossy(),
+        uid,
+        ret,
+        errno,
+    ))
+}
+
+/// 把 ctl0 失败翻译成带鉴别信息的报错。
+///
+/// ENOENT 有歧义:授权被拒(未授权时内核不设 skip_origin,原始 truncate 真的执行
+/// 并以 ENOENT 失败)与模块确实不存在,两种情况的 errno 相同。用无副作用的
+/// `kpm_nums` 探测一次,把结论写进报错,避免再去查错方向。
+fn ctl_error_detail(module: &str, args: &str, uid: u32, ret: i32, errno: i32) -> String {
     let auth_note = if errno == libc::ENOENT {
         match probe_authorization(uid) {
             Ok(n) => format!(
-                "\n授权正常（kpm_nums={}），所以 ENOENT 确实是内核里没有名为 \"{}\" 的模块：\
-                 该 KPM 尚未加载，或名字写错",
-                n,
-                module.to_string_lossy()
+                "\n授权正常(kpm_nums={}),所以 ENOENT 确实是内核里没有名为 \"{}\" 的模块:\
+                 该 KPM 尚未加载,或名字写错",
+                n, module
             ),
             Err(detail) => format!("\n{}", detail),
         }
@@ -332,16 +344,16 @@ pub(crate) fn control(module: &str, args: &str) -> Result<(), String> {
         String::new()
     };
 
-    Err(format!(
+    format!(
         "KernelPatch ctl0 {} {} 失败: syscall={}, errno={} (uid={}) ({}){}",
-        module.to_string_lossy(),
-        args_c.to_string_lossy(),
+        module,
+        args,
         ret,
         errno,
         uid,
         describe_errno(errno),
         auth_note
-    ))
+    )
 }
 
 /// 发一条 ctl0 命令,并把内核写回的 `out_msg` 内容取回来。
