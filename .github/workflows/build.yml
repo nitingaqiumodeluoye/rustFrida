@@ -17,6 +17,11 @@ env:
   NDK_DIR: /opt/android-ndk-r29
   # eBPF 工具链缓存版本：llvm-23 / bpf-linker 升级或缓存失效时手动 bump
   EBPF_CACHE_VERSION: v1
+  # QBDI 静态库的钉版。换 QBDI 版本必须同时改下面两行（tag + 哈希），
+  # 缓存 key 含这两项，所以改了就会自动重新拉取而不是复用旧库。
+  QBDI_VERSION: 0.12.1
+  # 实测 = 仓库 LFS 对象 oid（3c9809...791b），即与 committed 的 libQBDI.a 同一字节流
+  QBDI_AARCH64_SHA256: 3c98091533f2b6d631ce20a2fe9f40a52ff4fb2f07d2c26e6c9b6ff9fa1d791b
   CARGO_TERM_COLOR: always
 
 jobs:
@@ -138,9 +143,60 @@ jobs:
       - name: Check loader shellcode layout
         run: python3 .github/check-loader-layout.py
 
+      # 1.5) QBDI 静态库（仅 qbdi-helper 链接用；agent / rustfrida 都不直接链接它）。
+      #
+      # 为什么不走 LFS：qbdi/libQBDI.a 在 .gitattributes 里是 LFS 对象，390 MB，
+      # 而 GitHub 免费额度只有 1 GB/月带宽——一个对象就占 39%，再加上每次 push 都跑，
+      # 两次就超。且 actions/checkout 默认 lfs:false（它会设 GIT_LFS_SKIP_SMUDGE=1，
+      # 见 checkout 的 git-command-manager.ts），所以落地的是 134 B 的指针文本，
+      # 直接拿去链接会炸在“文件格式不可识别”。
+      #
+      # 改成从 QBDI 官方 release 取同一个字节流：69 MB 的 android-AARCH64 包，
+      # 只解出 usr/local/lib/libQBDI.a。校验哈希的作用是双重的：防下错架构/版本，
+      # 也让“仓库里的 .a 与 CI 用的 .a 是否同一个”这件事由机器断言而不是靠人记得。
+      - name: Restore QBDI static lib
+        id: qbdi-cache
+        uses: actions/cache@v4
+        with:
+          path: qbdi/libQBDI.a
+          key: qbdi-lib-${{ env.QBDI_VERSION }}-${{ env.QBDI_AARCH64_SHA256 }}
+
+      - name: Fetch QBDI static lib (avoids LFS bandwidth)
+        if: steps.qbdi-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euxo pipefail
+          curl -fL --retry 3 --retry-delay 5 \
+            -o /tmp/qbdi-android-aarch64.tar.gz \
+            "https://github.com/QBDI/QBDI/releases/download/v${QBDI_VERSION}/QBDI-${QBDI_VERSION}-android-AARCH64.tar.gz"
+          tar xzf /tmp/qbdi-android-aarch64.tar.gz -C /tmp usr/local/lib/libQBDI.a
+          rm -f /tmp/qbdi-android-aarch64.tar.gz
+          install -m 644 /tmp/usr/local/lib/libQBDI.a qbdi/libQBDI.a
+          echo "${QBDI_AARCH64_SHA256}  qbdi/libQBDI.a" | sha256sum -c -
+
+      # 1.6) qbdi-helper 必须早于 rustfrida：rust_frida/build.rs（feature qbdi）会
+      #      用 include_bytes!(env!("QBDI_HELPER_SO_PATH")) 把 helper SO 嵌进宿主，
+      #      而那个路径就是 target/<triple>/release/libqbdi_helper.so。顺序错了会嵌到旧字节。
+      #      链接时 qbdi-helper/build.rs 把 qbdi/libQBDI.a + NDK 的 libc++_static.a /
+      #      libc++abi.a 一起链进来（两者在 NDK r29 的 sysroot 里确认存在）。
+      - name: Build qbdi-helper (libqbdi_helper.so)
+        run: |
+          set -euxo pipefail
+          cargo build -p qbdi-helper --release --locked --target aarch64-linux-android
+          HELPER=target/aarch64-linux-android/release/libqbdi_helper.so
+          file "$HELPER"
+          SIZE=$(stat -c %s "$HELPER")
+          echo "libqbdi_helper.so = ${SIZE} 字节"
+          # 上限就是协议帧上限（rust_frida 的 MAX_FRAME_PAYLOAD_BYTES = 16 MB，
+          # write_frame 只拒绝 len > 上限，所以边界取 -le）。
+          # 超了不会构建失败，而是运行期“下发失败 + 中继断连”，现场表现为“连着连着就掉”。
+          # 在这里卡住，失败信息才指向真正的原因。
+          test "$SIZE" -le 16777216 || { echo "::error::libqbdi_helper.so ${SIZE} 字节，超过 16 MB 帧上限"; exit 1; }
+
       # 2) agent：rustfrida 通过 include_bytes! 内嵌 libagent.so，必须先于主程序。
+      #    带 qbdi feature：注册 qbdi.* 那组 JS 接口。helper SO 不在 agent 里，
+      #    而是宿主在自己那一侧按需下发（见 rust_frida/src/communication.rs 的 writer 线程）。
       - name: Build agent (libagent.so)
-        run: cargo build -p agent --release --locked --target aarch64-linux-android
+        run: cargo build -p agent --release --locked --features qbdi --target aarch64-linux-android
 
       # 3) 主程序：内嵌 bootstrapper.bin + rustfrida-loader.bin + libagent.so
       #    启用 watch-so feature：内嵌 ldmonitor eBPF SO 加载监听能力（--watch-so）
@@ -204,7 +260,7 @@ jobs:
           bpf-linker --version
 
       - name: Build rustfrida
-        run: cargo +nightly build -p rust_frida --release --locked --features watch-so --target aarch64-linux-android
+        run: cargo +nightly build -p rust_frida --release --locked --features watch-so,qbdi --target aarch64-linux-android
 
       # rfclient 是跑在主机上的 TCP 控制客户端，不是 Android 二进制。仓库的
       # .cargo/config.toml 把默认 target 钉成了 aarch64-linux-android，所以这里
@@ -229,6 +285,13 @@ jobs:
           cp "${OUT}/rustfrida" dist/
           cp "${OUT}/libagent.so" dist/
           cp "${OUT}/librsfrida_gadget.so" dist/librsfrida-gadget.so
+          # qbdi helper：宿主已经把它嵌进 rustfrida（按下发时用），单独产出一份是为了
+          # 排查时能直接对比“设备上跑的那份”与“构建出的那份”，以及手工 push 的场景。
+          cp "${OUT}/libqbdi_helper.so" dist/
+          # 校验嵌进二进制的字节与这份文件确实一致：include_bytes! 是编译期固定字节，
+          # 一旦 qbdi-helper 与 rust_frida 的构建顺序/缓存错位，两者会静默不一致，
+          # 而这种错位在运行时只表现为“JS 里 qbdi 报符号/版本不对”，极难回溯。
+          python3 .github/check-qbdi-embed.py "${OUT}/rustfrida" dist/libqbdi_helper.so
           # 内嵌的 zymbiote payload 也一并产出：便于把 CI 构建结果回写到仓库
           cp zymbiote/build/zymbiote.elf dist/
           cp "${HOST_OUT}/rfclient" dist/

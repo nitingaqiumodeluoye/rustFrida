@@ -160,6 +160,47 @@ pub(crate) fn send_qbdi_helper(
     sender.send(HostToAgentMessage::QbdiHelper(blob))
 }
 
+/// `--qbdi`：不管脚本内容，首条命令前就强制下发 helper blob。
+///
+/// 自动扫描只能看字面量，遇到 `globalThis['qb'+'di']` 这类动态构造会漏，
+/// 这个开关是那种场景的唯一后路。
+#[cfg(feature = "qbdi")]
+static QBDI_FORCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(feature = "qbdi")]
+pub(crate) fn set_qbdi_force(enabled: bool) {
+    QBDI_FORCE.store(enabled, Ordering::Release);
+}
+
+#[cfg(feature = "qbdi")]
+fn qbdi_forced() -> bool {
+    QBDI_FORCE.load(Ordering::Acquire)
+}
+
+/// 这条出站帧是不是“可能要用 qbdi”。
+///
+/// 只看命令帧（CMD / CMD_TAGGED），因为脚本正文全部经由 `send_command` 进同一个
+/// 队列：`loadjs_init` / `java_loadjs` / `loadjs` / `jseval` 无一例外。所以扫命令帧
+/// 就覆盖了全部投递路径，不需要在每个调用点各加一次判断。
+///
+/// 刻意**不扫** CHANNEL_* 与 PING：那是用户数据与保活，正文里碰巧出现 "qbdi"
+/// 不该触发一次十几 MB 的 blob 传输。CMD_TAGGED 前 4 字节是 reqid，要跳过。
+///
+/// 大小写敏感：“qbdi” 是与 JS 全局同名的确切标识符（JS 大小写敏感），
+/// 注释里写 QBDI 不算。
+#[cfg(feature = "qbdi")]
+fn frame_wants_qbdi(kind: u8, payload: &[u8]) -> bool {
+    let text = match kind {
+        FRAME_KIND_CMD => payload,
+        FRAME_KIND_CMD_TAGGED => match payload.get(4..) {
+            Some(rest) => rest,
+            None => return false,
+        },
+        _ => return false,
+    };
+    text.windows(4).any(|w| w == b"qbdi")
+}
+
 /// 原样向 agent 转发一个帧（协议 v2 tagged 命令 / PING）。
 pub(crate) fn send_raw_frame(
     sender: &Sender<HostToAgentMessage>,
@@ -371,13 +412,32 @@ fn handle_socket_connection(stream: UnixStream, session: Arc<Session>) {
                                     }
                                 }
                                 session2.connected.store(true, Ordering::Release);
+                                // QBDI helper 按需下发：首个提到 qbdi 的命令之前先把 blob 写进
+                                // 同一条流，靠 channel 的顺序保证 agent 处理该命令时 helper 已就位。
+                                #[cfg(feature = "qbdi")]
+                                let mut qbdi_pushed = false;
                                 while let Ok(msg) = rx.recv() {
                                     let (kind, payload) = match msg {
                                         HostToAgentMessage::Command(cmd) => (FRAME_KIND_CMD, cmd.into_bytes()),
                                         HostToAgentMessage::RawFrame { kind, payload } => (kind, payload),
                                         #[cfg(feature = "qbdi")]
-                                        HostToAgentMessage::QbdiHelper(blob) => (FRAME_KIND_QBDI_HELPER, blob),
+                                        HostToAgentMessage::QbdiHelper(blob) => {
+                                            // 客户端自己推了 blob：标记已下发，别再自动发一份
+                                            qbdi_pushed = true;
+                                            (FRAME_KIND_QBDI_HELPER, blob)
+                                        }
                                     };
+                                    #[cfg(feature = "qbdi")]
+                                    if !qbdi_pushed && (qbdi_forced() || frame_wants_qbdi(kind, &payload)) {
+                                        qbdi_pushed = true;
+                                        let blob = crate::injection::QBDI_HELPER_SO;
+                                        if let Err(e) = write_frame(&mut stream_clone, FRAME_KIND_QBDI_HELPER, blob) {
+                                            log_error!("[#{}] 下发 QBDI helper 失败: {}", session2.id, e);
+                                            session2.disconnected.store(true, Ordering::Release);
+                                            break;
+                                        }
+                                        log_info!("[#{}] 命令用到 qbdi，先下发 helper SO（{} 字节）", session2.id, blob.len());
+                                    }
                                     if let Err(e) = write_frame(&mut stream_clone, kind, &payload) {
                                         log_error!("[#{}] stream 写入失败: {}", session2.id, e);
                                         session2.disconnected.store(true, Ordering::Release);

@@ -145,6 +145,17 @@ pub(crate) struct Args {
     #[arg(long = "profile", value_name = "NAME")]
     pub(crate) profile: Option<String>,
 
+    /// 强制把 QBDI helper SO 下发给 agent（默认按脚本内容自动判断）
+    ///
+    /// 默认行为：扫命令帧里的 `qbdi` 字面量，命中就先下发 helper SO 再执行该命令。
+    /// 这个开关给自动判断漏网的场景留后路，例如用字符串拼接构造属性名
+    /// `globalThis['qb'+'di']`——那扫不到，只能手动强制。
+    ///
+    /// 需要 `--features qbdi` 构建，普通构建传了会被忽略（仅警告）。
+    #[cfg_attr(not(feature = "qbdi"), arg(hide = true))]
+    #[arg(long = "qbdi")]
+    pub(crate) qbdi: bool,
+
     /// Server daemon 模式：多 session 并发 spawn/inject，profile 持续生效。
     /// 未指定任何目标时也会默认进入此模式。
     ///

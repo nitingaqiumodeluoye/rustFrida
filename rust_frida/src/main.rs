@@ -31,8 +31,6 @@ pub(crate) fn parse_rpc_bind(arg: &str) -> String {
 use crate::logger::{DIM, RESET};
 use args::Args;
 use clap::Parser;
-#[cfg(feature = "qbdi")]
-use communication::send_qbdi_helper;
 use communication::{send_command, start_socketpair_handler};
 use injection::{
     cleanup_remote_loader_mappings, inject_via_bootstrapper, watch_and_inject, InjectionResult, LoaderCleanupInfo,
@@ -98,6 +96,17 @@ fn main() {
 
     // 初始化 verbose 模式
     logger::VERBOSE.store(args.verbose, Ordering::Relaxed);
+    // QBDI helper 是“按需下发”：默认扫命令帧里的 qbdi 字面量，命中了才把 helper SO
+    // 推给 agent（见 communication.rs 的 writer 线程）。--qbdi 强制下发，给扫描漏网
+    // 的场景（动态拼属性名）留后路。
+    #[cfg(feature = "qbdi")]
+    if args.qbdi {
+        communication::set_qbdi_force(true);
+    }
+    #[cfg(not(feature = "qbdi"))]
+    if args.qbdi {
+        log_warn!("--qbdi 已忽略：当前构建未启用 qbdi feature");
+    }
     if let Some(ref path) = args.output {
         if let Err(e) = logger::init_output_file(path) {
             eprintln!("初始化日志文件 '{}' 失败: {}", path, e);
@@ -427,10 +436,19 @@ fn main() {
 
     #[cfg(feature = "qbdi")]
     {
-        if let Err(e) = send_qbdi_helper(sender, crate::injection::QBDI_HELPER_SO.to_vec()) {
-            log_error!("发送 QBDI helper 失败: {}", e);
+        // 内嵌 helper SO 过大时，问题会拖到“第一次真正下发”才暴露：write_frame 拒绝超限帧、
+        // 中继线程直接断连，现场看起来只是“连着连着就掉了”，很难联想到嵌的 SO 尺寸。
+        // 所以在启动时就用同一条上限卡一次。空文件说明构建期 QBDI_HELPER_SO_PATH 指错了。
+        let size = crate::injection::QBDI_HELPER_SO.len();
+        if size == 0 || size > communication::MAX_FRAME_PAYLOAD_BYTES {
+            log_error!(
+                "内嵌 QBDI helper SO 尺寸异常（{} 字节，上限 {}）—— 检查构建期 QBDI_HELPER_SO_PATH 指向的产物",
+                size,
+                communication::MAX_FRAME_PAYLOAD_BYTES
+            );
             std::process::exit(1);
         }
+        log_info!("内嵌 QBDI helper SO: {} 字节（按需下发）", size);
     }
 
     // Spawn 模式: propload → jsinit → loadjs → resume

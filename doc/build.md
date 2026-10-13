@@ -148,11 +148,29 @@ cargo +nightly build -p rust_frida --release --locked \
 
 ## 可选组件
 
-不在流水线里，需要时单独构建（同样建议加进 CI 而不是本地编）。
+**QBDI Trace 支持**：已在 CI 流水线里（见 `.github/workflows/build.yml` 的
+`Restore QBDI static lib` / `Build qbdi-helper` 步骤），产物里 `libqbdi_helper.so`
+与带 qbdi 的 `rustfrida` / `libagent.so` 一起上传。
 
-**QBDI Trace 支持**：先构建 qbdi-helper SO，再用 `--features qbdi` 编译 agent 和 rustfrida：
+两个容易踩的点：
+
+1. **CI 不走 LFS**。`qbdi/libQBDI.a` 是 git-lfs 对象，390 MB，而免费额度只有 1 GB/月带宽；
+   `actions/checkout` 默认 `lfs: false`（会设 `GIT_LFS_SKIP_SMUDGE=1`），落地的是 134 B 的指针文本。
+   所以 CI 从 QBDI 官方 release 取 69 MB 的 `QBDI-<版本>-android-AARCH64.tar.gz`，只解出
+   `usr/local/lib/libQBDI.a`，并用 sha256 钉住（即仓库 LFS 对象的 oid）。
+   换版本要同时改 workflow 里的 `QBDI_VERSION` 和 `QBDI_AARCH64_SHA256` 两处，
+   缓存 key 含这两项，所以改了会自动重新拉取。
+2. **构建顺序 qbdi-helper → agent → rust_frida 不能颠倒**。宿主用
+   `include_bytes!(env!("QBDI_HELPER_SO_PATH"))` 把 helper SO 嵌进自己；
+   `rust_frida` 还用 `include_bytes!` 内嵌 `libagent.so`。顺序错了会嵌到旧字节，
+   而构建依旧成功 —— 运行期只表现为“JS 里 qbdi 报符号/版本不对”。
+   产物收集阶段有 `.github/check-qbdi-embed.py` 断言两者一致。
+
+helper SO 是**按需下发**的：宿主扫命令帧里的 `qbdi` 字面量，命中才把 SO 推给 agent
+（详见 README 的 QBDI Trace 段）。本地手工构建：
 
 ```bash
+# 先把 qbdi/libQBDI.a 备好（从官方 release 解出，或用 git lfs pull）
 cargo build -p qbdi-helper --release                  # → libqbdi_helper.so
 cargo build -p agent --release --features qbdi
 cargo build -p rust_frida --release --features qbdi   # rustfrida 内嵌 qbdi-helper SO

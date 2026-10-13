@@ -46,6 +46,17 @@ fn main() {
             target,
             if profile == "release" { "release" } else { "debug" }
         );
+        // injection.rs 用 include_bytes!(env!("QBDI_HELPER_SO_PATH")) 取文件。文件不在时
+        // 报错来自 include_bytes!，内容只有一句 “couldn't read file”，完全看不出是“少建了
+        // 一个包”。这里提前给出可直接照抄的命令。
+        if !Path::new(&helper_path).exists() {
+            panic!(
+                "feature qbdi 需要先构建 qbdi-helper（rust_frida 要把它嵌进自己）:\n  cargo build -p qbdi-helper --{} --target {}\n期望产物: {}",
+                if profile == "release" { "release" } else { "debug" },
+                target,
+                helper_path
+            );
+        }
         println!("cargo:rustc-env=QBDI_HELPER_SO_PATH={}", helper_path);
         println!("cargo:rerun-if-changed={}", helper_path);
     }

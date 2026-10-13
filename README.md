@@ -45,13 +45,30 @@ agent (libagent.so)┘
 
 ### 可选组件
 
-QBDI Trace 支持（先构建 qbdi-helper SO，再用 `--features qbdi` 编译 agent 和 rustfrida）与 ldmonitor 独立二进制不在流水线里，需要时单独加进 CI：
+QBDI Trace 支持已在 CI 里构建（见下文），ldmonitor 独立二进制不在流水线里：
 
 ```bash
-cargo build -p qbdi-helper --release                  # → libqbdi_helper.so
+cargo build -p ldmonitor --release
+```
+
+QBDI 部分的 CI 要点：
+
+- `qbdi/libQBDI.a` 是 git-lfs 对象（390 MB，免费额度只有 1 GB/月带宽），所以 CI **不走 LFS**：
+  从 QBDI 官方 release 取 `QBDI-0.12.1-android-AARCH64.tar.gz`（69 MB）只解出该文件，
+  并用 sha256 钉住（就是仓库 LFS 对象的 oid）。缓存 key 含版本 + 哈希，
+  换 QBDI 版本必须同时改 `.github/workflows/build.yml` 里的 `QBDI_VERSION` 与 `QBDI_AARCH64_SHA256`。
+- 构建顺序不能颠倒：`qbdi-helper` → `agent` → `rust_frida`。宿主用
+  `include_bytes!(env!("QBDI_HELPER_SO_PATH"))` 把 helper SO 嵌进自己，且
+  `agent` 要先于 `rust_frida`（后者 `include_bytes!` 内嵌 `libagent.so`）。
+- 产物里 `libqbdi_helper.so` 会单独出一份，并校验它与嵌进 `rustfrida` 的字节一致
+  （`.github/check-qbdi-embed.py`），防的是“两者静默不同步”这种只在运行时才暴露的错位。
+
+本地手工构建（仅诊断用）：
+
+```bash
+cargo build -p qbdi-helper --release                  # → libqbdi_helper.so（需先备好 qbdi/libQBDI.a）
 cargo build -p agent --release --features qbdi
 cargo build -p rust_frida --release --features qbdi   # rustfrida 内嵌 qbdi-helper SO
-cargo build -p ldmonitor --release
 ```
 
 `--watch-so`（eBPF SO 加载监控）已在 CI 默认启用。
@@ -1641,6 +1658,18 @@ out.close();
 常量：`File.SEEK_SET`、`File.SEEK_CUR`、`File.SEEK_END`。
 
 ## QBDI Trace
+
+CI 产物已带 qbdi（`agent` 与 `rustfrida` 都以 `--features qbdi` 构建）。**helper SO 不在启动时无条件下发**：
+宿主扫描发往 agent 的命令帧，命中 `qbdi` 字面量才先发 helper SO 再发该命令（同一条流，靠顺序保证
+agent 处理命令时 helper 已就位），所以不用 QBDI 的会话不会白传十几 MB。
+
+漏网时用 `--qbdi` 强制下发。自动判定只看字面量，`globalThis['qb'+'di']` 这类动态构造扫不到，
+这就是那个开关的用途：
+
+```bash
+rustfrida -f com.example.app -l trace.js            # 脚本里有 qbdi.* → 自动下发
+rustfrida -f com.example.app -l weird.js --qbdi     # 扫不到时强制下发
+```
 
 | API | 参数 | 返回 |
 | --- | --- | --- |
