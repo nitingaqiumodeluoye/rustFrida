@@ -420,9 +420,12 @@ unsafe fn call_interceptor_helper(
     let user_dup = ffi::qjs_dup_value(ctx, user_fn);
     let global = ffi::JS_GetGlobalObject(ctx);
     let helper = ffi::JS_GetPropertyStr(ctx, global, helper_name.as_ptr() as *const _);
-    // 与 invoke_hook_callback_common 一致：给回调执行套上上限，避免脚本死循环
-    // 把命中 hook 的宿主线程永久挂住（嵌套时 guard 取更早的截止）。
-    let _deadline_guard = crate::begin_js_execution_deadline(crate::hook_callback_timeout_ms());
+    // 与 invoke_hook_callback_common 保持一致:预算为 0(默认)时不设限。
+    // 预算非 0 时给回调执行套上上限,避免脚本死循环把命中 hook 的宿主线程
+    // 永久挂住(嵌套时 guard 取更早的截止)。
+    let callback_budget_ms = crate::hook_callback_timeout_ms();
+    let _deadline_guard =
+        (callback_budget_ms != 0).then(|| crate::begin_js_execution_deadline(callback_budget_ms));
     let result = if ffi::JS_IsFunction(ctx, helper) != 0 {
         let mut args = [user_dup, js_ctx];
         ffi::JS_Call(ctx, helper, global, 2, args.as_mut_ptr())

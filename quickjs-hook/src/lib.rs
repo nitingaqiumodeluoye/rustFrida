@@ -67,13 +67,26 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 const JS_TOP_LEVEL_EXECUTION_TIMEOUT_MS: u64 = 6_500;
-/// hook / java hook **回调**的单次执行上限。
+/// hook / java hook **回调**的单次执行上限。`0` = 不限制。
 ///
-/// 回调走 `JS_Call` 而不经过顶层 eval 的 deadline 防护，脚本里一个
-/// `while (true) {}` 会把宿主线程永久挂死（`console.log` 也不再有机会执行，
-/// `jsclean` 同样拿不到引擎锁，只能杀进程）。这里用与顶层执行相同的预算：
-/// 超过它就中断并抛异常，而不是无限挂死。
-const JS_HOOK_CALLBACK_TIMEOUT_MS: u64 = JS_TOP_LEVEL_EXECUTION_TIMEOUT_MS;
+/// 背景:回调走 `JS_Call` 而不经过顶层 eval 的 deadline 防护。历史上这里
+/// 用的是与顶层执行相同的 6.5s 预算,目的是让脚本里的 `while (true) {}`
+/// 不会把宿主线程永久挂死。
+///
+/// 现在默认**不设限**(`0`)。原因:拦截窗口内的 onEnter 常常要做远超 6.5s 的
+/// 工作(枚举符号表 / 建立 Stalker / 同步落盘),超时被 QuickJS interrupt
+/// 中断后 `sync_js_ctx_to_hook_ctx` 与 `intercept_leave` 会被跳过,回调跑到
+/// 一半静默失效 —— 比不设限更难排查。
+///
+/// 代价:回调里写死循环会挂住宿主线程(`console.log` 也不再执行,`jsclean`
+/// 拿不到引擎锁,只能杀进程)。需要恢复旧行为时把下面这行改成
+/// `JS_TOP_LEVEL_EXECUTION_TIMEOUT_MS`,或用 `set_hook_callback_timeout_ms()`
+/// 在运行时调大。
+const JS_HOOK_CALLBACK_TIMEOUT_MS_DEFAULT: u64 = 0;
+/// 可运行时覆盖的回调预算(毫秒,`0` = 不限制)。默认取
+/// `JS_HOOK_CALLBACK_TIMEOUT_MS_DEFAULT`,host 可用
+/// `set_hook_callback_timeout_ms()` 调整。
+static JS_HOOK_CALLBACK_TIMEOUT_MS: AtomicU64 = AtomicU64::new(JS_HOOK_CALLBACK_TIMEOUT_MS_DEFAULT);
 
 static QBDI_OUTPUT_DIR: OnceLock<String> = OnceLock::new();
 static QBDI_HELPER_BLOB: Mutex<Option<Vec<u8>>> = Mutex::new(None);
@@ -229,7 +242,15 @@ pub(crate) fn begin_js_execution_deadline(timeout_ms: u64) -> impl Drop {
 
 /// hook / java hook 回调的执行上限（毫秒）。
 pub(crate) fn hook_callback_timeout_ms() -> u64 {
-    JS_HOOK_CALLBACK_TIMEOUT_MS
+    JS_HOOK_CALLBACK_TIMEOUT_MS.load(Ordering::Acquire)
+}
+
+/// 设置 hook / java hook 回调的单次执行上限(毫秒)。
+///
+/// `0` = 不限制(默认)。传非 0 值可恢复「回调超时即中断」的保护。
+/// 只影响之后的回调,已在执行中的回调不受影响。
+pub fn set_hook_callback_timeout_ms(timeout_ms: u64) {
+    JS_HOOK_CALLBACK_TIMEOUT_MS.store(timeout_ms, Ordering::Release);
 }
 
 impl Drop for JsExecutionDeadlineGuard {

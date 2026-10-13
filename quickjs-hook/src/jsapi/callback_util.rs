@@ -685,9 +685,13 @@ pub(crate) unsafe fn invoke_hook_callback_common_with_env(
     // 避免 SuspendThreadByPeer 超时 → SIGABRT）。
     let prev_env = ART_CHECKPOINT_ENV.swap(jni_env as usize, std::sync::atomic::Ordering::Release);
 
-    // 回调执行上限：没有这个 guard 时 `js_execution_deadline_expired()` 恒为 false，
-    // 脚本里的死循环会把宿主（可能是 app 主线程）永久挂死。嵌套时 guard 取更早的截止。
-    let _deadline_guard = crate::begin_js_execution_deadline(crate::hook_callback_timeout_ms());
+    // 回调执行上限:预算为 0(默认)时不设限 —— 拦截窗口内的 onEnter 常要做
+    // 远超旧 6.5s 预算的工作(枚举符号表 / 建 Stalker / 同步落盘),超时中断会让
+    // 回调跑到一半静默失效。预算非 0 时:嵌套 guard 取更早的截止,超时由
+    // QuickJS interrupt handler 中断(见 lib.rs::set_hook_callback_timeout_ms)。
+    let callback_budget_ms = crate::hook_callback_timeout_ms();
+    let _deadline_guard =
+        (callback_budget_ms != 0).then(|| crate::begin_js_execution_deadline(callback_budget_ms));
 
     // 日志归属：切到注册该 hook 的脚本作用域，使回调里的 console 输出带
     // `[script#N name]` 前缀。target 未登记（如内部 hook）时为 0，不产生前缀。
