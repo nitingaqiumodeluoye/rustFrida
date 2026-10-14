@@ -3,6 +3,18 @@ frida-gum = []
 qbdi = []
 watch-so = ["dep:ldmonitor"]
 
+# 已停用(默认**关**):ARM64 内存读写观察点(`--hwbp*`)。
+#
+# 它依赖 mykpm 的 hwbp 内核模块,已被 stackplz 取代 —— 后者用户态走
+# perf_event_open(PERF_TYPE_BREAKPOINT),精度同样 1:1、还能给符号化调用栈、
+# 且按 CPU 挂载无下发竞争。实测对照见 mykpm/kpms/hwbp/HANDOVER.md §10。
+#
+# 源码保留在 src/hwbp.rs / src/hwbp_run.rs,不删也不维护。
+# 想重新编进来:`cargo build --features hwbp`(会自动恢复 --hwbp-watch 等参数)。
+# 注意:关着的时候这两份源码**不参与编译**,因此不会因为别处改接口而报错 ——
+# 真要重新启用前,先单独编一次看还过不过。
+hwbp = []
+
 [package]
 name = "rust_frida"
 version = "0.1.0"

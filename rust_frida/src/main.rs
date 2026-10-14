@@ -3,7 +3,15 @@
 mod args;
 mod communication;
 mod http_rpc;
+// ── 已停用(默认不编入)─────────────────────────────────────────
+// ARM64 内存读写观察点。已被 stackplz 取代,源码保留不动、也不再维护:
+//   * 为什么停用 + 实测对照数据:mykpm/kpms/hwbp/HANDOVER.md §10
+//   * 怎么重新启用:      cargo build --features hwbp
+// 关着的时候这两个模块**不参与编译**,所以别处的接口改动不会在这里报错 ——
+// 因此重新启用前请先单独编一次确认它还能过。
+#[cfg(feature = "hwbp")]
 mod hwbp;
+#[cfg(feature = "hwbp")]
 mod hwbp_run;
 mod injection;
 mod kpm;
@@ -54,6 +62,33 @@ use std::sync::Arc;
 use types::get_string_table_names;
 
 const AGENT_SHUTDOWN_WAIT_SECS: u64 = 1;
+
+/// `--hwbp*` 的分发。返回 `true` 表示已由它处理完毕,`main` 应直接返回。
+///
+/// 仅在 `--features hwbp` 时编入。它不需要 agent:整条链路是
+/// 「宿主 → KernelPatch supercall → 内核模块」,目标进程里不注入任何东西
+/// (这也正是硬件观察点比插桩隐蔽的原因),所以在 main 里短路、不进注入/REPL 流程。
+#[cfg(feature = "hwbp")]
+fn run_hwbp_mode(args: &Args, resolved_pid: Option<i32>) -> bool {
+    if args.hwbp_watch.is_empty() {
+        return false;
+    }
+    let Some(pid) = resolved_pid else {
+        log_error!("--hwbp-watch 需要 --pid 或 --name 指定目标进程");
+        std::process::exit(1);
+    };
+    if pid <= 0 {
+        log_error!("--hwbp-watch 的进程 id 无效: {}", pid);
+        std::process::exit(1);
+    }
+    if let Err(e) =
+        hwbp_run::run_from_args(pid as u32, &args.hwbp_watch, args.hwbp_max_hits, args.hwbp_interval)
+    {
+        log_error!("{}", e);
+        std::process::exit(1);
+    }
+    true
+}
 
 fn env_flag(name: &str) -> bool {
     std::env::var(name)
@@ -277,26 +312,9 @@ fn main() {
         args.pid
     };
 
-    // ── hwbp 子命令:硬件写观察点 ──
-    //
-    // 它不需要 agent:整条链路是「宿主 → KernelPatch supercall → 内核模块」,
-    // 目标进程里不注入任何东西(这也正是硬件观察点比插桩隐蔽的原因)。
-    // 所以在这里短路,不进注入/REPL 流程。
-    if !args.hwbp_watch.is_empty() {
-        let Some(pid) = resolved_pid else {
-            log_error!("--hwbp-watch 需要 --pid 或 --name 指定目标进程");
-            std::process::exit(1);
-        };
-        if pid <= 0 {
-            log_error!("--hwbp-watch 的进程 id 无效: {}", pid);
-            std::process::exit(1);
-        }
-        if let Err(e) =
-            hwbp_run::run_from_args(pid as u32, &args.hwbp_watch, args.hwbp_max_hits, args.hwbp_interval)
-        {
-            log_error!("{}", e);
-            std::process::exit(1);
-        }
+    // ── hwbp 子命令(仅 --features hwbp;默认已停用,见 hwbp.rs 顶部)──
+    #[cfg(feature = "hwbp")]
+    if run_hwbp_mode(&args, resolved_pid) {
         return;
     }
 

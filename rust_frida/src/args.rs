@@ -195,6 +195,10 @@ pub(crate) struct Args {
 
     /// ARM64 硬件观察点:监控某个内存地址,被访问时打印访问者。
     ///
+    /// ⚠️ **已停用**（v1.5 起）。想重新启用:`cargo build --features hwbp`。
+    /// 替代方案:stackplz（`--brk ADDR:r|w|rw`） —— 精度同样 1:1,而且能给
+    /// 符号化调用栈。实测对照见 mykpm/kpms/hwbp/HANDOVER.md §10。
+    ///
     /// 走 mykpm 的 hwbp 内核模块(需已加载)。一次可以给多个观察点:
     ///   --hwbp-watch 0x7f1234000 --hwbp-watch 0x7f1234100:8
     ///   --hwbp-watch 0x7f1234000:4:rw     # 读写都监控(命中自带方向)
@@ -207,6 +211,7 @@ pub(crate) struct Args {
     ///
     /// 注意观察点寄存器是按线程的硬件资源(每线程仅 4 个),本工具会自动对目标
     /// 进程当时的所有线程下发,并把之后新建的线程也补上。
+    #[cfg(feature = "hwbp")]
     #[arg(long = "hwbp-watch", value_name = "ADDR[:LEN][:TYPE]", action = clap::ArgAction::Append)]
     pub(crate) hwbp_watch: Vec<String>,
 
@@ -214,6 +219,7 @@ pub(crate) struct Args {
     ///
     /// 热地址会让 CPU 一直在 trap/return 之间震荡,到量后**内核侧**直接关掉,
     /// 不等用户态来关。传 0 表示不限制(不推荐)。
+    #[cfg(feature = "hwbp")]
     #[arg(long = "hwbp-max-hits", value_name = "N", default_value = "64")]
     pub(crate) hwbp_max_hits: u32,
 
@@ -222,7 +228,7 @@ pub(crate) struct Args {
     /// 内核不推送命中,只能轮询。间隔越小越接近实时,但每次轮询都是一次
     /// supercall(要 fork 降权),间隔太小会拖慢宿主;间隔太大则热地址的
     /// 命中环(每节点 32 条)会被覆盖丢失。
-    /// hwbp 命中轮询间隔,单位毫秒。越小越实时,但内核侧环只有 32 条。
+    #[cfg(feature = "hwbp")]
     #[arg(long = "hwbp-interval", value_name = "MS", default_value = "50")]
     pub(crate) hwbp_interval: u64,
 
