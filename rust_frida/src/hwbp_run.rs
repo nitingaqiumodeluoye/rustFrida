@@ -179,8 +179,8 @@ fn print_hit(sym: &Symbolizer, spec: &WatchSpec, hit: &HwbpHit) {
 
 /// 主循环。
 ///
-/// `pid` 是目标进程的 tgid(线观察点要按线程下发,用 tgid 枚举 /proc/<pid>/task)。
-pub(crate) fn run(pid: u32, specs: Vec<WatchSpec>, max_hits: u32, interval_ms: u64) -> Result<(), String> {
+/// `pid` 是目标进程的 tgid(观察点要按线程下发,用 tgid 枚举 /proc/<pid>/task)。
+fn run(pid: u32, specs: Vec<WatchSpec>, max_hits: u32, interval_ms: u64) -> Result<(), String> {
     if specs.is_empty() {
         return Err("没有指定观察点".to_string());
     }
@@ -201,7 +201,7 @@ pub(crate) fn run(pid: u32, specs: Vec<WatchSpec>, max_hits: u32, interval_ms: u
     let mut old_action: libc::sigaction = unsafe { std::mem::zeroed() };
     unsafe {
         let mut action: libc::sigaction = std::mem::zeroed();
-        action.sa_sigaction = hwbp_signal_handler as usize;
+        action.sa_sigaction = hwbp_signal_handler as *const () as usize;
         libc::sigemptyset(&mut action.sa_mask);
         action.sa_flags = 0;
         libc::sigaction(libc::SIGINT, &action, &mut old_action);
