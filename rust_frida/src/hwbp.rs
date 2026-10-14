@@ -55,7 +55,7 @@ pub(crate) enum HitAccess {
 }
 
 impl HitAccess {
-    fn from_raw(v: u32) -> Self {
+    pub(crate) fn from_raw(v: u32) -> Self {
         match v {
             1 => HitAccess::Read,
             2 => HitAccess::Write,
