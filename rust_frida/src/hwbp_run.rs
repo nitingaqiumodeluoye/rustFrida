@@ -319,15 +319,27 @@ fn run(pid: u32, specs: Vec<WatchSpec>, max_hits: u32, interval_ms: u64) -> Resu
     let mut cursors: HashMap<(u64, u32), Cursor> = HashMap::new();
     let mut total_printed = 0u64;
 
-    while !HWBP_INTERRUPTED.load(Ordering::Relaxed) {
-        // 目标进程没了就收工
-        if !std::path::Path::new(&format!("/proc/{pid}")).exists() {
-            log_warn!("目标进程 {pid} 已退出");
-            break;
+    /*
+     * 收工前一定要**再取最后一轮**。
+     *
+     * 之前是在循环顶部发现「进程没了」或收到 SIGINT 就直接 break、接着 unwatch ——
+     * 于是最后那批命中(恰好就在退出前那几十毫秒里产生的)会被静默丢掉。
+     * 实测过:靶子三个线程各 13 写 + 13 读 = 78 次,宿主只报了 76 次,
+     * 少的那 2 次正是晚线程最后一轮的写+读。
+     * 而「进程死前最后干了什么」往往就是这个工具最想看的东西 —— 丢在这里最不划算。
+     */
+    while true {
+        let mut stop_reason: Option<String> = None;
+        if HWBP_INTERRUPTED.load(Ordering::Relaxed) {
+            stop_reason = Some("收到中断信号".to_string());
+        } else if !std::path::Path::new(&format!("/proc/{pid}")).exists() {
+            stop_reason = Some(format!("目标进程 {pid} 已退出"));
         }
 
-        // 补新线程:目标工作线程往往在建观察点之后才创建,漏了它们就白监控了。
-        arm_new_threads(pid, &specs, max_hits, &mut armed);
+        // 要收工时就不用再补装线程了(反正马上要卸)。
+        if stop_reason.is_none() {
+            arm_new_threads(pid, &specs, max_hits, &mut armed);
+        }
 
         for spec in &specs {
             /*
@@ -412,6 +424,11 @@ fn run(pid: u32, specs: Vec<WatchSpec>, max_hits: u32, interval_ms: u64) -> Resu
                     );
                 }
             }
+        }
+
+        if let Some(reason) = stop_reason {
+            log_info!("{reason} —— 已取完最后一轮命中,共打印 {total_printed} 条");
+            break;
         }
 
         std::thread::sleep(std::time::Duration::from_millis(interval_ms.max(1)));
