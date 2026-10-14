@@ -7,6 +7,7 @@ use std::sync::OnceLock;
 const SUPERCALL_NR: libc::c_long = 45;
 const KERNELPATCH_VERSION_CODE: u64 = (0u64 << 16) | (13u64 << 8);
 const SUPERCALL_MAGIC: u64 = 0x1158;
+const SUPERCALL_KERNELPATCH_VER: u64 = 0x1008;
 const SUPERCALL_KPM_CONTROL: u64 = 0x1022;
 const SUPERCALL_KPM_NUMS: u64 = 0x1030;
 const KARINAHIDE: &str = "karinahide";
@@ -255,6 +256,62 @@ fn supercall_as(
     }
 
     Ok((ret, errno))
+}
+
+/// 查设备上**实际运行**的 KernelPatch 版本,返回 `(major, minor, patch)`。
+///
+/// 为什么需要它:构建 KPM 时用的头文件版本应与设备上运行的 kpimg 对应,而不匹配
+/// 是模块加载失败的头号原因。`kptools -v` 只报**本地工具链**版本,答不了这个问题 ——
+/// 只有问内核才知道设备上到底跑的是哪一个。
+///
+/// ## 它为什么能当诊断手段
+///
+/// `kpver` 是少数**不需要 `is_authed`** 的命令:内核把它列在 su 白名单里
+/// (`.kp/kernel/include/kpscauth.h:10` 的 `kp_supercall_allowed_for_su`),
+/// 于是 `supercall()` 开头那句
+/// `if (!is_authed && !kp_supercall_allowed_for_su(cmd)) return -EPERM;` 对它放行。
+///
+/// 所以它能把两类故障分开:
+///   - `kpver` 就失败 → supercall 通道/授权这一层不通,根本还没轮到模块,
+///     别再怀疑 hwbp.kpm 本身;
+///   - `kpver` 拿得到版本、但 KPM 命令失败 → KP 与授权都正常,问题在模块侧
+///     (没加载 / 版本不匹配 / 内核符号缺失)。
+///
+/// ## 仍然要降权
+///
+/// 注意「不需要 is_authed」≠「谁都能调」:它仍要过 `before()` 里那道
+/// `is_trusted_caller` 门,而 **uid 0 既不是管理器也不在 su 白名单**
+/// (下面 `supercall_as` 的注释记录了同一个事实)。所以这里和 ctl0 一样
+/// fork 到受信任管理器 uid 去调,而不是就地直调。
+///
+/// 版本号编码为 `0xMMmmpp`(0.13.9 → 0x000D09),按字节拆分。
+pub(crate) fn kpver() -> Result<(u32, u32, u32), String> {
+    let key = CString::new(SUPERCALL_KEY).map_err(|e| format!("KernelPatch key 无效: {}", e))?;
+    let uid = trusted_manager_uid();
+
+    let (ret, errno) = supercall_as(uid, &key, SUPERCALL_KERNELPATCH_VER, 0, 0, 0, 0)?;
+
+    // 成功时返回的是版本号本身(正整数),与 `kpm_nums` 那种「ret<0 才算错」不同;
+    // 0x000D09 这种值不能被当成错误码。
+    if ret > 0 {
+        let v = ret as u32;
+        return Ok(((v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF));
+    }
+
+    Err(format!(
+        "查询 KernelPatch 版本失败: syscall={}, errno={} ({})\n\
+         这一层不通说明 KernelPatch 未生效或授权未通过，与 KPM 模块本身无关，\
+         先排查设备侧的 KP 安装与管理器 uid，不用怀疑 hwbp.kpm",
+        ret,
+        errno,
+        describe_errno(errno)
+    ))
+}
+
+/// 把 `kpver()` 的结果格式化成 `0.13.9`。
+pub(crate) fn kpver_string() -> Result<String, String> {
+    let (major, minor, patch) = kpver()?;
+    Ok(format!("{major}.{minor}.{patch}"))
 }
 
 /// 用无副作用的 `SUPERCALL_KPM_NUMS` 探测当前身份能否通过授权门。

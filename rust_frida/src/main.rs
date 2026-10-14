@@ -119,6 +119,22 @@ fn main() {
 
     logger::print_banner();
 
+    // --kpver: 独立操作，查完退出。
+    //
+    // 必须放在下面 target_count 检查**之前**：它只问内核要版本，不碰目标进程，
+    // 所以不需要 --pid/--name。若放到后面会被「必须指定 --pid、--name、...」
+    // 直接拦死。同样也放在孤儿 payload 清理之前 —— 纯查询没必要去扫 /proc。
+    if args.kpver {
+        match kpm::kpver_string() {
+            Ok(v) => log_info!("设备上运行的 KernelPatch 版本: {}", v),
+            Err(e) => {
+                log_error!("{}", e);
+                std::process::exit(1);
+            }
+        }
+        std::process::exit(0);
+    }
+
     // --dump-props: 独立操作，dump 后退出
     if let Some(ref profile_name) = args.dump_props {
         match props::dump_props(profile_name) {

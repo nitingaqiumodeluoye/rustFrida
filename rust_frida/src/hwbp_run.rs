@@ -177,6 +177,37 @@ fn print_hit(sym: &Symbolizer, spec: &WatchSpec, hit: &HwbpHit) {
     }
 }
 
+/// 探活失败时把错误拼成带**分诊**的提示。
+///
+/// `probe()` 失败有两种完全不同的原因,但表面错误几乎一样(都是 supercall 失败),
+/// 光看它分不清:
+///   - KernelPatch 这一层就不通(未安装 / 授权未过) —— 还没轮到模块;
+///   - 通道正常但 hwbp 模块没加载 —— 只需把模块装上。
+///
+/// `kpver` 恰好能区分:它不需要 `is_authed`(在内核的 su 白名单里),且完全不碰模块,
+/// 所以它能返回就证明前一条链路是通的。分不清时人容易在错的地方反复折腾,
+/// 所以这里直接把结论写进错误里。
+fn probe_failure_message(probe_err: &str) -> String {
+    let hint = "hwbp.kpm 需先由 APatch 加载(与 karinahide 同一路径),\
+                确认它的 ready 日志里带版本号";
+
+    match crate::kpm::kpver_string() {
+        Ok(v) => format!(
+            "hwbp 内核模块不可用,无法监控。\n\
+             探测结果: {probe_err}\n\
+             分诊: 设备上 KernelPatch 正常(版本 {v}),说明 supercall 通道与授权都没问题,\
+             问题就在 hwbp 模块本身 —— 多半是没加载,或构建用的头文件版本与上面的 {v} 不匹配。\n\
+             提示: {hint}"
+        ),
+        Err(kp_err) => format!(
+            "hwbp 内核模块不可用,无法监控。\n\
+             探测结果: {probe_err}\n\
+             分诊: 连 KernelPatch 版本都查不到 —— 这一层还没通,先别怀疑 hwbp.kpm。\n\
+             kpver 报错: {kp_err}"
+        ),
+    }
+}
+
 /// 主循环。
 ///
 /// `pid` 是目标进程的 tgid(观察点要按线程下发,用 tgid 枚举 /proc/<pid>/task)。
@@ -188,13 +219,7 @@ fn run(pid: u32, specs: Vec<WatchSpec>, max_hits: u32, interval_ms: u64) -> Resu
     // 先探活:模块没加载时后续每条命令都会失败,早报比刷一屏错误好。
     match hwbp::probe() {
         Ok(status) => log_info!("hwbp 模块就绪: {status}"),
-        Err(e) => {
-            return Err(format!(
-                "hwbp 内核模块不可用,无法监控。\n{e}\n\
-                 提示:hwbp.kpm 需先由 APatch 加载(与 karinahide 同一路径),\
-                 可用 `--hwbp-watch` 前先确认它的 ready 日志"
-            ))
-        }
+        Err(e) => return Err(probe_failure_message(&e)),
     }
 
     // Ctrl+C 时停循环并卸掉观察点。

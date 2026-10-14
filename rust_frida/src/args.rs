@@ -221,4 +221,14 @@ pub(crate) struct Args {
     /// 命中环(每节点 32 条)会被覆盖丢失。
     #[arg(long = "hwbp-interval", value_name = "MS", default_value = "50")]
     pub(crate) hwbp_interval: u64,
+
+    /// 打印设备上**实际运行**的 KernelPatch 版本，然后退出。
+    ///
+    /// 用于确诊：KPM 模块加载/取不到数据时，先跑一次这个把「KernelPatch 这一层
+    /// 不通」和「模块本身有问题」分开。版本不匹配是模块加载失败的常见原因，
+    /// 而 `kptools -v` 只报本地工具链版本，答不了设备上跑的是哪个 kpimg。
+    ///
+    /// 不需要 `--pid`：它只查内核，不碰目标进程。
+    #[arg(long = "kpver")]
+    pub(crate) kpver: bool,
 }
