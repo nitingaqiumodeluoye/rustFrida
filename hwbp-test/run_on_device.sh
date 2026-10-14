@@ -14,6 +14,9 @@ DELAY=${1:-14}
 OBS_SECS=${2:-22}
 MODE=${3:-write}
 LATE=${4:-1}
+# 第 5 个参数:观察点类型(w|r|rw)—— 直接拼进 --hwbp-watch 的第三种字段。
+# 缺省 w 保持旧行为;测读写监控时传 rw。
+WTYPE=${5:-w}
 
 rm -f "$LOG"
 
@@ -28,7 +31,7 @@ sleep 2
 PID=$(sed -n 's/.*pid=\([0-9]*\).*/\1/p' "$LOG" | head -1)
 ADDR=$(sed -n 's/.*被观察地址 = \(0x[0-9a-fA-F]*\).*/\1/p' "$LOG" | head -1)
 
-echo "########## 靶子 pid=$PID 地址=$ADDR ##########"
+echo "########## 靶子 pid=$PID 地址=$ADDR 模式=$MODE 观察点类型=$WTYPE ##########"
 
 if [ -z "$PID" ] || [ -z "$ADDR" ]; then
     echo "错误: 没从靶子日志里取到 pid/地址"
@@ -38,7 +41,8 @@ if [ -z "$PID" ] || [ -z "$ADDR" ]; then
 fi
 
 # 观察者放在前台跑,超时用 SIGINT 触发它的优雅退出
-timeout -s INT "$OBS_SECS" "$OBS" --pid "$PID" --hwbp-watch "$ADDR"
+# 地址后面拼上宽度与类型:`ADDR:4:TYPE`(宽度 4 = 靶子的 uint32_t 目标)。
+timeout -s INT "$OBS_SECS" "$OBS" --pid "$PID" --hwbp-watch "$ADDR:4:$WTYPE"
 OBSRC=$?
 
 echo "########## 观察者退出码=$OBSRC ##########"
