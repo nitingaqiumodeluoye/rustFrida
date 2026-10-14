@@ -33,12 +33,14 @@ mkdir -p build
 
 # -O2 让读循环真的跑起来(-O0 下每轮都有额外开销,会盖住观察点本身的开销);
 # -Wall -Wextra 让未用参数之类的问题在构建期就暴露,不留给设备现场。
+#
+# 不加 -lpthread:Android 的 bionic 把 pthread 并进了 libc,没有独立的
+# libpthread.so,加 -lpthread 会直接 "unable to find library -lpthread"。
 "$NDK_CC" \
     -O2 -Wall -Wextra -Wno-unused-parameter \
     -fno-omit-frame-pointer \
     -o build/hwbp_test \
-    hwbp_test.c \
-    -lpthread
+    hwbp_test.c
 
 # 必须显式检查:Android 上「能编出文件」和「能跑起来」不是一回事
 # (架构错了 / 动态链接器路径不对都会到设备上才炸)。
