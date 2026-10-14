@@ -23,8 +23,6 @@ use crate::kpm;
 pub(crate) const HITS_MAX: usize = 32;
 /// 每条命中保存的寄存器个数(x0-x7),对应 `HWBP_HIT_REG_WORDS`。
 pub(crate) const HIT_REG_WORDS: usize = 8;
-/// `max_hits` 缺省值,对应 `HWBP_DEF_MAX_HITS`。
-pub(crate) const DEF_MAX_HITS: u32 = 64;
 
 /// 内核模块名,对应 `KPM_NAME("hwbp")`。
 const MODULE: &str = "hwbp";
@@ -111,20 +109,6 @@ impl BpLen {
             BpLen::Len8 => 8,
         }
     }
-
-    /// 按数据宽度选最自然的一档。
-    ///
-    /// 3 字节没有对应的硬件宽度(只有 1/2/4/8),向上取到 4;5-8 取 8。
-    /// 注意这会让观察范围超出原始数据 —— 硬件断点是「按窗口匹配」的,超出部分
-    /// 若被邻居访问也会命中。
-    pub(crate) fn for_size(size: usize) -> Self {
-        match size {
-            0 | 1 => BpLen::Len1,
-            2 => BpLen::Len2,
-            3..=4 => BpLen::Len4,
-            _ => BpLen::Len8,
-        }
-    }
 }
 
 /// 在指定线程上注册一个写观察点。
@@ -157,6 +141,7 @@ pub(crate) fn unwatch(addr: u64, tid: u32) -> Result<(), String> {
 }
 
 /// 卸掉全部观察点。
+#[allow(dead_code)] // 供后续 JS API / REPL 命令复用
 pub(crate) fn clear() -> Result<(), String> {
     kpm::control(MODULE, "clear")
 }
@@ -189,6 +174,10 @@ pub(crate) fn hits(addr: u64, tid: u32, node_index: u32) -> Result<HwbpHits, Str
     }
 
     // 共享页内容按 repr(C) 结构体解释。read_unaligned:共享页只保证页对齐。
+    //
+    // 注意 entries[count..] 是共享页里的历史残留(内核只写实际命中过的条目),
+    // 所以下面一定按 count 截断 —— `effective_hits` 负责这件事,调用方不要直接
+    // 遍历 entries。
     let parsed = unsafe { core::ptr::read_unaligned(raw.as_ptr() as *const HwbpHits) };
 
     if parsed.node_total == 0 {
@@ -209,6 +198,7 @@ pub(crate) fn effective_hits(h: &HwbpHits) -> &[HwbpHit] {
 /// 列出当前全部观察点,返回内核的原始状态串。
 ///
 /// 形如 `hwbp ready v1.0.0 nodes=2 7f1234000:1234:5 ...`(每项 `地址:tid:命中数`)。
+#[allow(dead_code)] // 供后续 JS API / REPL 命令复用
 pub(crate) fn list() -> Result<String, String> {
     let raw = kpm::control_shared(MODULE, "list", 512)?;
     let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());

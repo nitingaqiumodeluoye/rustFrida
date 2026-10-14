@@ -187,9 +187,38 @@ pub(crate) struct Args {
     #[arg(long = "listen", value_name = "PORT_OR_ADDR")]
     pub(crate) listen: Option<String>,
 
-    /// TCP 控制服务器认证令牌。设置后，rfclient 必须在引导行中携带
-    /// `token=<值>` 才能执行 attach/spawn/use/gadget；list 始终允许（仅探测用）。
-    /// 未设置时不启用认证（局域网/USB 场景）。
+    /// TCP 控制服务器认证令牌。设置后,rfclient 必须在引导行中携带
+    /// `token=<值>` 才能执行 attach/spawn/use/gadget;list 始终允许(仅探测用)。
+    /// 未设置时不启用认证(局域网/USB 场景)。
     #[arg(long = "token", value_name = "TOKEN")]
     pub(crate) token: Option<String>,
+
+    /// ARM64 硬件写观察点:监控某个内存地址,被写入时打印写入者。
+    ///
+    /// 走 mykpm 的 hwbp 内核模块(需已加载)。一次可以给多个观察点:
+    ///   --hwbp-watch 0x7f1234000 --hwbp-watch 0x7f1234100:8
+    /// 地址后接 `:宽度` 指定观察宽度(1/2/4/8,默认 4),地址必须按宽度对齐。
+    ///
+    /// 这是「谁写了这块内存」的唯一可靠手段:native 代码直接往数组元素内存里写时,
+    /// 没有任何 JNI 层钩子看得见。
+    ///
+    /// 注意观察点寄存器是按线程的硬件资源(每线程仅 4 个),本工具会自动对目标
+    /// 进程当时的所有线程下发,并把之后新建的线程也补上。
+    #[arg(long = "hwbp-watch", value_name = "ADDR[:LEN]", action = clap::ArgAction::Append)]
+    pub(crate) hwbp_watch: Vec<String>,
+
+    /// 每个观察点累计命中多少次后自动停止(默认 64)。
+    ///
+    /// 热地址会让 CPU 一直在 trap/return 之间震荡,到量后**内核侧**直接关掉,
+    /// 不等用户态来关。传 0 表示不限制(不推荐)。
+    #[arg(long = "hwbp-max-hits", value_name = "N", default_value = "64")]
+    pub(crate) hwbp_max_hits: u32,
+
+    /// 轮询间隔(毫秒,默认 50)。
+    ///
+    /// 内核不推送命中,只能轮询。间隔越小越接近实时,但每次轮询都是一次
+    /// supercall(要 fork 降权),间隔太小会拖慢宿主;间隔太大则热地址的
+    /// 命中环(每节点 32 条)会被覆盖丢失。
+    #[arg(long = "hwbp-interval", value_name = "MS", default_value = "50")]
+    pub(crate) hwbp_interval: u64,
 }

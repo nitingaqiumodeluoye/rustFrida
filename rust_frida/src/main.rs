@@ -4,6 +4,7 @@ mod args;
 mod communication;
 mod http_rpc;
 mod hwbp;
+mod hwbp_run;
 mod injection;
 mod kpm;
 mod logger;
@@ -16,6 +17,7 @@ mod selinux;
 mod server;
 mod session;
 mod spawn;
+mod symbolize;
 mod types;
 
 /// 解析 `--rpc-port` 参数为绑定地址：
@@ -258,6 +260,29 @@ fn main() {
     } else {
         args.pid
     };
+
+    // ── hwbp 子命令:硬件写观察点 ──
+    //
+    // 它不需要 agent:整条链路是「宿主 → KernelPatch supercall → 内核模块」,
+    // 目标进程里不注入任何东西(这也正是硬件观察点比插桩隐蔽的原因)。
+    // 所以在这里短路,不进注入/REPL 流程。
+    if !args.hwbp_watch.is_empty() {
+        let Some(pid) = resolved_pid else {
+            log_error!("--hwbp-watch 需要 --pid 或 --name 指定目标进程");
+            std::process::exit(1);
+        };
+        if pid <= 0 {
+            log_error!("--hwbp-watch 的进程 id 无效: {}", pid);
+            std::process::exit(1);
+        }
+        if let Err(e) =
+            hwbp_run::run_from_args(pid as u32, &args.hwbp_watch, args.hwbp_max_hits, args.hwbp_interval)
+        {
+            log_error!("{}", e);
+            std::process::exit(1);
+        }
+        return;
+    }
 
     // 解析字符串覆盖参数（格式：name=value）
     let mut string_overrides = std::collections::HashMap::new();
