@@ -307,12 +307,14 @@ fn run(pid: u32, specs: Vec<WatchSpec>, max_hits: u32, interval_ms: u64) -> Resu
     log_info!("开始监控,命中会即时打印;Ctrl+C 停止并卸载观察点");
 
     /*
-     * 游标按 **(地址, 节点序号)** 分,不能只按地址。
+     * 游标按 **(地址, tid)** 分,不按 **(地址, 节点序号)**。
      *
-     * 观察点是 per-thread 的:同一个地址在 N 个线程上就有 N 个节点。只读
-     * node_index=0 会静静地把其它线程的命中全部丢掉 —— 多线程 app 里这正是
-     * 「谁写了这块内存」的主要部分,漏了等于白装。
-     * 每个节点也有自己的 ring_total,所以要各自记消费位置。
+     * 观察点是 per-thread 的:同一地址在 N 个线程上就有 N 个节点,各自有自己的
+     * ring_total,所以必须各自记消费位置。但**不能用节点序号当身份** ——
+     * 内核用 list_add 插头,一有线程被补装(arm_new_threads),全链序号整体后移,
+     * 旧序号就换成了另一个线程。那时拿 A 线程的 consumed_total 去减 B 线程的 total,
+     * 要么漏报、要么变成一个天文数字(wrapping_sub)再加上一条假的「环形缓冲只剩
+     * 32 条」告警。节点的 tid 是稳定的,拿它做 key。
      */
     let mut cursors: HashMap<(u64, u32), Cursor> = HashMap::new();
     let mut total_printed = 0u64;
@@ -329,32 +331,55 @@ fn run(pid: u32, specs: Vec<WatchSpec>, max_hits: u32, interval_ms: u64) -> Resu
 
         for spec in &specs {
             /*
-             * 先问一次拿到该地址的节点总数,再逐个节点取。
-             * node_total 是 0 就说明观察点已经不在了(被 clear 或被 max_hits 之外
-             * 的原因移除),报一次就够,不要每轮刷屏。
+             * 先问一次拿到该地址的**真实**节点总数,再逐个取。
+             *
+             * 这一步曾经完全不工作,因为它依赖内核 `hits` 回填的 node_total ——
+             * 而内核那边是在找到目标节点后就 break,于是 node_total 恒等于
+             * node_index+1。宿主问 (index=0) 就永远得到 1,于是**只轮询 index 0**
+             * (= 链表头 = 最后下发的那个线程),其余线程的命中全被静默丢掉。
+             * 内核已修(v1.4.1),见 HANDOVER §5.16。
              */
             let node_total = match hwbp::hits(spec.addr, 0, 0) {
                 Ok(h) => h.node_total,
                 Err(e) => {
+                    // (addr, 0) 不会与任何真 tid 冲突,用它当「该地址」的告警去重位。
                     let cursor = cursors.entry((spec.addr, 0)).or_default();
                     if !cursor.warned_missing {
                         cursor.warned_missing = true;
                         log_warn!("{}", e);
                     }
+                    /*
+                     * 该地址上一个节点都不剩了。把它的 (addr,tid) 全部从 armed 里
+                     * 摘掉,让 arm_new_threads 下轮重装 —— 这能自愈「被 clear 掉」
+                     * 或「节点被外部卸掉」的情形;线程已退出的那些 watch 会失败,
+                     * 不会被重新加回来,所以不会死循环。
+                     */
+                    armed.retain(|(a, _)| *a != spec.addr);
                     continue;
                 }
             };
+            cursors.entry((spec.addr, 0)).or_default().warned_missing = false;
 
             for node_index in 0..node_total {
                 let h = match hwbp::hits(spec.addr, 0, node_index) {
                     Ok(h) => h,
                     Err(_) => continue,
                 };
-                let cursor = cursors.entry((spec.addr, node_index)).or_default();
-                cursor.warned_missing = false;
+                let cursor = cursors.entry((h.watch_addr, h.tid)).or_default();
 
                 // ring_total 是累计值;差值即上次以来新增的条数。
                 let new = h.total.wrapping_sub(cursor.consumed_total);
+                /*
+                 * 反向跳变(或巨大跳变)= 这个节点是**重建过**的:total 从头开始,
+                 * 而游标还记着旧节点的值。因为内核的 ring_total 严格单调递增,
+                 * 所以只需重新对齐,不要把它当成「新增几十亿次命中」报出去。
+                 * (阈值取 2^31:max_hits 默认 64,真跑出这么多命中是不可能的,
+                 *   而 32 位回绕在这个量级上也不会误触发。)
+                 */
+                if new > (1u32 << 31) {
+                    cursor.consumed_total = h.total;
+                    continue;
+                }
                 cursor.consumed_total = h.total;
                 if new == 0 {
                     continue;
