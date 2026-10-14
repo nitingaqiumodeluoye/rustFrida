@@ -64,8 +64,7 @@ fn parse_watch_spec(s: &str) -> Result<WatchSpec, String> {
         .strip_prefix("0x")
         .or_else(|| addr_str.strip_prefix("0X"))
         .unwrap_or(addr_str);
-    let addr = u64::from_str_radix(hex, 16)
-        .map_err(|e| format!("观察地址 '{addr_str}' 不是合法十六进制: {e}"))?;
+    let addr = u64::from_str_radix(hex, 16).map_err(|e| format!("观察地址 '{addr_str}' 不是合法十六进制: {e}"))?;
     if addr == 0 {
         return Err("观察地址不能为 0".to_string());
     }
@@ -158,12 +157,13 @@ struct Cursor {
     warned_missing: bool,
 }
 
-fn print_hit(sym: &Symbolizer, spec: &WatchSpec, hit: &HwbpHit) {
+fn print_hit(sym: &Symbolizer, spec: &WatchSpec, hit: &HwbpHit, tid: u32) {
     // 用 stderr 之外的标准输出:这是工具的主结果,不是日志。
     println!(
-        "[write] 0x{:x} len={} pc={} lr={}",
+        "[write] 0x{:x} len={} tid={} pc={} lr={}",
         spec.addr,
         spec.len.bytes(),
+        tid,
         sym.resolve(hit.pc),
         sym.resolve(hit.lr),
     );
@@ -257,7 +257,15 @@ fn run(pid: u32, specs: Vec<WatchSpec>, max_hits: u32, interval_ms: u64) -> Resu
     }
     log_info!("开始监控,命中会即时打印;Ctrl+C 停止并卸载观察点");
 
-    let mut cursors: HashMap<u64, Cursor> = HashMap::new();
+    /*
+     * 游标按 **(地址, 节点序号)** 分,不能只按地址。
+     *
+     * 观察点是 per-thread 的:同一个地址在 N 个线程上就有 N 个节点。只读
+     * node_index=0 会静静地把其它线程的命中全部丢掉 —— 多线程 app 里这正是
+     * 「谁写了这块内存」的主要部分,漏了等于白装。
+     * 每个节点也有自己的 ring_total,所以要各自记消费位置。
+     */
+    let mut cursors: HashMap<(u64, u32), Cursor> = HashMap::new();
     let mut total_printed = 0u64;
 
     while !HWBP_INTERRUPTED.load(Ordering::Relaxed) {
@@ -271,50 +279,63 @@ fn run(pid: u32, specs: Vec<WatchSpec>, max_hits: u32, interval_ms: u64) -> Resu
         arm_new_threads(pid, &specs, max_hits, &mut armed);
 
         for spec in &specs {
-            let cursor = cursors.entry(spec.addr).or_default();
-            match hwbp::hits(spec.addr, 0, 0) {
-                Ok(h) => {
-                    cursor.warned_missing = false;
-                    // ring_total 是累计值;差值即上次以来新增的条数。
-                    let new = h.total.wrapping_sub(cursor.consumed_total);
-                    cursor.consumed_total = h.total;
-                    if new == 0 {
-                        continue;
-                    }
-
-                    let entries = hwbp::effective_hits(&h);
-                    // 环只有 32 条:新增超过环容量说明中间的被覆盖了,如实说明,
-                    // 否则会把「只看到最后 32 条」误读成「只发生了 32 次」。
-                    let shown = (new as usize).min(entries.len());
-                    if new as usize > entries.len() {
-                        println!(
-                            "[!] 0x{:x} 新增 {new} 次命中,但环形缓冲只保留 {} 条 —— \
-                             中间 {} 条已被覆盖(如需完整记录请减小 --hwbp-interval)",
-                            spec.addr,
-                            entries.len(),
-                            new as usize - entries.len()
-                        );
-                    }
-
-                    for hit in entries.iter().skip(entries.len() - shown) {
-                        print_hit(&sym, spec, hit);
-                        total_printed += 1;
-                    }
-
-                    if h.is_armed == 0 {
-                        println!(
-                            "[*] 0x{:x} 已达上限 {} 次命中,内核侧自动关闭(不再产生新记录)",
-                            spec.addr, h.max_hits
-                        );
-                    }
-                }
+            /*
+             * 先问一次拿到该地址的节点总数,再逐个节点取。
+             * node_total 是 0 就说明观察点已经不在了(被 clear 或被 max_hits 之外
+             * 的原因移除),报一次就够,不要每轮刷屏。
+             */
+            let node_total = match hwbp::hits(spec.addr, 0, 0) {
+                Ok(h) => h.node_total,
                 Err(e) => {
-                    // 节点不存在通常是「还没下发成功」或「观察点已到量卸载」。
-                    // 只报一次,避免 50ms 一条刷屏。
+                    let cursor = cursors.entry((spec.addr, 0)).or_default();
                     if !cursor.warned_missing {
                         cursor.warned_missing = true;
-                        log_warn!("0x{:x} 查询失败: {e}", spec.addr);
+                        log_warn!("{}", e);
                     }
+                    continue;
+                }
+            };
+
+            for node_index in 0..node_total {
+                let h = match hwbp::hits(spec.addr, 0, node_index) {
+                    Ok(h) => h,
+                    Err(_) => continue,
+                };
+                let cursor = cursors.entry((spec.addr, node_index)).or_default();
+                cursor.warned_missing = false;
+
+                // ring_total 是累计值;差值即上次以来新增的条数。
+                let new = h.total.wrapping_sub(cursor.consumed_total);
+                cursor.consumed_total = h.total;
+                if new == 0 {
+                    continue;
+                }
+
+                let entries = hwbp::effective_hits(&h);
+                // 环只有 32 条:新增超过环容量说明中间的被覆盖了,如实说明,
+                // 否则会把「只看到最后 32 条」误读成「只发生了 32 次」。
+                let shown = (new as usize).min(entries.len());
+                if new as usize > entries.len() {
+                    println!(
+                        "[!] 0x{:x} tid={} 新增 {new} 次命中,但环形缓冲只保留 {} 条 —— \
+                         中间 {} 条已被覆盖(如需完整记录请减小 --hwbp-interval)",
+                        spec.addr,
+                        h.tid,
+                        entries.len(),
+                        new as usize - entries.len()
+                    );
+                }
+
+                for hit in entries.iter().skip(entries.len() - shown) {
+                    print_hit(&sym, spec, hit, h.tid);
+                    total_printed += 1;
+                }
+
+                if h.is_armed == 0 {
+                    println!(
+                        "[*] 0x{:x} tid={} 已达上限 {} 次命中,内核侧自动关闭(不再产生新记录)",
+                        spec.addr, h.tid, h.max_hits
+                    );
                 }
             }
         }
@@ -343,12 +364,7 @@ fn run(pid: u32, specs: Vec<WatchSpec>, max_hits: u32, interval_ms: u64) -> Resu
 }
 
 /// CLI 入口:解析 `--hwbp-watch` 列表并跑。
-pub(crate) fn run_from_args(
-    pid: u32,
-    watches: &[String],
-    max_hits: u32,
-    interval_ms: u64,
-) -> Result<(), String> {
+pub(crate) fn run_from_args(pid: u32, watches: &[String], max_hits: u32, interval_ms: u64) -> Result<(), String> {
     let mut specs = Vec::with_capacity(watches.len());
     for w in watches {
         specs.push(parse_watch_spec(w)?);
