@@ -24,18 +24,70 @@ pub(crate) const HITS_MAX: usize = 32;
 /// 每条命中保存的寄存器个数(x0-x7),对应 `HWBP_HIT_REG_WORDS`。
 pub(crate) const HIT_REG_WORDS: usize = 8;
 
+/// 观察类型,对应 `hwbp.h` 的 `HWBP_BP_*`(即 uapi 的 `HW_BREAKPOINT_*`)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum BpType {
+    #[default]
+    Write,
+    Read,
+    Access,
+}
+
+impl BpType {
+    /// 内核 `watch` 命令认的字符串形式。
+    pub(crate) fn as_arg(self) -> &'static str {
+        match self {
+            BpType::Write => "w",
+            BpType::Read => "r",
+            BpType::Access => "rw",
+        }
+    }
+}
+
+/// 单条命中的访问方向,对应 `hwbp.h` 的 `HWBP_ACCESS_*`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HitAccess {
+    Read,
+    Write,
+    /// 内核回了非预期的值(模块与宿主不同版本)。不静默当读 — 那个方向在
+    /// 「谁读了」和「谁写了」之间刚好搞反,比报错难查。
+    Unknown(u32),
+}
+
+impl HitAccess {
+    fn from_raw(v: u32) -> Self {
+        match v {
+            1 => HitAccess::Read,
+            2 => HitAccess::Write,
+            other => HitAccess::Unknown(other),
+        }
+    }
+
+    /// 给用户看的单字符/短标签。
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            HitAccess::Read => "read",
+            HitAccess::Write => "write",
+            HitAccess::Unknown(_) => "access?",
+        }
+    }
+}
+
+/// `hwbp_hit.flags` 的位,对应 `hwbp.h` 的 `HWBP_HIT_F_*`。
+pub(crate) const HIT_F_KERNEL_UACCESS: u32 = 0x1;
+
 /// 内核模块名,对应 `KPM_NAME("hwbp")`。
 const MODULE: &str = "hwbp";
 
-/// 一次写命中。与 C 侧 `struct hwbp_hit` 逐字段对应。
+/// 一次观察点命中。与 C 侧 `struct hwbp_hit` 逐字段对应。
 ///
-/// 只含 trap 上下文里零风险可得的字段 —— 全部来自 `pt_regs`。刻意不含 value /
-/// 栈快照:那需要在 debug exception 里解引用用户内存,异常态缺页会睡眠 → 内核
-/// panic。需要值时在 `hits()` 返回后自己读(那时已不在异常上下文)。
+/// 只含 trap 上下文里零风险可得的字段 —— 全部来自 `pt_regs` 与 `ESR`。刻意不含
+/// value / 栈快照:那需要在 debug exception 里解引用用户内存,异常态缺页会睡眠
+/// → 内核 panic。需要值时在 `hits()` 返回后自己读(那时已不在异常上下文)。
 #[derive(Debug, Clone, Copy, Default)]
 #[repr(C)]
 pub(crate) struct HwbpHit {
-    /// 触发 trap 的那条 store 指令地址
+    /// 触发 trap 的那条访存指令地址
     pub pc: u64,
     /// x30(trap 时的链接寄存器)
     pub lr: u64,
@@ -45,9 +97,21 @@ pub(crate) struct HwbpHit {
     pub addr: u64,
     /// x0-x7
     pub x: [u64; HIT_REG_WORDS],
+
+    /// 这次访问是读还是写(`HWBP_ACCESS_*`)。只有 RW 观察点下才有区分意义。
+    pub access: u32,
+    /// `HWBP_HIT_F_*`
+    pub flags: u32,
+    /// 原始 ESR(排查用)
+    pub esr: u32,
+    pub _pad: u32,
 }
 
-/// `hits` 的应答。与 C 侧 `struct hwbp_hits` 逐字段对应。
+/// `hits` 的应答。与 C 侧 `struct hwbp_hits` 逐字段对应(共 3640 字节:
+/// 8+4×11 = 52,补 4 字节对齐到 56,再加 32×112 的 entries)。
+///
+/// 两边尺寸不一致时内核会**主动拒答**(`hits` 命令里带 ABI 校验值,见 `hits()`),
+/// 不会把错位的字节当合法命中交回来。
 ///
 /// 注意 C 侧结构体的前 16 字节(`watch_addr`/`tid`/`node_index`)在命令里走字符串,
 /// 内核只把它们回填进输出结构;这里保留同样的布局以维持 `repr(C)` 对齐一致。
@@ -77,7 +141,8 @@ pub(crate) struct HwbpHits {
     pub ring_head: u32,
     /// 自动关闭阈值
     pub max_hits: u32,
-    pub _pad: u32,
+    /// 该节点的观察类型(`HWBP_BP_*`)。0 = 模块太旧(ABI 校验会先拦下这种情况)
+    pub bp_type: u32,
 
     /// 命中环,按「最旧 -> 最新」排列
     pub entries: [HwbpHit; HITS_MAX],
@@ -111,14 +176,24 @@ impl BpLen {
     }
 }
 
-/// 在指定线程上注册一个写观察点。
+/// 在指定线程上注册一个观察点。
 ///
 /// `addr` 必须按 `len` 对齐(arm64 强制,不对齐内核返回 `EINVAL`)。`max_hits`
 /// 传 0 用缺省值(`DEF_MAX_HITS`);到量后**内核侧**自动关掉该观察点,不等用户态。
 ///
+/// `bp_type` 选 `Read`/`Write`/`Access`(RW)。RW 下每条命中自带读写方向
+/// (`HwbpHit::access`),所以能直接回答「谁读的」和「谁写的」—— 而这正是写观察点
+/// 回答不了的(RW 观察点如果不带方向位,只能说「有人碰了」)。
+///
 /// 注意这是**按线程**的:观察点寄存器是 per-thread 资源(每线程只有 4 个),
 /// 覆盖整个进程需要调用方遍历 `/proc/<pid>/task` 逐个 TID 下发。
-pub(crate) fn watch(addr: u64, tid: u32, len: BpLen, max_hits: u32) -> Result<(), String> {
+pub(crate) fn watch(
+    addr: u64,
+    tid: u32,
+    len: BpLen,
+    max_hits: u32,
+    bp_type: BpType,
+) -> Result<(), String> {
     if addr == 0 {
         return Err("hwbp::watch: 地址为 0".to_string());
     }
@@ -129,7 +204,17 @@ pub(crate) fn watch(addr: u64, tid: u32, len: BpLen, max_hits: u32) -> Result<()
             len.bytes()
         ));
     }
-    kpm::control(MODULE, &format!("watch 0x{:x} {} {} {}", addr, tid, len.bytes(), max_hits))
+    kpm::control(
+        MODULE,
+        &format!(
+            "watch 0x{:x} {} {} {} {}",
+            addr,
+            tid,
+            len.bytes(),
+            max_hits,
+            bp_type.as_arg()
+        ),
+    )
 }
 
 /// 卸掉观察点。`tid` 传 0 表示卸掉该地址上的全部线程。
@@ -153,6 +238,9 @@ pub(crate) fn clear() -> Result<(), String> {
 ///
 /// `node_total == 0` 表示该地址上没有任何观察点,直接报错 —— 区别于「有观察点
 /// 但还没命中」(那种情况返回 `Ok`,里面 `count == 0`)。
+///
+/// 命令里会带上本地的 `sizeof(HwbpHits)` 作为 ABI 校验值:与内核不一致时内核直接
+/// 拒答(而不是把错位的字节当合法命中交回来)。所以升级时两边必须一起换。
 pub(crate) fn hits(addr: u64, tid: u32, node_index: u32) -> Result<HwbpHits, String> {
     if addr == 0 {
         return Err("hwbp::hits: 地址为 0".to_string());
@@ -161,7 +249,7 @@ pub(crate) fn hits(addr: u64, tid: u32, node_index: u32) -> Result<HwbpHits, Str
     let size = core::mem::size_of::<HwbpHits>();
     let raw = kpm::control_shared(
         MODULE,
-        &format!("hits 0x{:x} {} {}", addr, tid, node_index),
+        &format!("hits 0x{:x} {} {} {}", addr, tid, node_index, size),
         size,
     )?;
 

@@ -193,18 +193,21 @@ pub(crate) struct Args {
     #[arg(long = "token", value_name = "TOKEN")]
     pub(crate) token: Option<String>,
 
-    /// ARM64 硬件写观察点:监控某个内存地址,被写入时打印写入者。
+    /// ARM64 硬件观察点:监控某个内存地址,被访问时打印访问者。
     ///
     /// 走 mykpm 的 hwbp 内核模块(需已加载)。一次可以给多个观察点:
     ///   --hwbp-watch 0x7f1234000 --hwbp-watch 0x7f1234100:8
-    /// 地址后接 `:宽度` 指定观察宽度(1/2/4/8,默认 4),地址必须按宽度对齐。
+    ///   --hwbp-watch 0x7f1234000:4:rw     # 读写都监控(命中自带方向)
+    ///   --hwbp-watch 0x7f1234000::r       # 只监控读
+    /// 格式 ADDR[:LEN][:TYPE];LEN 缺省 4,TYPE 缺省 w(w=只写,r=只读,rw=读写)。
+    /// 地址必须按宽度对齐(arm64 强制)。
     ///
-    /// 这是「谁写了这块内存」的唯一可靠手段:native 代码直接往数组元素内存里写时,
-    /// 没有任何 JNI 层钩子看得见。
+    /// 这是「谁动了这块内存」的唯一可靠手段:native 代码直接往数组元素内存里写时,
+    /// 没有任何 JNI 层钩子看得见。用 `:rw` 时每条命中会标明这次是读还是写。
     ///
     /// 注意观察点寄存器是按线程的硬件资源(每线程仅 4 个),本工具会自动对目标
     /// 进程当时的所有线程下发,并把之后新建的线程也补上。
-    #[arg(long = "hwbp-watch", value_name = "ADDR[:LEN]", action = clap::ArgAction::Append)]
+    #[arg(long = "hwbp-watch", value_name = "ADDR[:LEN][:TYPE]", action = clap::ArgAction::Append)]
     pub(crate) hwbp_watch: Vec<String>,
 
     /// 每个观察点累计命中多少次后自动停止(默认 64)。
@@ -219,6 +222,7 @@ pub(crate) struct Args {
     /// 内核不推送命中,只能轮询。间隔越小越接近实时,但每次轮询都是一次
     /// supercall(要 fork 降权),间隔太小会拖慢宿主;间隔太大则热地址的
     /// 命中环(每节点 32 条)会被覆盖丢失。
+    /// hwbp 命中轮询间隔,单位毫秒。越小越实时,但内核侧环只有 32 条。
     #[arg(long = "hwbp-interval", value_name = "MS", default_value = "50")]
     pub(crate) hwbp_interval: u64,
 

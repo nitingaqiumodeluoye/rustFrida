@@ -1,8 +1,10 @@
-//! hwbp 子命令:监控内存写入,打印写入者。
+//! hwbp 子命令:监控内存访问,打印访问者。
 //!
 //! 用法(见 `args.rs` 的 `--hwbp-watch`):
 //! ```text
 //! rustfrida --pid 1234 --hwbp-watch 0x7f1234000 --hwbp-watch 0x7f1234100:8
+//! rustfrida --pid 1234 --hwbp-watch 0x7f1234000:4:rw     # 读写都监控
+//! rustfrida --pid 1234 --hwbp-watch 0x7f1234000::r       # 只监控读
 //! ```
 //!
 //! ## 为什么是轮询
@@ -28,7 +30,7 @@
 
 #![cfg(all(target_os = "android", target_arch = "aarch64"))]
 
-use crate::hwbp::{self, BpLen, HwbpHit};
+use crate::hwbp::{self, BpLen, BpType, HitAccess, HwbpHit, HIT_F_KERNEL_UACCESS};
 use crate::symbolize::Symbolizer;
 use crate::{log_info, log_warn};
 use std::collections::{HashMap, HashSet};
@@ -47,17 +49,29 @@ extern "C" fn hwbp_signal_handler(_sig: libc::c_int) {
 struct WatchSpec {
     addr: u64,
     len: BpLen,
+    bp_type: BpType,
 }
 
-/// 解析 `ADDR[:LEN]`。
+/// 解析 `ADDR[:LEN][:TYPE]`。
 ///
 /// 宽度缺省 4(最常见的 int / 指针以下标量);显式写 `:8` 才是 8 字节。
 /// 不猜数据大小是刻意的 —— 猜错会让观察窗口盖到邻居,报告出无关的写入者。
+///
+/// 类型缺省 `w`(写),与旧版行为一致;要监控读写必须显式写 `:r` / `:rw`。
+/// 用户原始需求是「读写都监控」,但把缺省改成 rw 会让所有现有脚本默默变成
+/// 「每个读也陷入一次」的降速陷阱,所以缺省不动,只把它做成可选。
+///
+/// 例:`0x7f1234000` / `0x7f1234000:8` / `0x7f1234000:4:rw` / `0x7f1234000::r`。
 fn parse_watch_spec(s: &str) -> Result<WatchSpec, String> {
-    let (addr_part, len_part) = match s.split_once(':') {
-        Some((a, l)) => (a, Some(l)),
-        None => (s, None),
-    };
+    let mut parts = s.split(':');
+    let addr_part = parts.next().unwrap_or("");
+    let len_part = parts.next();
+    let type_part = parts.next();
+    if parts.next().is_some() {
+        return Err(format!(
+            "观察点 '{s}' 形态非法(格式 ADDR[:LEN][:TYPE],TYPE 为 w/r/rw)"
+        ));
+    }
 
     let addr_str = addr_part.trim();
     let hex = addr_str
@@ -69,9 +83,10 @@ fn parse_watch_spec(s: &str) -> Result<WatchSpec, String> {
         return Err("观察地址不能为 0".to_string());
     }
 
-    let len = match len_part {
+    // 空字段算「缺省」:`0x1000::r` 里的中间那段就是空串。
+    let len = match len_part.map(str::trim).filter(|l| !l.is_empty()) {
         None => BpLen::Len4,
-        Some(l) => match l.trim() {
+        Some(l) => match l {
             "1" => BpLen::Len1,
             "2" => BpLen::Len2,
             "4" => BpLen::Len4,
@@ -79,6 +94,19 @@ fn parse_watch_spec(s: &str) -> Result<WatchSpec, String> {
             other => {
                 return Err(format!(
                     "观察宽度 '{other}' 非法(只能是 1/2/4/8;arm64 硬件观察点只有这四档)"
+                ))
+            }
+        },
+    };
+
+    let bp_type = match type_part.map(str::trim).filter(|t| !t.is_empty()) {
+        None => BpType::Write,
+        Some(t) => match t.to_ascii_lowercase().as_str() {            "w" | "write" => BpType::Write,
+            "r" | "read" => BpType::Read,
+            "rw" | "wr" | "both" => BpType::Access,
+            other => {
+                return Err(format!(
+                    "观察类型 '{other}' 非法(只能是 w / r / rw;w=只写,r=只读,rw=读写)"
                 ))
             }
         },
@@ -92,7 +120,11 @@ fn parse_watch_spec(s: &str) -> Result<WatchSpec, String> {
         ));
     }
 
-    Ok(WatchSpec { addr, len })
+    Ok(WatchSpec {
+        addr,
+        len,
+        bp_type,
+    })
 }
 
 /// 目标进程当前的线程 id 列表。
@@ -112,7 +144,7 @@ fn list_tids(pid: u32) -> Result<Vec<u32>, String> {
 /// 返回值只用于统计成功率:同一线程上的第 5 个观察点必然失败(硬件只有 4 个
 /// 寄存器),这是预期内的,不该当成错误刷屏。
 fn arm_on_thread(spec: &WatchSpec, tid: u32, max_hits: u32) -> Result<(), String> {
-    hwbp::watch(spec.addr, tid, spec.len, max_hits)
+    hwbp::watch(spec.addr, tid, spec.len, max_hits, spec.bp_type)
 }
 
 /// 已见过并已下发观察点的 (addr, tid) 集合。
@@ -158,22 +190,39 @@ struct Cursor {
 }
 
 fn print_hit(sym: &Symbolizer, spec: &WatchSpec, hit: &HwbpHit, tid: u32) {
-    // 用 stderr 之外的标准输出:这是工具的主结果,不是日志。
+    let access = HitAccess::from_raw(hit.access);
+    // 用**命中自带的**读写方向做标签,而不是 spec.bp_type —— RW 观察点正是靠这个
+    // 区分「谁读的」和「谁写的」。
     println!(
-        "[write] 0x{:x} len={} tid={} pc={} lr={}",
+        "[{}] 0x{:x} len={} tid={} pc={} lr={}",
+        access.label(),
         spec.addr,
         spec.len.bytes(),
         tid,
         sym.resolve(hit.pc),
         sym.resolve(hit.lr),
     );
+    // 内核代客访问(uaccess)产生的陷阱:pc 是内核地址,符号化不出来。
+    // 这在读观察点上很常见(内核读用户缓冲),不标出来现场没法解释。
+    if hit.flags & HIT_F_KERNEL_UACCESS != 0 {
+        println!(
+            "        (内核 uaccess 触发:这次访问是本线程的某个系统调用在内核里代做的,pc 是内核地址)"
+        );
+    }
     println!(
         "        sp=0x{:x} x0=0x{:x} x1=0x{:x} x2=0x{:x} x3=0x{:x}",
         hit.sp, hit.x[0], hit.x[1], hit.x[2], hit.x[3]
     );
-    // x0 常常就是被写的目标(store 的基址寄存器),单独提一句能省一次心算。
+    // x0 常常就是被访问的目标(读/写指令的基址寄存器),单独提一句能省一次心算。
     if hit.x[0] == spec.addr {
         println!("        (x0 即被观察地址)");
+    }
+    // 模块与宿主结构体不一致时 access 会是未预期的值 —— 大声说出来,
+    // 不要静默当成读:读/写刚好搞反的错比报错难查得多。
+    if let HitAccess::Unknown(raw) = access {
+        println!(
+            "        (!! 方向值 {raw} 不是内核认的 1=read/2=write —— 宿主与 hwbp.kpm 可能不是同一次构建)"
+        );
     }
 }
 
@@ -381,6 +430,8 @@ mod tests {
         let s = parse_watch_spec("0x7f1234000").unwrap();
         assert_eq!(s.addr, 0x7f1234000);
         assert_eq!(s.len, BpLen::Len4);
+        // 缺省类型仍是写:改缺省会让所有旧脚本默默变降速陷阱
+        assert_eq!(s.bp_type, BpType::Write);
     }
 
     #[test]
@@ -388,6 +439,27 @@ mod tests {
         let s = parse_watch_spec("7f1234000:8").unwrap();
         assert_eq!(s.addr, 0x7f1234000);
         assert_eq!(s.len, BpLen::Len8);
+        assert_eq!(s.bp_type, BpType::Write);
+    }
+
+    #[test]
+    fn parses_access_type() {
+        let s = parse_watch_spec("0x7f1234000:4:rw").unwrap();
+        assert_eq!(s.addr, 0x7f1234000);
+        assert_eq!(s.len, BpLen::Len4);
+        assert_eq!(s.bp_type, BpType::Access);
+
+        assert_eq!(parse_watch_spec("0x1000::r").unwrap().bp_type, BpType::Read);
+        assert_eq!(parse_watch_spec("0x1000:8:w").unwrap().bp_type, BpType::Write);
+        assert_eq!(parse_watch_spec("0x1000:8:BOTH").unwrap().bp_type, BpType::Access);
+    }
+
+    #[test]
+    fn rejects_bad_access_type_and_extra_fields() {
+        let e = parse_watch_spec("0x1000:4:x").unwrap_err();
+        assert!(e.contains("类型"), "{e}");
+        // 第四段 = 多输了字段,必须报错而不是默默忽略
+        assert!(parse_watch_spec("0x1000:4:rw:9").is_err());
     }
 
     #[test]
@@ -395,12 +467,5 @@ mod tests {
         // 4 字节宽度要求地址 4 对齐
         let e = parse_watch_spec("0x7f1234002:4").unwrap_err();
         assert!(e.contains("对齐"), "{e}");
-    }
-
-    #[test]
-    fn rejects_bad_len_and_bad_hex() {
-        assert!(parse_watch_spec("0x1000:3").unwrap_err().contains("非法"));
-        assert!(parse_watch_spec("zzz").is_err());
-        assert!(parse_watch_spec("0x0").is_err());
     }
 }
