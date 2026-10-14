@@ -128,6 +128,12 @@ jobs:
       - name: Build zymbiote payload
         run: bash zymbiote/build.sh
 
+      # 0.5) hwbp 的受控靶子。「谁写了这块内存」没法靠被监控者自证,
+      #      需要一个行为可预期、地址已知的进程来对账。它极轻(单文件 +
+      #      libc + pthread),放在这里一并出包,免得每次验证都要另找编译途径。
+      - name: Build hwbp test target
+        run: bash hwbp-test/build.sh
+
       # 1) loader shellcode：rustfrida 通过 include_bytes! 内嵌，必须先构建。
       #    （rust_frida/build.rs 也会兜底重跑，这里显式跑一次便于早期报错）
       - name: Build loader shellcode
@@ -290,6 +296,8 @@ jobs:
           python3 .github/check-qbdi-embed.py "${OUT}/rustfrida" dist/libqbdi_helper.so
           # 内嵌的 zymbiote payload 也一并产出:便于把 CI 构建结果回写到仓库
           cp zymbiote/build/zymbiote.elf dist/
+          # hwbp 的受控靶子(验证内存读写观察点用)
+          cp hwbp-test/build/hwbp_test dist/
           file dist/* || true
           ls -l dist
           sha256sum dist/* | tee dist/SHA256SUMS.txt
