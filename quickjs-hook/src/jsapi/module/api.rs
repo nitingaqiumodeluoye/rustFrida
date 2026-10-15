@@ -3,7 +3,8 @@
 // ============================================================================
 
 use crate::jsapi::callback_util::{extract_pointer_address, throw_internal_error};
-use crate::jsapi::util::add_cfunction_to_object;
+// 注：`add_cfunction_to_object` 已由 module/mod.rs 统一导入（本文件经 include! 拼进同一作用域），
+// 在此重复 use 会触发 E0252。
 
 unsafe fn module_info_to_js(ctx: *mut ffi::JSContext, m: &ModuleInfo) -> ffi::JSValue {
     let obj = ffi::JS_NewObject(ctx);
@@ -214,12 +215,18 @@ unsafe extern "C" fn js_module_instance_enumerate_ranges(
         Err(exc) => return exc,
     };
     // 复用静态实现：把模块名合成成第一个参数转发过去。
-    // 注意与静态版一致：protection 可省略，故此处不强制 argc >= 1。
+    // 注意：js_module_enumerate_ranges 的第二参是裸 `ffi::JSValue`，
+    // 不是包装类型 `value::JSValue`，故这里用 `ffi::JSValue::undefined()`。
     let mut args = [
         JSValue::string(ctx, &module_name),
         if argc >= 1 { JSValue(*argv) } else { JSValue::undefined() },
     ];
-    js_module_enumerate_ranges(ctx, JSValue::undefined(), if argc >= 1 { 2 } else { 1 }, args.as_mut_ptr())
+    js_module_enumerate_ranges(
+        ctx,
+        ffi::JSValue::undefined(),
+        if argc >= 1 { 2 } else { 1 },
+        args.as_mut_ptr(),
+    )
 }
 
 /// Module.findExportByName(moduleName, symbolName) → NativePointer | null
