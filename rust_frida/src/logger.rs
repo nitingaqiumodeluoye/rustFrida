@@ -7,6 +7,97 @@ use std::sync::{Mutex, OnceLock};
 pub static VERBOSE: AtomicBool = AtomicBool::new(false);
 static LOG_FILE: OnceLock<Mutex<File>> = OnceLock::new();
 
+/// 日志镜像开关（将服务端日志同步给主机端客户端）。
+///
+/// 取值来自环境变量 `RF_SYNC_LOG`：
+///   - 未设置 / `errors`：只镜像警告+错误（`log_warn!` / `log_error!`）
+///   - `all`：连普通信息/步骤/verbose 一起镜像
+///   - `off` / `0` / `none`：完全不镜像
+static MIRROR_MODE: OnceLock<MirrorMode> = OnceLock::new();
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum MirrorMode {
+    Off,
+    ErrorsOnly,
+    All,
+}
+
+/// 镜像回调：由服务端注册（logger 不能反向依赖 server，否则循环依赖）。
+/// 参数是已去 ANSI 的纯文本行。
+pub type MirrorFn = fn(&str);
+static MIRROR_SINK: OnceLock<MirrorFn> = OnceLock::new();
+
+thread_local! {
+    /// 防重入：镜像动作本身可能触发日志（如 relay 写失败），
+    /// 若无此标记会无限递归，或在持锁路径上自死锁。
+    static IN_MIRROR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
+    /// 主动抑制镜像：用于那些**本就会直接送达客户端**的本地重打。
+    /// 典型场景：服务端把 agent 发来的日志同时打到本地终端，在
+    /// `RF_SYNC_LOG=all` 下若不抑制，客户端会收到两份同样的日志。
+    static SUPPRESS_MIRROR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// 在闭包执行期间抑制日志镜像。用于打印“已由其它通道送达”的内容。
+pub fn with_mirror_suppressed<R>(f: impl FnOnce() -> R) -> R {
+    SUPPRESS_MIRROR.with(|flag| {
+        let prev = flag.get();
+        flag.set(true);
+        // 即使 f panic 也要恢复，否则本线程后续日志会静默丢镜像。
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        flag.set(prev);
+        match result {
+            Ok(v) => v,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    })
+}
+
+pub fn mirror_mode() -> MirrorMode {
+    *MIRROR_MODE.get_or_init(|| match std::env::var("RF_SYNC_LOG").ok().as_deref() {
+        Some("all") | Some("ALL") => MirrorMode::All,
+        Some("off") | Some("OFF") | Some("0") | Some("none") => MirrorMode::Off,
+        // 默认：只给用户看真正需要注意的东西
+        _ => MirrorMode::ErrorsOnly,
+    })
+}
+
+/// 由服务端启动时注册一次。重复注册忽略（OnceLock 语义）。
+pub fn set_mirror_sink(sink: MirrorFn) {
+    let _ = MIRROR_SINK.set(sink);
+}
+
+/// 把一行日志（已去 ANSI）镜像给主机端。
+///
+/// 本函数自身**绝不能**向外抛日志：由 IN_MIRROR 防重入。
+fn mirror_line(plain: &str, is_warn_or_error: bool) {
+    let mode = mirror_mode();
+    let wanted = match mode {
+        MirrorMode::Off => return,
+        MirrorMode::All => true,
+        MirrorMode::ErrorsOnly => is_warn_or_error,
+    };
+    if !wanted {
+        return;
+    }
+    let Some(sink) = MIRROR_SINK.get() else {
+        return;
+    };
+    IN_MIRROR.with(|flag| {
+        if flag.get() {
+            return;
+        }
+        if SUPPRESS_MIRROR.with(|f| f.get()) {
+            return;
+        }
+        flag.set(true);
+        // 镜像过程中请勿 panic：sink 内部已用 try_lock，不向调用者抛错。
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sink(plain)));
+        let _ = result;
+        flag.set(false);
+    });
+}
+
 pub fn is_verbose() -> bool {
     VERBOSE.load(Ordering::Relaxed)
 }
@@ -63,12 +154,15 @@ pub fn stdout_line(colored: &str, plain: &str) {
     let ts = format_ts_now();
     println!("[{}] {}", ts, colored);
     write_log_line(&format!("{} {}", ts, plain));
+    mirror_line(plain, false);
 }
 
 pub fn stderr_line(colored: &str, plain: &str) {
     let ts = format_ts_now();
     eprintln!("[{}] {}", ts, colored);
     write_log_line(&format!("{} {}", ts, plain));
+    // stderr 出口 = log_warn! / log_error!，默认镜像给客户端。
+    mirror_line(plain, true);
 }
 
 /// ANSI 颜色常量

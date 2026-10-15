@@ -346,4 +346,54 @@
         };
         return fn;
     };
+
+    // NativeCallback — Frida 兼容的 "JS 函数 → 可交付 native 的回调" 。
+    //
+    // Frida 里它返回一个真正的函数指针（带 .handle），可以传给 native API。
+    // rustFrida 的回调模型不同：hook 回调始终在 JS 侧执行，native 侧只持有
+    // JSValue 的 16 字节拷贝（见 callback_util::dup_callback_to_bytes）。
+    // 因此这里返回一个 **可直接调用的普通 JS 函数**，并带上 Frida 同名的元信息。
+    //
+    // 这样写的意义：
+    //   1. 用户习惯的 `Interceptor.replace(addr, new NativeCallback(fn, 'int', ['int']))`
+    //      无需改写即可工作 —— replace/hook 的第二参只要是函数就行；
+    //   2. 直接传裸 JS 函数 `Interceptor.replace(addr, function (x) { ... })` 同样工作
+    //      （两条路都支持）。
+    //
+    // 注意：返回的并不是可直接塞给任意 native API 的裸指针。需要传递到 native 侧时，
+    // 请用 Interceptor.replace / hook 这类“接收 JS 回调”的 API。
+    globalThis.NativeCallback = function NativeCallback(fn, retType, argTypes) {
+        if (typeof fn !== 'function') {
+            throw new TypeError("NativeCallback: first argument must be a function, got " + typeof fn);
+        }
+        if (retType !== undefined && retType !== null) {
+            _resolveType(retType);   // 校验类型名，非法则抛 TypeError
+        }
+        if (argTypes !== undefined && argTypes !== null) {
+            if (!Array.isArray(argTypes)) {
+                throw new TypeError("NativeCallback: argTypes must be an array");
+            }
+            for (var i = 0; i < argTypes.length; i++) {
+                var info = _resolveType(argTypes[i]);
+                if (info.kind === 0) {
+                    throw new TypeError("NativeCallback: 'void' can only be the return type");
+                }
+            }
+        }
+
+        // 回调本体。直接转发所有实参，返回值原样透传给 native hook 层做类型转换。
+        var cb = function() {
+            return fn.apply(this, arguments);
+        };
+
+        cb.returnType = retType;
+        cb.argumentTypes = argTypes;
+        cb.type = 'callback';
+        cb.toString = function() {
+            return 'NativeCallback(' + String(fn) + ', ' + retType
+                 + (argTypes ? ', [' + argTypes.join(', ') + ']' : '')
+                 + ')';
+        };
+        return cb;
+    };
 })();

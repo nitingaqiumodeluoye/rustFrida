@@ -27,7 +27,7 @@ pub(crate) const FRAME_KIND_CMD_TAGGED: u8 = 4;
 pub(crate) const FRAME_KIND_PING: u8 = 5;
 
 const FRAME_KIND_HELLO: u8 = 0x80;
-const FRAME_KIND_LOG: u8 = 0x81;
+pub(crate) const FRAME_KIND_LOG: u8 = 0x81;
 const FRAME_KIND_COMPLETE: u8 = 0x82;
 const FRAME_KIND_EVAL_OK: u8 = 0x83;
 const FRAME_KIND_EVAL_ERR: u8 = 0x84;
@@ -253,48 +253,80 @@ fn is_backloggable_frame(kind: u8) -> bool {
 /// keeps text and binary traffic from interleaving on the same stream.
 ///
 /// 无客户端时按 `queue_enabled` 做有界积压，重连后由 install_tcp_relay 补发。
-fn forward_agent_frame(session: &Session, kind: u8, payload: &[u8]) {
-    let mut relay = session.relay.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(writer) = relay.writer.as_mut() {
-        if let Err(e) = write_frame(writer, kind, payload) {
-            log_info!("[#{}] TCP relay closed: {}", session.id, e);
-            // 写失败只摘掉 writer，保留积压采集：客户端重连后可继续收后续日志。
-            relay.writer = None;
-            relay.closer = None;
-        }
-        return;
-    }
-
-    if !relay.queue_enabled || !is_backloggable_frame(kind) {
-        return;
-    }
-
-    let frame_bytes = payload.len().saturating_add(5);
-    if frame_bytes > MAX_RELAY_BACKLOG_BYTES {
-        log_warn!(
-            "[#{}] relay frame too large ({} bytes), discarded",
-            session.id,
-            frame_bytes
-        );
-        relay.dropped_frames = relay.dropped_frames.saturating_add(1);
-        return;
-    }
-    while relay.pending_bytes.saturating_add(frame_bytes) > MAX_RELAY_BACKLOG_BYTES {
-        match relay.pending.pop_front() {
-            Some(frame) => {
-                relay.pending_bytes = relay
-                    .pending_bytes
-                    .saturating_sub(frame.payload.len().saturating_add(5));
-                relay.dropped_frames = relay.dropped_frames.saturating_add(1);
+pub(crate) fn forward_agent_frame(session: &Session, kind: u8, payload: &[u8]) {
+    // 关键：本函数的日志必须**在锁外**发出。
+    //
+    // 原因：logger 会把 log_warn!/log_error! 镜像给客户端（RF_SYNC_LOG），而镜像
+    // 路径会反过来调本函数去抢 session.relay 锁。若在持锁期间打日志，同一线程就会
+    // 重复加同一把不可重入的 Mutex → 自死锁、进程挂死。
+    //
+    // 故结构上分两段：锁内只做状态变更并记下“待发消息”，锁外统一发出。
+    let pending_log = {
+        let mut relay = session.relay.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(writer) = relay.writer.as_mut() {
+            if let Err(e) = write_frame(writer, kind, payload) {
+                // 写失败只摘掉 writer，保留积压采集：客户端重连后可继续收后续日志。
+                relay.writer = None;
+                relay.closer = None;
+                Some(LogLine::Info(format!("[#{}] TCP relay closed: {}", session.id, e)))
+            } else {
+                None
             }
-            None => break,
+        } else if !relay.queue_enabled || !is_backloggable_frame(kind) {
+            None
+        } else {
+            let frame_bytes = payload.len().saturating_add(5);
+            if frame_bytes > MAX_RELAY_BACKLOG_BYTES {
+                relay.dropped_frames = relay.dropped_frames.saturating_add(1);
+                Some(LogLine::Warn(format!(
+                    "[#{}] relay frame too large ({} bytes), discarded",
+                    session.id, frame_bytes
+                )))
+            } else {
+                while relay.pending_bytes.saturating_add(frame_bytes) > MAX_RELAY_BACKLOG_BYTES {
+                    match relay.pending.pop_front() {
+                        Some(frame) => {
+                            relay.pending_bytes = relay
+                                .pending_bytes
+                                .saturating_sub(frame.payload.len().saturating_add(5));
+                            relay.dropped_frames = relay.dropped_frames.saturating_add(1);
+                        }
+                        None => break,
+                    }
+                }
+                relay.pending_bytes = relay.pending_bytes.saturating_add(frame_bytes);
+                relay.pending.push_back(PendingRelayFrame {
+                    kind,
+                    payload: payload.to_vec(),
+                });
+                None
+            }
         }
+    };
+
+    // 锁已释放，此处打日志不会重入死锁。
+    match pending_log {
+        Some(LogLine::Info(msg)) => log_info!("{}", msg),
+        Some(LogLine::Warn(msg)) => log_warn!("{}", msg),
+        None => {}
     }
-    relay.pending_bytes = relay.pending_bytes.saturating_add(frame_bytes);
-    relay.pending.push_back(PendingRelayFrame {
-        kind,
-        payload: payload.to_vec(),
-    });
+}
+
+/// `forward_agent_frame` 的延迟日志（锁外发出）。
+enum LogLine {
+    Info(String),
+    Warn(String),
+}
+
+/// 向已连接的主机客户端下发一条诊断/错误消息（`[agent] ...`）。
+///
+/// 用于服务端自身产生的、以前只落在设备端 `rustfrida.log` 里的消息 —— 比如
+/// 「脚本执行失败: <原因>」。这类消息与 agent 日志走同一条 FRAME_KIND_LOG
+/// 通道，所以主机端能用同一套解析路径处理，也能受益于断线重连的积压补发。
+///
+/// 无客户端时进积压队列（而非丢弃），客户端重连后可补看。
+pub(crate) fn notify_client(session: &Session, message: &str) {
+    forward_agent_frame(session, FRAME_KIND_LOG, message.as_bytes());
 }
 
 fn install_tcp_relay(stream: &TcpStream, session: &Session) -> io::Result<()> {
@@ -498,21 +530,26 @@ fn handle_socket_connection(stream: UnixStream, session: Arc<Session>) {
                         let msg = String::from_utf8(payload).unwrap_or_default();
                         let msg = msg.strip_suffix('\n').unwrap_or(&msg);
                         if !msg.is_empty() {
-                            if session.id == 0 {
-                                log_agent!("{}", msg);
-                            } else {
-                                crate::logger::stdout_line(
-                                    &format!(
-                                        "{}{} [agent#{}]{} {}",
-                                        crate::logger::BOLD,
-                                        crate::logger::MAGENTA,
-                                        session.id,
-                                        crate::logger::RESET,
-                                        msg
-                                    ),
-                                    &format!("[agent#{}] {}", session.id, msg),
-                                );
-                            }
+                            // 抑制镜像：这些日志已经通过 relay 直接送到客户端了
+                            // （本处只是给本地终端/日志文件补一份），
+                            // RF_SYNC_LOG=all 下不抑制的话客户端会收到两份。
+                            crate::logger::with_mirror_suppressed(|| {
+                                if session.id == 0 {
+                                    log_agent!("{}", msg);
+                                } else {
+                                    crate::logger::stdout_line(
+                                        &format!(
+                                            "{}{} [agent#{}]{} {}",
+                                            crate::logger::BOLD,
+                                            crate::logger::MAGENTA,
+                                            session.id,
+                                            crate::logger::RESET,
+                                            msg
+                                        ),
+                                        &format!("[agent#{}] {}", session.id, msg),
+                                    );
+                                }
+                            });
                         }
                     }
                     FRAME_KIND_BYE => {

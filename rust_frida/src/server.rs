@@ -11,7 +11,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{channel, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::thread;
 use std::time::Duration;
 
@@ -24,7 +24,8 @@ use rustyline::{Context, Editor, Helper};
 
 use crate::args::{Args, DEFAULT_LISTEN_ADDR};
 use crate::communication::{
-    read_frame, send_command, start_socketpair_handler, start_tcp_relay, FRAME_KIND_BOOTSTRAP_SCRIPT,
+    notify_client, read_frame, send_command, start_socketpair_handler, start_tcp_relay,
+    FRAME_KIND_BOOTSTRAP_SCRIPT,
 };
 use crate::injection::{cleanup_remote_loader_mappings, inject_via_bootstrapper, LoaderCleanupInfo};
 use crate::process::find_pid_by_name;
@@ -207,6 +208,7 @@ fn script_declares_wxshadow(source: &ScriptSource) -> bool {
 fn load_script_on_session(session: &Session, source: &ScriptSource, stop_worker_after_load: bool) -> ScriptLoadState {
     if session.get_sender().is_none() {
         log_error!("[#{}] agent 未连接，无法加载脚本", session.id);
+        notify_client(session, &format!("[#{}] agent 未连接，无法加载脚本", session.id));
         return ScriptLoadState::Failed;
     }
     let (script_name, script) = match source {
@@ -221,6 +223,10 @@ fn load_script_on_session(session: &Session, source: &ScriptSource, stop_worker_
             ),
             Err(e) => {
                 log_error!("[#{}] 读取脚本 '{}' 失败: {}", session.id, path, e);
+                notify_client(
+                    session,
+                    &format!("[#{}] 读取脚本 '{}' 失败: {}", session.id, path, e),
+                );
                 return ScriptLoadState::Failed;
             }
         },
@@ -236,6 +242,7 @@ fn load_script_on_session(session: &Session, source: &ScriptSource, stop_worker_
 
     if let Err(e) = preconfigure_java_stealth_if_declared(session, &script) {
         log_error!("[#{}] {}", session.id, e);
+        notify_client(session, &format!("[#{}] {}", session.id, e));
         return ScriptLoadState::Failed;
     }
 
@@ -301,6 +308,10 @@ fn load_script_on_session(session: &Session, source: &ScriptSource, stop_worker_
                     }
                     Some(Err(e)) => {
                         log_error!("[#{}] pre-resume Java 脚本执行失败: {}", session.id, e);
+                        notify_client(
+                            session,
+                            &format!("[#{}] pre-resume Java 脚本执行失败: {}", session.id, e),
+                        );
                         return ScriptLoadState::Failed;
                     }
                     Some(Ok(out)) => {
@@ -326,8 +337,20 @@ fn load_script_on_session(session: &Session, source: &ScriptSource, stop_worker_
                 } else {
                     LOAD_DEFAULT_TIMEOUT_SECS
                 })) {
-                None => log_warn!("[#{}] 脚本加载超时", session.id),
-                Some(Err(e)) => log_error!("[#{}] 脚本执行失败: {}", session.id, e),
+                None => {
+                    // 超时对用户来说最难排查（脚本既没输出也没报错），必须下发。
+                    log_warn!("[#{}] 脚本加载超时", session.id);
+                    notify_client(
+                        session,
+                        &format!("[#{}] 脚本加载超时（脚本可能存在无界循环或阻塞调用）", session.id),
+                    );
+                }
+                Some(Err(e)) => {
+                    // 关键路径：脚本自身抛异常时，以前只有设备端日志能看到，
+                    // 主机端只能看到“没输出”，找不到原因。这里把原文一并下发。
+                    log_error!("[#{}] 脚本执行失败: {}", session.id, e);
+                    notify_client(session, &format!("[#{}] 脚本执行失败: {}", session.id, e));
+                }
                 Some(Ok(out)) => {
                     if !out.is_empty() {
                         log_success!("[#{}] => {}", session.id, out);
@@ -335,7 +358,13 @@ fn load_script_on_session(session: &Session, source: &ScriptSource, stop_worker_
                 }
             }
         }
-        Err(e) => log_error!("[#{}] 主线程加载脚本失败: {}", session.id, e),
+        Err(e) => {
+            log_error!("[#{}] 主线程加载脚本失败: {}", session.id, e);
+            notify_client(
+                session,
+                &format!("[#{}] 主线程加载脚本失败: {}", session.id, e),
+            );
+        }
     }
     ScriptLoadState::Loaded {
         needs_post_resume_java_worker: uses_java_api,
@@ -1115,11 +1144,74 @@ fn print_sessions(mgr: &SessionManager) {
     println!();
 }
 
+/// 
+/// 日志镜像目标：由 `run_server` 在启动时注册。故意用 `Weak` 而不持有强引用 ——
+/// 镜像只是调试辅助，不应延长会话管理器生命周期，也不应在退出阶段阻止析构。
+static MIRROR_TARGET: std::sync::OnceLock<Weak<SessionManager>> = std::sync::OnceLock::new();
+
+/// 日志镜像 sink：把服务端日志同步给主机端客户端。
+///
+/// 安全要点（这是本功能最容易出事的地方）：
+///
+/// 1. **绝不阻塞**。本函数会在任意日志调用点执行，包括 `forward_agent_frame`
+///    正**持有** `session.relay` 锁期间（它在写失败时会 `log_info!`）。若这里
+///    再去阻塞地 `lock()` 同一个锁，就是同线程自死锁 → 进程挂死。因此全程
+///    只用 `try_lock`，拿不到就放弃这次镜像（下一次日志再补）。
+/// 2. **不递归**。镜像自身可能触发日志，由 logger 的 IN_MIRROR 线程本地标记拦。
+/// 3. **失败静默**。镜像失败不能让原本的日志调用出错，所以不 unwrap、不 panic。
+fn mirror_log_to_client(plain: &str) {
+    let Some(mgr) = MIRROR_TARGET.get().and_then(|w| w.upgrade()) else {
+        return;
+    };
+    // 挑一个“活着且有客户端”的会话。
+    //
+    // 优先活跃会话（用户 `use` 的那个），否则回退到任意带中继的会话 —— 否则在
+    // 用户没显式 `use` 时（例如 `-U -f pkg` 一次性 spawn）镜像会静默失效，
+    // 而那恰好是脚本报错最需要被看到的场景。
+    //
+    // 全程 try_lock：任一步拿不到锁就放弃本次镜像，不做重试（重试等于阻塞）。
+    let mut target = None;
+    let sessions = match mgr.try_sessions_snapshot() {
+        Some(s) => s,
+        None => return,
+    };
+    if let Some(id) = mgr.try_active_id() {
+        target = sessions.iter().find(|s| s.id == id).cloned();
+    }
+    if target.is_none() {
+        target = sessions.into_iter().find(|s| s.try_has_active_relay());
+    }
+    let Some(session) = target else {
+        return;
+    };
+    if !session.try_has_active_relay() {
+        return;
+    }
+    let message = format!("[server] {}", plain);
+    forward_agent_frame(&session, FRAME_KIND_LOG, message.as_bytes());
+}
+
 /// Server daemon 主入口
 pub(crate) fn run_server(args: &Args) {
     use crate::logger::{BOLD, CYAN, DIM, RESET};
 
     let mgr = Arc::new(SessionManager::new());
+
+    // 注册日志镜像 sink，使服务端产生的日志（脚本报错、注入失败等）
+    // 能同步到主机端 rfclient，而不只落在设备端 rustfrida.log。
+    let _ = MIRROR_TARGET.set(Arc::downgrade(&mgr));
+    crate::logger::set_mirror_sink(mirror_log_to_client);
+    match crate::logger::mirror_mode() {
+        crate::logger::MirrorMode::Off => {
+            log_info!("日志镜像已关闭（RF_SYNC_LOG=off），服务端日志仅在设备端可见");
+        }
+        crate::logger::MirrorMode::ErrorsOnly => {
+            log_info!("日志镜像：警告/错误会同步到主机端客户端（RF_SYNC_LOG=all 可开全量）");
+        }
+        crate::logger::MirrorMode::All => {
+            log_info!("日志镜像：全部服务端日志同步到主机端客户端（RF_SYNC_LOG=all）");
+        }
+    }
 
     // 注册信号处理（Ctrl+C 触发清理）
     spawn::register_cleanup_handler();

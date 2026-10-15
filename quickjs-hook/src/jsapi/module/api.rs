@@ -2,7 +2,8 @@
 // JS API: Module namespace
 // ============================================================================
 
-use crate::jsapi::callback_util::extract_pointer_address;
+use crate::jsapi::callback_util::{extract_pointer_address, throw_internal_error};
+use crate::jsapi::util::add_cfunction_to_object;
 
 unsafe fn module_info_to_js(ctx: *mut ffi::JSContext, m: &ModuleInfo) -> ffi::JSValue {
     let obj = ffi::JS_NewObject(ctx);
@@ -24,7 +25,201 @@ unsafe fn module_info_to_js(ctx: *mut ffi::JSContext, m: &ModuleInfo) -> ffi::JS
     obj_val.set_property(ctx, "size", size_val);
     obj_val.set_property(ctx, "path", path_val);
 
+    // Frida 对齐：ModuleInfo 实例方法。官方 Frida 的 Module 实例可直接
+    // `mod.findExportByName("sym")`，而不再需要回传模块名给静态 Module.*。
+    // 实现方式：这些 C 函数从 `this.name` 取自己的模块名，再复用静态路径。
+    add_cfunction_to_object(ctx, obj, "findExportByName", js_module_instance_find_export, 1);
+    add_cfunction_to_object(ctx, obj, "getExportByName", js_module_instance_get_export, 1);
+    add_cfunction_to_object(ctx, obj, "enumerateExports", js_module_instance_enumerate_exports, 0);
+    add_cfunction_to_object(ctx, obj, "enumerateImports", js_module_instance_enumerate_imports, 0);
+    add_cfunction_to_object(ctx, obj, "enumerateSymbols", js_module_instance_enumerate_symbols, 0);
+    add_cfunction_to_object(ctx, obj, "findSymbolByName", js_module_instance_find_symbol, 1);
+    add_cfunction_to_object(ctx, obj, "getSymbolByName", js_module_instance_get_symbol, 1);
+    add_cfunction_to_object(ctx, obj, "enumerateRanges", js_module_instance_enumerate_ranges, 1);
+
     obj
+}
+
+/// 从 `this.name` 取当前 ModuleInfo 实例的模块名。
+/// 失败时抛 TypeError（正常不会发生，除非用户把方法拆下来单独调用）。
+unsafe fn instance_module_name(ctx: *mut ffi::JSContext, this: ffi::JSValue) -> Result<String, ffi::JSValue> {
+    let name_val = JSValue(this).get_property(ctx, "name");
+    let name = name_val.to_string(ctx);
+    name_val.free(ctx);
+    match name {
+        Some(s) if !s.is_empty() => Ok(s),
+        _ => Err(ffi::JS_ThrowTypeError(
+            ctx,
+            b"Module method called on an object without a module name\0".as_ptr() as *const _,
+        )),
+    }
+}
+
+/// mod.findExportByName(symbolName) → NativePointer | null
+///
+/// 在模块的导出表里查符号，找不到返回 null（与静态 Module.findExportByName 一致）。
+unsafe extern "C" fn js_module_instance_find_export(
+    ctx: *mut ffi::JSContext,
+    this: ffi::JSValue,
+    argc: i32,
+    argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    if argc < 1 {
+        return ffi::JS_ThrowTypeError(
+            ctx,
+            b"mod.findExportByName(symbolName) requires 1 argument\0".as_ptr() as *const _,
+        );
+    }
+    let module_name = match instance_module_name(ctx, this) {
+        Ok(s) => s,
+        Err(exc) => return exc,
+    };
+    let symbol_name = match require_string_arg(ctx, JSValue(*argv), "symbolName") {
+        Ok(s) => s,
+        Err(exc) => return exc,
+    };
+
+    let addr = module_dlsym(&module_name, &symbol_name);
+    if addr.is_null() {
+        JSValue::null().raw()
+    } else {
+        create_native_pointer(ctx, addr as u64).raw()
+    }
+}
+
+/// mod.getExportByName(symbolName) — 同 findExportByName，但找不到时抛异常。
+unsafe extern "C" fn js_module_instance_get_export(
+    ctx: *mut ffi::JSContext,
+    this: ffi::JSValue,
+    argc: i32,
+    argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    let result = js_module_instance_find_export(ctx, this, argc, argv);
+    if JSValue(result).is_null() {
+        let module_name = instance_module_name(ctx, this).unwrap_or_else(|_| String::from("<unknown>"));
+        let symbol_name = if argc >= 1 {
+            JSValue(*argv).to_string(ctx).unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let msg = format!("{}: unable to find export '{}'", module_name, symbol_name);
+        return throw_internal_error(ctx, msg);
+    }
+    result
+}
+
+/// mod.enumerateExports() → 与静态 Module.enumerateExports(self.name) 同形。
+unsafe extern "C" fn js_module_instance_enumerate_exports(
+    ctx: *mut ffi::JSContext,
+    this: ffi::JSValue,
+    _argc: i32,
+    _argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    let module_name = match instance_module_name(ctx, this) {
+        Ok(s) => s,
+        Err(exc) => return exc,
+    };
+    enumerate_exports_for_module(ctx, &module_name)
+}
+
+/// mod.enumerateImports()
+unsafe extern "C" fn js_module_instance_enumerate_imports(
+    ctx: *mut ffi::JSContext,
+    this: ffi::JSValue,
+    _argc: i32,
+    _argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    let module_name = match instance_module_name(ctx, this) {
+        Ok(s) => s,
+        Err(exc) => return exc,
+    };
+    enumerate_imports_for_module(ctx, &module_name)
+}
+
+/// mod.enumerateSymbols()
+unsafe extern "C" fn js_module_instance_enumerate_symbols(
+    ctx: *mut ffi::JSContext,
+    this: ffi::JSValue,
+    _argc: i32,
+    _argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    let module_name = match instance_module_name(ctx, this) {
+        Ok(s) => s,
+        Err(exc) => return exc,
+    };
+    enumerate_symbols_for_module(ctx, &module_name)
+}
+
+/// mod.findSymbolByName(symbolName) → NativePointer | null
+///
+/// 与 findExportByName 的区别：本函数查 ELF 符号表（含 local/undefined），
+/// 不要求符号是动态导出。debug 符号（如 linker64 的 __dl_* 系列）需要走这里。
+unsafe extern "C" fn js_module_instance_find_symbol(
+    ctx: *mut ffi::JSContext,
+    this: ffi::JSValue,
+    argc: i32,
+    argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    if argc < 1 {
+        return ffi::JS_ThrowTypeError(
+            ctx,
+            b"mod.findSymbolByName(symbolName) requires 1 argument\0".as_ptr() as *const _,
+        );
+    }
+    let module_name = match instance_module_name(ctx, this) {
+        Ok(s) => s,
+        Err(exc) => return exc,
+    };
+    let symbol_name = match require_string_arg(ctx, JSValue(*argv), "symbolName") {
+        Ok(s) => s,
+        Err(exc) => return exc,
+    };
+
+    match find_symbol_in_module(&module_name, &symbol_name) {
+        Some(addr) => create_native_pointer(ctx, addr).raw(),
+        None => JSValue::null().raw(),
+    }
+}
+
+/// mod.getSymbolByName(symbolName) — 同 findSymbolByName，未命中时抛异常。
+unsafe extern "C" fn js_module_instance_get_symbol(
+    ctx: *mut ffi::JSContext,
+    this: ffi::JSValue,
+    argc: i32,
+    argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    let result = js_module_instance_find_symbol(ctx, this, argc, argv);
+    if JSValue(result).is_null() {
+        let module_name = instance_module_name(ctx, this).unwrap_or_else(|_| String::from("<unknown>"));
+        let symbol_name = if argc >= 1 {
+            JSValue(*argv).to_string(ctx).unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let msg = format!("{}: unable to find symbol '{}'", module_name, symbol_name);
+        return throw_internal_error(ctx, msg);
+    }
+    result
+}
+
+/// mod.enumerateRanges(protection) → 与静态 Module.enumerateRanges(self.name, prot) 同形。
+unsafe extern "C" fn js_module_instance_enumerate_ranges(
+    ctx: *mut ffi::JSContext,
+    this: ffi::JSValue,
+    argc: i32,
+    argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    let module_name = match instance_module_name(ctx, this) {
+        Ok(s) => s,
+        Err(exc) => return exc,
+    };
+    // 复用静态实现：把模块名合成成第一个参数转发过去。
+    // 注意与静态版一致：protection 可省略，故此处不强制 argc >= 1。
+    let mut args = [
+        JSValue::string(ctx, &module_name),
+        if argc >= 1 { JSValue(*argv) } else { JSValue::undefined() },
+    ];
+    js_module_enumerate_ranges(ctx, JSValue::undefined(), if argc >= 1 { 2 } else { 1 }, args.as_mut_ptr())
 }
 
 /// Module.findExportByName(moduleName, symbolName) → NativePointer | null
@@ -236,6 +431,71 @@ unsafe fn range_record_to_js(
     obj
 }
 
+// ---------------------------------------------------------------------------
+// 按模块名枚举（静态 `Module.*` 与实例方法 `mod.*` 共用）
+// ---------------------------------------------------------------------------
+
+/// 导出符号（defined + global）——`Module.enumerateExports(name)` / `mod.enumerateExports()`。
+unsafe fn enumerate_exports_for_module(ctx: *mut ffi::JSContext, module_name: &str) -> ffi::JSValue {
+    let arr = ffi::JS_NewArray(ctx);
+    let Some((path, base)) = resolve_module_for_enumeration(module_name) else {
+        return arr;
+    };
+
+    let symbols = elf_module_enumerate_symbols(&path, base);
+    let mut out_idx = 0u32;
+    for sym in &symbols {
+        // Exports are defined + globally visible.
+        if !sym.is_defined || !sym.is_global {
+            continue;
+        }
+        ffi::JS_SetPropertyUint32(ctx, arr, out_idx, symbol_record_to_js(ctx, sym, false));
+        out_idx += 1;
+    }
+    arr
+}
+
+/// 导入符号（含 PLT/GOT slot）——`Module.enumerateImports(name)` / `mod.enumerateImports()`。
+unsafe fn enumerate_imports_for_module(ctx: *mut ffi::JSContext, module_name: &str) -> ffi::JSValue {
+    let arr = ffi::JS_NewArray(ctx);
+    let Some((path, base)) = resolve_module_for_enumeration(module_name) else {
+        return arr;
+    };
+
+    let imports = elf_module_enumerate_imports(&path, base);
+    for (i, rec) in imports.iter().enumerate() {
+        ffi::JS_SetPropertyUint32(ctx, arr, i as u32, import_record_to_js(ctx, rec));
+    }
+    arr
+}
+
+/// 全部符号（含 local / undefined）——`Module.enumerateSymbols(name)` / `mod.enumerateSymbols()`。
+unsafe fn enumerate_symbols_for_module(ctx: *mut ffi::JSContext, module_name: &str) -> ffi::JSValue {
+    let arr = ffi::JS_NewArray(ctx);
+    let Some((path, base)) = resolve_module_for_enumeration(module_name) else {
+        return arr;
+    };
+
+    let symbols = elf_module_enumerate_symbols(&path, base);
+    for (i, sym) in symbols.iter().enumerate() {
+        ffi::JS_SetPropertyUint32(ctx, arr, i as u32, symbol_record_to_js(ctx, sym, true));
+    }
+    arr
+}
+
+/// 在模块 ELF 符号表里按名字查地址（含 local / debug 符号）。
+///
+/// 与 `module_dlsym` 的区别：后者只认动态导出表，而 linker64 的 `__dl_*` 这类
+/// 内部符号需要走本函数。命中但 address 为 0（如 `.c` 这类 FILE 符号）视为未命中。
+unsafe fn find_symbol_in_module(module_name: &str, symbol_name: &str) -> Option<u64> {
+    let (path, base) = resolve_module_for_enumeration(module_name)?;
+    let symbols = elf_module_enumerate_symbols(&path, base);
+    symbols
+        .iter()
+        .find(|s| s.name == symbol_name && s.address != 0)
+        .map(|s| s.address)
+}
+
 /// Module.enumerateExports(moduleName) → Array of {type, name, address}
 unsafe extern "C" fn js_module_enumerate_exports(
     ctx: *mut ffi::JSContext,
@@ -253,23 +513,7 @@ unsafe extern "C" fn js_module_enumerate_exports(
         Ok(s) => s,
         Err(exc) => return exc,
     };
-
-    let arr = ffi::JS_NewArray(ctx);
-    let Some((path, base)) = resolve_module_for_enumeration(&module_name) else {
-        return arr;
-    };
-
-    let symbols = elf_module_enumerate_symbols(&path, base);
-    let mut out_idx = 0u32;
-    for sym in &symbols {
-        // Exports are defined + globally visible.
-        if !sym.is_defined || !sym.is_global {
-            continue;
-        }
-        ffi::JS_SetPropertyUint32(ctx, arr, out_idx, symbol_record_to_js(ctx, sym, false));
-        out_idx += 1;
-    }
-    arr
+    enumerate_exports_for_module(ctx, &module_name)
 }
 
 /// Module.enumerateImports(moduleName) → Array of {type, name, slot, address}
@@ -289,17 +533,7 @@ unsafe extern "C" fn js_module_enumerate_imports(
         Ok(s) => s,
         Err(exc) => return exc,
     };
-
-    let arr = ffi::JS_NewArray(ctx);
-    let Some((path, base)) = resolve_module_for_enumeration(&module_name) else {
-        return arr;
-    };
-
-    let imports = elf_module_enumerate_imports(&path, base);
-    for (i, rec) in imports.iter().enumerate() {
-        ffi::JS_SetPropertyUint32(ctx, arr, i as u32, import_record_to_js(ctx, rec));
-    }
-    arr
+    enumerate_imports_for_module(ctx, &module_name)
 }
 
 /// Module.enumerateSymbols(moduleName) → Array of {type, name, address, isGlobal, isDefined}
@@ -319,17 +553,7 @@ unsafe extern "C" fn js_module_enumerate_symbols(
         Ok(s) => s,
         Err(exc) => return exc,
     };
-
-    let arr = ffi::JS_NewArray(ctx);
-    let Some((path, base)) = resolve_module_for_enumeration(&module_name) else {
-        return arr;
-    };
-
-    let symbols = elf_module_enumerate_symbols(&path, base);
-    for (i, sym) in symbols.iter().enumerate() {
-        ffi::JS_SetPropertyUint32(ctx, arr, i as u32, symbol_record_to_js(ctx, sym, true));
-    }
-    arr
+    enumerate_symbols_for_module(ctx, &module_name)
 }
 
 /// Module.enumerateRanges(moduleName, protection?) → Array of {base, size, protection, file}

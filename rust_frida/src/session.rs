@@ -148,6 +148,18 @@ impl Session {
         self.relay.lock().unwrap_or_else(|e| e.into_inner()).writer.is_some()
     }
 
+    /// 非阻塞版 `has_active_relay`，专供日志镜像路径使用。
+    ///
+    /// 镜像会在任意日志调用点执行（可能正处于某个持锁窗口附近），
+    /// 用阻塞锁会带来不必要的挂起风险，故此处只用 `try_lock`。
+    pub(crate) fn try_has_active_relay(&self) -> bool {
+        match self.relay.try_lock() {
+            Ok(g) => g.writer.is_some(),
+            // 拿不到锁 → 本次不镜像，等下一次日志。
+            Err(_) => false,
+        }
+    }
+
     pub(crate) fn set_remote_agent_info(&self, loader_ctx_addr: u64, current_thread_eval_impl: u64) {
         self.loader_ctx_addr.store(loader_ctx_addr, Ordering::Release);
         self.agent_current_thread_eval_impl
@@ -330,5 +342,21 @@ impl SessionManager {
 
     pub(crate) fn all_sessions(&self) -> Vec<Arc<Session>> {
         self.sessions.lock().unwrap().values().cloned().collect()
+    }
+
+    /// 非阻塞版 `active_id`：供日志镜像这类“拿不到就放弃”的路径使用。
+    ///
+    /// 用 `try_lock` 而非 `lock`，避免与持锁路径（如 `forward_agent_frame`
+    /// 在写失败时打日志的持锁窗口）互等造成死锁。
+    pub(crate) fn try_active_id(&self) -> Option<u32> {
+        self.active_id.try_lock().ok().and_then(|g| *g)
+    }
+
+    /// 非阻塞版会话快照，供日志镜像这类“拿不到就放弃”的路径使用。
+    ///
+    /// 用 `try_lock` 而非 `lock`，避免与持锁路径（如 `forward_agent_frame`
+    /// 在写失败时打日志的持锁窗口）互等造成死锁。
+    pub(crate) fn try_sessions_snapshot(&self) -> Option<Vec<Arc<Session>>> {
+        self.sessions.try_lock().ok().map(|g| g.values().cloned().collect())
     }
 }
