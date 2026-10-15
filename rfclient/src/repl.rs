@@ -280,11 +280,12 @@ fn spawn_event_printer(events: Receiver<Event>) {
     let _ = thread::Builder::new().name("rf-print".into()).spawn(move || {
         for event in events {
             match event {
-                // 服务端镜像日志自带 `[server] ` 前缀（见 server.rs mirror_log_to_client），
-                // 此时不再叠 `[agent] `，否则会渲染成 `[agent] [server] ...`，
-                // 读起来像是 agent 报的，其实是服务端报的。
+                // 服务端镜像日志自带 `[server] ` 或 `[server#N] ` 前缀（见 server.rs
+                // mirror_log_to_client），此时不再叠 `[agent] `，否则会渲染成
+                // `[agent] [server] ...`，读起来像是 agent 报的，其实是服务端报的。
+                // 且镜像会被投递给任意一个带中继的会话，`#N` 指明消息真正属于哪个 session。
                 Event::Log(msg) => {
-                    if msg.starts_with("[server] ") {
+                    if msg.starts_with("[server") {
                         print_line(&msg)
                     } else {
                         print_line(&format!("[agent] {}", msg))

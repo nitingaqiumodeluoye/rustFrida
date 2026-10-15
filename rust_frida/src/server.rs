@@ -1187,8 +1187,41 @@ fn mirror_log_to_client(plain: &str) {
     if !session.try_has_active_relay() {
         return;
     }
-    let message = format!("[server] {}", plain);
+    let message = format!("[server{}] {}", match extract_session_tag(plain) {
+        Some(tag) => tag,
+        None => "",
+    }, plain);
     forward_agent_frame(&session, FRAME_KIND_LOG, message.as_bytes());
+}
+
+/// 从日志正文里提取已有的 `[#N]` 会话标记，返回形如 `"#4"` 的片段。
+///
+/// 用途：镜像会被投递给“任意一个带中继的会话”（见 `mirror_log_to_client`
+/// 的选取逻辑），因此**接收方未必就是消息所属的会话**。把来源提到前缀里
+/// （`[server#4] [!] [#4] 脚本加载超时`），用户扫一眼前缀就知道这条属于谁，
+/// 不用去读正文。
+///
+/// 正文里没有 `[#N]` 的是全局日志（TCP accept 失败、页还原诊断等），
+/// 本来就不属于任何会话，返回 `None`，前缀退化为 `[server]`。
+fn extract_session_tag(plain: &str) -> Option<&str> {
+    let bytes = plain.as_bytes();
+    let mut i = 0;
+    while i + 2 < bytes.len() {
+        if bytes[i] == b'[' && bytes[i + 1] == b'#' {
+            let mut j = i + 2;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                j += 1;
+            }
+            // `[#` 后至少一位数字，且以 `]` 收尾。切点全落在 ASCII 字节上，
+            // 不会踩到 UTF-8 字符边界。
+            if j > i + 2 && j < bytes.len() && bytes[j] == b']' {
+                // 连同 `#` 一起返回：`[server` + `#4` + `]` → `[server#4]`
+                return Some(&plain[i + 1..j]);
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Server daemon 主入口

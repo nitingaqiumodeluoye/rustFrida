@@ -45,7 +45,10 @@ impl Tag {
             Tag::Client => "[client] ",
             Tag::Agent => "[agent] ",
             Tag::Out => "[out] ",
-            Tag::Server => "[server] ",
+            // 文本自带 `[server] ` / `[server#N] `（由服务端构造，见 server.rs
+            // mirror_log_to_client），此处不再加前缀，否则会叠加成
+            // `[server] [server#4] ...`。
+            Tag::Server => "",
             Tag::Event => "[event] ",
             Tag::Reply => "=> ",
             Tag::Error => "[错误] ",
