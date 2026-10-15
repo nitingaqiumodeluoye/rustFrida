@@ -203,32 +203,6 @@ unsafe extern "C" fn js_module_instance_get_symbol(
     result
 }
 
-/// mod.enumerateRanges(protection) → 与静态 Module.enumerateRanges(self.name, prot) 同形。
-unsafe extern "C" fn js_module_instance_enumerate_ranges(
-    ctx: *mut ffi::JSContext,
-    this: ffi::JSValue,
-    argc: i32,
-    argv: *mut ffi::JSValue,
-) -> ffi::JSValue {
-    let module_name = match instance_module_name(ctx, this) {
-        Ok(s) => s,
-        Err(exc) => return exc,
-    };
-    // 复用静态实现：把模块名合成成第一个参数转发过去。
-    // 注意：js_module_enumerate_ranges 的第二参是裸 `ffi::JSValue`，
-    // 不是包装类型 `value::JSValue`，故这里用 `ffi::JSValue::undefined()`。
-    let mut args = [
-        JSValue::string(ctx, &module_name),
-        if argc >= 1 { JSValue(*argv) } else { JSValue::undefined() },
-    ];
-    js_module_enumerate_ranges(
-        ctx,
-        ffi::JSValue::undefined(),
-        if argc >= 1 { 2 } else { 1 },
-        args.as_mut_ptr(),
-    )
-}
-
 /// Module.findExportByName(moduleName, symbolName) → NativePointer | null
 ///
 /// moduleName == null → search all loaded modules through our ELF parser
@@ -604,12 +578,54 @@ unsafe extern "C" fn js_module_enumerate_ranges(
         None
     };
 
-    let ranges = enumerate_module_ranges(&module_name, prot_filter.as_deref());
+    enumerate_ranges_for_module(ctx, &module_name, prot_filter.as_deref())
+}
+
+/// 按模块名枚举内存区间（静态 `Module.enumerateRanges` 与实例方法共用）。
+unsafe fn enumerate_ranges_for_module(
+    ctx: *mut ffi::JSContext,
+    module_name: &str,
+    prot_filter: Option<&str>,
+) -> ffi::JSValue {
+    let ranges = enumerate_module_ranges(module_name, prot_filter);
     let arr = ffi::JS_NewArray(ctx);
     for (i, rec) in ranges.iter().enumerate() {
         ffi::JS_SetPropertyUint32(ctx, arr, i as u32, range_record_to_js(ctx, rec));
     }
     arr
+}
+
+/// mod.enumerateRanges(protection?) → 与静态 Module.enumerateRanges(self.name, prot) 同形。
+unsafe extern "C" fn js_module_instance_enumerate_ranges(
+    ctx: *mut ffi::JSContext,
+    this: ffi::JSValue,
+    argc: i32,
+    argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    let module_name = match instance_module_name(ctx, this) {
+        Ok(s) => s,
+        Err(exc) => return exc,
+    };
+    // protection 可省略；只在显式给了非 null/undefined 的值时才做类型校验。
+    let prot = if argc >= 1 {
+        let arg0 = JSValue(*argv);
+        if arg0.is_null() || arg0.is_undefined() {
+            None
+        } else {
+            match arg0.to_string(ctx) {
+                Some(s) => Some(s),
+                None => {
+                    return ffi::JS_ThrowTypeError(
+                        ctx,
+                        b"protection must be a string\0".as_ptr() as *const _,
+                    );
+                }
+            }
+        }
+    } else {
+        None
+    };
+    enumerate_ranges_for_module(ctx, &module_name, prot.as_deref())
 }
 
 fn tagged_module_memfd_name(basename: &str) -> String {
