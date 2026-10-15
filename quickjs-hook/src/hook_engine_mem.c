@@ -258,10 +258,24 @@ static int find_containing_vma(uintptr_t addr, uintptr_t* vma_start, size_t* vma
  * containing VMA + COW write.  Operating on the full VMA boundary
  * avoids VMA fragmentation in /proc/self/maps.
  *
+ * 这是 wxshadow_patch 失败后的兜底，且只剩两种场景还有意义：
+ *
+ *  1. 2MB PMD block：wxshadow KPM 1.0.4 起自己会拆
+ *     （prepare_shadow_target -> wxshadow_try_split_pmd -> 内核
+ *     __split_huge_pmd），正常情况走不到这里；留着是对付
+ *     __split_huge_pmd 不可解析或旧版 KPM。
+ *
+ *  2. 连续 PTE 组（PTE_CONT：arm64 把对齐的 16 项折成一个 TLB 条目）：
+ *     KPM 1.0.9 起自己展开整组（wxshadow_write_pte_raw ->
+ *     wxshadow_unfold_cont_group）；更早的版本则依赖这里的 COW 副作用
+ *     —— 写 fault 会顺带清掉 PTE 组的 CONT 位。
+ *
+ * 两者都不是「正确性依赖」：真正必须清 CONT 的是 KPM 侧（它持有 PTE 原始值，
+ * 能精确判断并做整组 TLB 失效），这里只是兜底。
+ *
  * The transient RWX window is unavoidable but:
  *   - wxshadow itself causes VMA splits (more detectable than RWX)
  *   - The window is microseconds (single volatile write)
- *   - Without this, wxshadow fails on contiguous PTE pages
  *
  * Returns 0 on success, -1 on failure.
  */
@@ -314,8 +328,8 @@ int wxshadow_patch(void* addr, const void* buf, size_t len) {
     }
 
     if (ret != 0) {
-        /* PATCH failed — likely 2MB section (PMD) mapping.
-         * wxshadow only supports 4KB PTE-mapped pages.
+        /* PATCH failed —— 目标页不是 4KB PTE 映射，通常是 2MB PMD block
+         * （连续 PTE 组也会落到这里：KPM 严格按单页 PTE 操作）。
          *
          * Split the PMD by triggering COW on the target page.  We must
          * mprotect the ENTIRE containing VMA (not just the target page)
@@ -362,13 +376,25 @@ int wxshadow_release(void* addr) {
 }
 
 /*
- * wxshadow 同页 LDR literal livelock 修复
+ * wxshadow 同页 LDR literal 的优化搬运（不是正确性必需）
  *
- * wxshadow 通过 R/X PTE 互斥保护页面。如果同页上有 PC-relative literal load
- * (LDR Rt, #imm)，该指令的 fetch(X) 和 data read(R) 都在同一保护页上，
- * 导致无限 page fault 循环 (livelock)。
+ * 背景（4.19 时代的判断）：wxshadow 用 R/X 互斥的 PTE 保护页面，同页上的
+ * PC-relative literal load (LDR Rt, #imm) 的 fetch(X) 与 data read(R) 落在同一个
+ * 保护页上，当时认为会造成无限 page fault 循环 (livelock)。
  *
- * 修复: 将同页 LDR literal 替换为 B → trampoline，trampoline 里嵌入常量值。
+ * 现状（对照 wxshadow KPM 源码核实）：KPM 自己对这类 fault 做了页翻转，
+ * 不会 livelock —— do_page_fault hook 把同页 literal 的读 fault 翻到
+ * 「原始页 + r--」，而该状态带 PTE_UXN（EL0 execute-never），翻过去只能读、
+ * 不能执行，所以不存在绕过 hook 的窗口；下一次取指再 fault 翻回 shadow 页
+ * （已打补丁的代码）。见 wxshadow_handle_read_fault() /
+ * wxshadow_handle_exec_fault() 的注释（"Called when execution resumes after a
+ * read fault switched to original"）。
+ *
+ * 所以本函数是性能优化：把每条命中 literal 的两趟 fault 换成一个 B 跳转。
+ * 是否启用在 patch_target() 里由 disable_wxshadow_ldr_reloc 决定，那个开关
+ * 目前刻意保持关闭 —— 取舍见那里的注释。
+ *
+ * 实现: 将同页 LDR literal 替换为 B → trampoline，trampoline 里嵌入常量值。
  * B 指令只需 X(fetch)，不读数据，不触发 R/X 切换。
  */
 
@@ -450,11 +476,13 @@ void wxshadow_relocate_same_page_ldr_literals(void* patch_addr, int patch_len) {
 
         /* 分配 trampoline (48 bytes 足够: 加载常量 + 跳回)
          * B 指令范围 ±128MB，必须用 hook_alloc_near_range 严格限制。
-         * 分配失败意味着该 LDR 无法修复 → wxshadow 会 livelock → 必须警告。 */
+         * 分配失败只是失去这次优化（该 LDR 每次执行多走两趟 page fault，
+         * 由 KPM 的读 fault 页翻转兜住），不是 livelock。仍然打出来，
+         * 便于判断优化覆盖了多少条 literal。 */
         void* tramp = hook_alloc_near_range(48, (void*)pc, 0x8000000 /* ±128MB */);
         if (!tramp) {
-            hook_log("\033[31m[stealth_ldr_reloc] CRITICAL: alloc trampoline FAILED for LDR at %#lx "
-                     "(no memory within ±128MB). This LDR will livelock under wxshadow!\033[0m",
+            hook_log("\033[33m[stealth_ldr_reloc] skip LDR at %#lx: no memory within ±128MB "
+                     "(falls back to the KPM read-fault page flip; slower but correct)\033[0m",
                      (unsigned long)pc);
             continue;
         }
@@ -1407,10 +1435,25 @@ int patch_target(void* target, void* jump_dest, int stealth, HookEntry* entry) {
     }
 
     if (stealth == 1) {
-        /* Diagnostic mode:
-         * Temporarily disable same-page LDR literal relocation and only keep the
-         * core wxshadow patch. This isolates whether device reboots are caused by
-         * the page-wide relocate pass rather than the base shadow patch itself. */
+        /* 同页 LDR literal 搬运默认关闭。
+         *
+         * 这个开关来自 0d9b7e3 (2026-06-27) 的整机重启二分诊断，当时注释写的是
+         * "Temporarily disable"；0ca0b4e (2026-06-29) 把 wxshadow replace 路径
+         * 恢复原样时把它留下了，之后再没有任何提交碰过它 —— 所以"临时"已经变成
+         * 事实上的默认值。
+         *
+         * 事后对照 wxshadow KPM 源码核实，它没必要打开：KPM 的 do_page_fault
+         * hook 自己处理同页 literal 的读 fault，把页翻到「原始页 + r--」，
+         * 该状态带 PTE_UXN，只能读不能执行，因此既不 livelock 也不会绕过 hook；
+         * 下一次取指再翻回 shadow 页。也就是说这个 pass 只是省掉每条 literal 的
+         * 两趟 fault，属于性能优化。
+         *
+         * 保持关闭的理由：省掉的那点开销换来的是「扫描被 patch 页的全部 1024 条
+         * 指令 + 对每条命中项再发一次 wxshadow_patch」，直接放大 6 月那轮未收敛
+         * 重启诊断的暴露面（多一次 shadow patch 就多一个可疑点）。那轮诊断的结论
+         * 至今没有收敛，所以维持现状。
+         *
+         * 要重新打开就把它改成 0，但先接受上面这个取舍。 */
         const int disable_wxshadow_ldr_reloc = 1;
 
         /* wxshadow 模式: shadow 页写入.
