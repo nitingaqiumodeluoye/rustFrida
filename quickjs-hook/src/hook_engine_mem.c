@@ -375,179 +375,6 @@ int wxshadow_release(void* addr) {
     return 0;
 }
 
-/*
- * wxshadow 同页 LDR literal 的优化搬运（不是正确性必需）
- *
- * 背景（4.19 时代的判断）：wxshadow 用 R/X 互斥的 PTE 保护页面，同页上的
- * PC-relative literal load (LDR Rt, #imm) 的 fetch(X) 与 data read(R) 落在同一个
- * 保护页上，当时认为会造成无限 page fault 循环 (livelock)。
- *
- * 现状（对照 wxshadow KPM 源码核实）：KPM 自己对这类 fault 做了页翻转，
- * 不会 livelock —— do_page_fault hook 把同页 literal 的读 fault 翻到
- * 「原始页 + r--」，而该状态带 PTE_UXN（EL0 execute-never），翻过去只能读、
- * 不能执行，所以不存在绕过 hook 的窗口；下一次取指再 fault 翻回 shadow 页
- * （已打补丁的代码）。见 wxshadow_handle_read_fault() /
- * wxshadow_handle_exec_fault() 的注释（"Called when execution resumes after a
- * read fault switched to original"）。
- *
- * 所以本函数是性能优化：把每条命中 literal 的两趟 fault 换成一个 B 跳转。
- * 是否启用在 patch_target() 里由 disable_wxshadow_ldr_reloc 决定，那个开关
- * 目前刻意保持关闭 —— 取舍见那里的注释。
- *
- * 实现: 将同页 LDR literal 替换为 B → trampoline，trampoline 里嵌入常量值。
- * B 指令只需 X(fetch)，不读数据，不触发 R/X 切换。
- */
-
-/* ARM64 LDR literal 编码检测:
- * LDR Wt:  opc=00 V=0 → 0x18000000 mask 0xFF000000
- * LDR Xt:  opc=01 V=0 → 0x58000000 mask 0xFF000000
- * LDR St:  opc=00 V=1 → 0x1C000000 mask 0xFF000000
- * LDR Dt:  opc=01 V=1 → 0x5C000000 mask 0xFF000000
- * LDR Qt:  opc=10 V=1 → 0x9C000000 mask 0xFF000000
- * PRFM:    opc=11 V=0 → 0xD8000000 (prefetch, 不需要修复)
- */
-static int is_ldr_literal(uint32_t insn) {
-    uint32_t top8 = insn & 0xFF000000;
-    return top8 == 0x18000000 || top8 == 0x58000000 ||
-           top8 == 0x1C000000 || top8 == 0x5C000000 ||
-           top8 == 0x9C000000;
-}
-
-/* 从 LDR literal 指令中提取 PC-relative 目标地址 */
-static uint64_t ldr_literal_target(uint64_t pc, uint32_t insn) {
-    int32_t imm19 = (int32_t)((insn >> 5) & 0x7FFFF);
-    if (imm19 & (1 << 18)) imm19 -= (1 << 19);  /* sign extend */
-    return pc + (int64_t)imm19 * 4;
-}
-
-/* LDR literal 加载的数据大小 (bytes) */
-static int ldr_literal_size(uint32_t insn) {
-    uint32_t top8 = insn & 0xFF000000;
-    if (top8 == 0x18000000 || top8 == 0x1C000000) return 4;  /* W/S */
-    if (top8 == 0x58000000 || top8 == 0x5C000000) return 8;  /* X/D */
-    if (top8 == 0x9C000000) return 16; /* Q */
-    return 0;
-}
-
-/* 是否为 SIMD/FP LDR literal (V=1) */
-static int ldr_literal_is_simd(uint32_t insn) {
-    return (insn & 0x04000000) != 0;  /* bit 26 = V */
-}
-
-/*
- * 扫描 wxshadow 保护页上的同页 LDR literal 指令并修复。
- * 对每条同页 LDR literal: 读取常量值 → 分配 trampoline → 嵌入常量 + 跳回 →
- * wxshadow patch 原始 LDR 为 B trampoline。
- *
- * patch_addr: wxshadow patch 的目标地址
- * patch_len: patch 覆盖的字节数 (这些字节内的 LDR 不需要修复)
- */
-void wxshadow_relocate_same_page_ldr_literals(void* patch_addr, int patch_len) {
-    uintptr_t page_start = (uintptr_t)patch_addr & ~0xFFFUL;
-    uintptr_t page_end = page_start + 0x1000;
-    uintptr_t patch_start = (uintptr_t)patch_addr;
-    uintptr_t patch_end = patch_start + patch_len;
-    int fixed = 0;
-    int scanned = 0;
-
-    hook_log("[stealth_ldr_reloc] scanning page %#lx for patch at %p len=%d",
-             (unsigned long)page_start, patch_addr, patch_len);
-
-    for (uintptr_t pc = page_start; pc < page_end; pc += 4) {
-        scanned++;
-        /* 跳过被 patch 覆盖的区域 */
-        if (pc >= patch_start && pc < patch_end) continue;
-
-        uint32_t insn = *(uint32_t*)pc;
-        if (!is_ldr_literal(insn)) continue;
-
-        uint64_t target = ldr_literal_target(pc, insn);
-        uintptr_t target_page = target & ~0xFFFUL;
-        if (target_page != page_start) continue;
-
-        /* 同页 LDR literal — 需要修复 */
-        int data_size = ldr_literal_size(insn);
-        int is_simd = ldr_literal_is_simd(insn);
-        uint32_t rt = insn & 0x1F;
-
-        /* 读取原始常量值 */
-        uint8_t literal_data[16];
-        memcpy(literal_data, (void*)target, data_size);
-
-        /* 分配 trampoline (48 bytes 足够: 加载常量 + 跳回)
-         * B 指令范围 ±128MB，必须用 hook_alloc_near_range 严格限制。
-         * 分配失败只是失去这次优化（该 LDR 每次执行多走两趟 page fault，
-         * 由 KPM 的读 fault 页翻转兜住），不是 livelock。仍然打出来，
-         * 便于判断优化覆盖了多少条 literal。 */
-        void* tramp = hook_alloc_near_range(48, (void*)pc, 0x8000000 /* ±128MB */);
-        if (!tramp) {
-            hook_log("\033[33m[stealth_ldr_reloc] skip LDR at %#lx: no memory within ±128MB "
-                     "(falls back to the KPM read-fault page flip; slower but correct)\033[0m",
-                     (unsigned long)pc);
-            continue;
-        }
-
-        Arm64Writer w;
-        arm64_writer_init(&w, tramp, (uint64_t)tramp, 48);
-
-        if (is_simd) {
-            /* SIMD: LDR St/Dt/Qt, [PC, #8] → skip over embedded data → B back
-             * 编码: opc[31:30] 0 11 100 imm19 Rt
-             * imm19 = (data_offset) / 4, data 紧跟在 B 指令后面 */
-            /* LDR Vt, #data (PC+8 = skip B insn) */
-            uint32_t opc = (insn >> 30) & 3;
-            uint32_t ldr_enc = (opc << 30) | 0x1C000000 | (2 << 5) | rt;  /* imm19=2 → PC+8 */
-            arm64_writer_put_insn(&w, ldr_enc);
-            /* B back to pc+4 */
-            int64_t back_offset = (int64_t)(pc + 4) - (int64_t)((uint64_t)tramp + 4);
-            arm64_writer_put_b_imm(&w, (uint64_t)tramp + 4 + back_offset);
-            /* 嵌入常量 */
-            for (int i = 0; i < data_size; i += 4) {
-                arm64_writer_put_insn(&w, *(uint32_t*)(literal_data + i));
-            }
-        } else {
-            /* GPR: 用 LDR Xt/Wt, [PC, #8] 同样的方式 */
-            uint32_t opc = (insn >> 30) & 3;
-            uint32_t ldr_enc = (opc << 30) | 0x18000000 | (2 << 5) | rt;  /* imm19=2 → PC+8 */
-            arm64_writer_put_insn(&w, ldr_enc);
-            /* B back */
-            int64_t back_offset = (int64_t)(pc + 4) - (int64_t)((uint64_t)tramp + 4);
-            arm64_writer_put_b_imm(&w, (uint64_t)tramp + 4 + back_offset);
-            /* 嵌入常量 (4 or 8 bytes, padding to 4-byte align) */
-            for (int i = 0; i < data_size; i += 4) {
-                arm64_writer_put_insn(&w, *(uint32_t*)(literal_data + i));
-            }
-        }
-
-        arm64_writer_flush(&w);
-        arm64_writer_clear(&w);
-
-        /* 构造 B 指令跳到 trampoline */
-        int64_t b_offset = (int64_t)(uint64_t)tramp - (int64_t)pc;
-        if (b_offset < -0x8000000 || b_offset > 0x7FFFFFC) {
-            hook_log("[stealth_ldr_reloc] B range exceeded for LDR at %#lx → tramp %p",
-                     (unsigned long)pc, tramp);
-            continue;
-        }
-        uint32_t b_insn = 0x14000000 | (((uint32_t)(b_offset >> 2)) & 0x03FFFFFF);
-
-        /* wxshadow patch: 替换 LDR literal 为 B trampoline */
-        if (wxshadow_patch((void*)pc, &b_insn, 4) != 0) {
-            hook_log("[stealth_ldr_reloc] wxshadow_patch failed for LDR at %#lx", (unsigned long)pc);
-            continue;
-        }
-
-        fixed++;
-        hook_log("[stealth_ldr_reloc] fixed LDR at %#lx → tramp %p (data_size=%d, %s, rt=%d)",
-                 (unsigned long)pc, tramp, data_size, is_simd ? "SIMD" : "GPR", rt);
-    }
-
-    if (fixed > 0) {
-        hook_log("[stealth_ldr_reloc] fixed %d same-page LDR literals on page %#lx",
-                 fixed, (unsigned long)page_start);
-    }
-}
-
 /* --- Jump writing and allocation --- */
 
 /* BRK 填充 + 清理 writer，返回写入字节数 */
@@ -1435,26 +1262,24 @@ int patch_target(void* target, void* jump_dest, int stealth, HookEntry* entry) {
     }
 
     if (stealth == 1) {
-        /* 同页 LDR literal 搬运默认关闭。
+        /* 同页 LDR literal 搬运已删除。
          *
-         * 这个开关来自 0d9b7e3 (2026-06-27) 的整机重启二分诊断，当时注释写的是
-         * "Temporarily disable"；0ca0b4e (2026-06-29) 把 wxshadow replace 路径
-         * 恢复原样时把它留下了，之后再没有任何提交碰过它 —— 所以"临时"已经变成
-         * 事实上的默认值。
+         * 原实现(wxshadow_relocate_same_page_ldr_literals)扫描被 patch 页,把同页
+         * LDR literal 换成 B → trampoline,避开 wxshadow 下 R/X 互斥页上的取指/数据读
+         * 冲突。它在 0d9b7e3 (2026-06-27) 的整机重启二分诊断中被关闭(当时写
+         * "Temporarily disable"),0ca0b4e (2026-06-29) 恢复 replace 路径时把开关留下,
+         * 之后再无提交碰过 —— 因为 `const int = 1` 会被 -O2 常量折叠,该函数及其 4 个
+         * helper 实际上从未被编译进产物(两次 CI 的 libagent.so 逐字节相同可证)。
          *
-         * 事后对照 wxshadow KPM 源码核实，它没必要打开：KPM 的 do_page_fault
-         * hook 自己处理同页 literal 的读 fault，把页翻到「原始页 + r--」，
-         * 该状态带 PTE_UXN，只能读不能执行，因此既不 livelock 也不会绕过 hook；
-         * 下一次取指再翻回 shadow 页。也就是说这个 pass 只是省掉每条 literal 的
-         * 两趟 fault，属于性能优化。
+         * 对照 wxshadow KPM 源码核实:即使打开也仅是把每条 literal 的两趟 page fault
+         * 换成一个 B 跳转,属性能优化而非正确性必需 —— KPM 的 do_page_fault hook 自己
+         * 处理同页 literal 的读 fault,把页翻到「原始页 + r--」,该状态带 PTE_UXN
+         * (只能读不能执行),既不 livelock 也不会绕过 hook;下一次取指再翻回 shadow 页。
+         * 见 wxshadow_handle_read_fault() / wxshadow_handle_exec_fault()。
          *
-         * 保持关闭的理由：省掉的那点开销换来的是「扫描被 patch 页的全部 1024 条
-         * 指令 + 对每条命中项再发一次 wxshadow_patch」，直接放大 6 月那轮未收敛
-         * 重启诊断的暴露面（多一次 shadow patch 就多一个可疑点）。那轮诊断的结论
-         * 至今没有收敛，所以维持现状。
-         *
-         * 要重新打开就把它改成 0，但先接受上面这个取舍。 */
-        const int disable_wxshadow_ldr_reloc = 1;
+         * 故连同开关一起删除。若将来要恢复这个优化,应从 0d9b7e3^ 取回函数体,并先
+         * 评估「扫描 1024 条指令 + 每条命中项再发一次 wxshadow_patch」带来的暴露面
+         * (6 月那轮重启诊断至今未收敛)。 */
 
         /* wxshadow 模式: shadow 页写入.
          * 1. aligned(32) 防止 buf 跨页 (copy_from_user_via_pte 不支持跨页)
@@ -1487,13 +1312,6 @@ int patch_target(void* target, void* jump_dest, int stealth, HookEntry* entry) {
             }
             hook_log("[patch_target] cross-page first segment patched target=%p len=%zu",
                      target, first_len);
-            /* LDR literal relocate: 两页各扫一次 (shadow 页 R/X 互斥按页生效) */
-            if (!disable_wxshadow_ldr_reloc) {
-                wxshadow_relocate_same_page_ldr_literals(target, (int)first_len);
-                wxshadow_relocate_same_page_ldr_literals(second_addr, (int)second_len);
-            } else {
-                hook_log("[STEALTH1] diagnostic: skip same-page LDR relocate for cross-page patch target=%p", target);
-            }
             ok = 1;
             hook_log("[STEALTH1] cross-page patch OK target=%p split=%zu+%zu", target, first_len, second_len);
         } else {
@@ -1502,11 +1320,6 @@ int patch_target(void* target, void* jump_dest, int stealth, HookEntry* entry) {
             if (wxshadow_patch(target, jump_buf, jump_result) == 0) {
                 hook_log("[patch_target] after wxshadow_patch single-page OK target=%p len=%d",
                          target, jump_result);
-                if (!disable_wxshadow_ldr_reloc) {
-                    wxshadow_relocate_same_page_ldr_literals(target, jump_result);
-                } else {
-                    hook_log("[STEALTH1] diagnostic: skip same-page LDR relocate target=%p len=%d", target, jump_result);
-                }
                 ok = 1;
             } else {
                 hook_log("[patch_target] after wxshadow_patch single-page FAILED target=%p len=%d",
