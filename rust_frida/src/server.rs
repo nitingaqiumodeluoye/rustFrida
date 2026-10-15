@@ -24,8 +24,8 @@ use rustyline::{Context, Editor, Helper};
 
 use crate::args::{Args, DEFAULT_LISTEN_ADDR};
 use crate::communication::{
-    notify_client, read_frame, send_command, start_socketpair_handler, start_tcp_relay,
-    FRAME_KIND_BOOTSTRAP_SCRIPT,
+    forward_agent_frame, notify_client, read_frame, send_command, start_socketpair_handler,
+    start_tcp_relay, FRAME_KIND_BOOTSTRAP_SCRIPT, FRAME_KIND_LOG,
 };
 use crate::injection::{cleanup_remote_loader_mappings, inject_via_bootstrapper, LoaderCleanupInfo};
 use crate::process::find_pid_by_name;
