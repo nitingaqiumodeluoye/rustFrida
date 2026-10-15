@@ -206,7 +206,7 @@ pub(crate) fn is_reflect_ids_ready() -> bool {
 }
 
 // ClassLoader 动态覆盖：spawn 模式下 jsinit 时 ClassLoader 不可用，
-// Java.ready() gate 触发后通过 update_app_classloader() 设置。
+// Java.perform() gate 触发后通过 update_app_classloader() 设置。
 use std::sync::atomic::AtomicU64;
 /// app ClassLoader global ref（由 Java._updateClassLoader 设置）
 pub(super) static CL_OVERRIDE: AtomicU64 = AtomicU64::new(0);
@@ -1390,7 +1390,7 @@ pub(super) unsafe fn cache_reflect_ids(env: JniEnv) {
     });
 }
 
-/// 更新 app ClassLoader（由 Java.ready() gate hook 在 Instrumentation.newApplication 中调用）。
+/// 更新 app ClassLoader(由 Java.perform() gate hook 在 Instrumentation.newApplication 中调用)。
 /// 将 local ref 转为 global ref 并缓存 loadClass method ID。
 pub(super) unsafe fn update_app_classloader(env: JniEnv, cl_local: *mut std::ffi::c_void) -> bool {
     if env.is_null() || cl_local.is_null() {
@@ -1409,7 +1409,7 @@ pub(super) unsafe fn update_app_classloader(env: JniEnv, cl_local: *mut std::ffi
     let get_mid: GetMethodIdFn = jni_fn!(env, GetMethodIdFn, JNI_GET_METHOD_ID);
     let delete_local_ref: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
 
-    // 避免在 Java.ready gate hook 中触发 FindClass → WalkStack/GetDexPc。
+    // 避免在 Java.perform gate hook 中触发 FindClass → WalkStack/GetDexPc。
     // 这里已有 cl_local，直接取其运行时 Class 即可拿到对应 loadClass 方法。
     let cl_cls = get_object_class(env, gl);
     if jni_null_or_exc(env, cl_cls) {
@@ -1470,7 +1470,7 @@ pub(super) unsafe fn get_app_classloader_local_ref(env: JniEnv) -> *mut std::ffi
 }
 
 /// 主动重新探测 app ClassLoader（spawn resume-first 场景）。
-/// jsinit 时 app 可能尚未初始化，此函数在 Java.ready 安装 hook 后再次尝试，
+/// jsinit 时 app 可能尚未初始化,此函数在 Java.perform 安装 hook 后再次尝试,
 /// 通过 ActivityThread.currentActivityThread().getApplication().getClassLoader() 探测。
 /// 如果成功，更新缓存的 classloader 并返回 true。
 /// 最多重试 8 次（每次 50ms sleep），总等待 ~400ms。
@@ -1484,11 +1484,11 @@ pub(super) unsafe fn reprobe_classloader() -> bool {
             crate::raw_thread::sleep_ms(50);
         }
         if reprobe_classloader_once() {
-            crate::jsapi::console::output_verbose(&format!("[Java.ready] reprobe succeeded after {}ms", attempt * 50));
+            crate::jsapi::console::output_verbose(&format!("[Java.perform] reprobe succeeded after {}ms", attempt * 50));
             return true;
         }
     }
-    crate::jsapi::console::output_verbose("[Java.ready] reprobe_classloader: 400ms timeout, app not ready");
+    crate::jsapi::console::output_verbose("[Java.perform] reprobe_classloader: 400ms timeout, app not ready");
     false
 }
 
@@ -1580,7 +1580,7 @@ pub(super) unsafe fn reprobe_classloader_once_with_env(env: JniEnv) -> bool {
     delete_local_ref(env, cl);
 
     if updated && is_classloader_ready() {
-        crate::jsapi::console::output_verbose("[Java.ready] reprobe_classloader: app ClassLoader found");
+        crate::jsapi::console::output_verbose("[Java.perform] reprobe_classloader: app ClassLoader found");
         true
     } else {
         false

@@ -852,7 +852,7 @@ unsafe extern "C" fn js_java_get_stealth(
 }
 
 /// JS CFunction: Java._updateClassLoader(ptr) — 更新缓存的 app ClassLoader
-/// 由 Java.ready() gate hook 在 Instrumentation.newApplication 回调中调用，
+/// 由 Java.perform() gate hook 在 Instrumentation.newApplication 回调中调用,
 /// 传入 ClassLoader 的 jobject 指针。
 unsafe extern "C" fn js_update_classloader(
     ctx: *mut ffi::JSContext,
@@ -887,14 +887,14 @@ unsafe extern "C" fn js_update_classloader(
         Ok(env) => {
             let updated = update_app_classloader(env, cl_ptr);
             if updated {
-                output_verbose("[java.ready] ClassLoader 已更新");
+                output_verbose("[java.perform] ClassLoader 已更新");
             } else {
-                output_verbose("[java.ready] ClassLoader 更新失败");
+                output_verbose("[java.perform] ClassLoader 更新失败");
             }
             JSValue::bool(updated).raw()
         }
         Err(_) => {
-            output_verbose("[java.ready] 获取 JNIEnv 失败，ClassLoader 更新失败");
+            output_verbose("[java.perform] 获取 JNIEnv 失败,ClassLoader 更新失败");
             JSValue::bool(false).raw()
         }
     }
@@ -1218,7 +1218,7 @@ pub fn deferred_java_init() -> Result<(), String> {
 
     crate::jsapi::console::output_verbose("[java] deferred_java_init: JNI 已就绪");
 
-    // 兜底：resume 前 Java.ready 里的 gate hook 安装可能因 JNI 未就绪而失败
+    // 兜底:resume 前 Java.perform 里的 gate hook 安装可能因 JNI 未就绪而失败
     if let Err(e) = crate::load_script("Java._installGateHook && Java._installGateHook()") {
         crate::jsapi::console::output_verbose(&format!("[java] gate hook retry: {}", e));
     }

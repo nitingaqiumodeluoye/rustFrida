@@ -179,7 +179,7 @@ exit                # 退出
 ```js
 console.log("agent loaded");
 
-Java.ready(function() {
+Java.perform(function() {
     console.log("Java is ready");
 });
 ```
@@ -203,10 +203,10 @@ Java.ready(function() {
 
 #### Hook Java 方法
 
-适合看业务参数、绕过判断、替换返回值。Spawn 模式下务必放在 `Java.ready()` 里。
+适合看业务参数、绕过判断、替换返回值。Spawn 模式下务必放在 `Java.perform()` 里。
 
 ```js
-Java.ready(function() {
+Java.perform(function() {
     var Login = Java.use("com.example.LoginManager");
 
     Login.checkPassword.impl = function(user, pass) {
@@ -219,7 +219,7 @@ Java.ready(function() {
 需要保留原逻辑时调用 `$orig()`：
 
 ```js
-Java.ready(function() {
+Java.perform(function() {
     var Log = Java.use("android.util.Log");
 
     Log.i.overload("java.lang.String", "java.lang.String").impl = function(tag, msg) {
@@ -793,7 +793,7 @@ hook(target, callback, false)           // false = NORMAL
 Frida 风格：**`this`** = 实例（静态方法时为 class 载体），**`arguments`** = Java 参数。
 
 ```js
-Java.ready(function() {
+Java.perform(function() {
     var Activity = Java.use("android.app.Activity");
 
     // hook 实例方法
@@ -889,9 +889,23 @@ map.size();        // 调用 size() 方法
 map.size.value;    // 读取 size 字段
 ```
 
-### Java.ready
+### Java.perform
 
-Spawn 模式下 app ClassLoader 未就绪，用 `Java.ready` 延迟执行。PID 注入模式下立即执行。
+Frida 兼容入口。Spawn 模式下 app ClassLoader 未就绪,用 `Java.perform` 延迟执行;PID 注入模式下立即执行。
+
+```js
+Java.perform(function() {
+    // 这里可以用 Java.*
+});
+```
+
+**语义边界**:与 Frida 的 `Java.perform` 只对齐了名字和常见用法,不是 drop-in 兼容——
+
+- 就绪门槛是 **app ClassLoader**(没有 Frida 的 `_isAppProcess` 判断,非 app 进程在 loader 未就绪时也会排队);
+- 回调是**分片执行**的(`Java._flushStep` 每次一个,分片间释放 JS_ENGINE 锁让 hook 事件插队),不保证原子性;
+- 没有 `Java.performNow` 对应物。
+
+改名前的 `Java.ready` 仍保留为别名(`Java.ready === Java.perform`),老脚本不会断。
 
 ### Managed DSL 高频 Hook
 
@@ -913,7 +927,7 @@ DSL 语法接近 JS/Java，但不是完整 JS runtime。它不能访问 JS 变�
 #### 最推荐写法
 
 ```js
-Java.ready(function () {
+Java.perform(function () {
     var HashMap = Java.use("java.util.HashMap");
     var put = HashMap.put.overload("java.lang.Object", "java.lang.Object");
 
@@ -1198,7 +1212,7 @@ Java.setClassLoader(loaders[0]);               // 切换 Java.use() 查找上下
 var MyCls = Java.findClassWithLoader(loaders[0], "com.example.MyClass");
 ```
 
-`loader` 参数接受 loader 对象、`{__jptr}` wrapper 或 `NativePointer`。Spawn 模式下 app loader 就绪前 `Java.classLoaders()` 可能只返回 boot loader，应在 `Java.ready()` 里调。
+`loader` 参数接受 loader 对象、`{__jptr}` wrapper 或 `NativePointer`。Spawn 模式下 app loader 就绪前 `Java.classLoaders()` 可能只返回 boot loader,应在 `Java.perform()` 里调。
 
 ### Stealth 模式（Java hook）
 
@@ -1335,7 +1349,8 @@ obj.foo.overload("[B")([1, 200, 3]);  // 强制 byte[]，200 按位截断为 -56
 | `Class.method.impl = fn` | `function(...args) { this.$orig(...) }`（this = 实例/static 载体） | setter |
 | `Class.method.impl = null` | — | setter |
 | `Class.method.overload(...types)` | `string...` | `MethodWrapper` |
-| `Java.ready(fn)` | `() => void` | `void` |
+| `Java.perform(fn)` | `() => void` | `void` |
+| `Java.ready(fn)` | 同上(别名,已废弃) | `void` |
 | `Java.choose(cls, callbacks, subtypes?)` | `string, {onMatch,onComplete?,subtypes?,maxCount?}, bool?` | `void` |
 | `Java.classLoaders()` | — | `LoaderInfo[]` |
 | `Java.findClassWithLoader(loader, cls)` | `Loader, string` | `JavaClassWrapper` |
@@ -1713,7 +1728,7 @@ Trace 文件默认输出到 `/data/data/<package>/trace_bundle.pb`，配合 qbdi
 - **Java hook 回调签名：** `function(a, b, c) { ... }`，`this` = 实例（静态方法为 class 载体）、`arguments` = Java 参数、`this.$orig(...)` = 原方法；`return value` 改返回值
 - **Java 字段访问必须用 `.value`：** `obj.field` 返回 FieldWrapper，`obj.field.value` 才是真实值
 - **`Java.choose` 的 wrapper 仅在 `onMatch` 内有效**，跨回调保留需要自己提取字段值
-- Spawn 模式下 Java hook 必须放在 `Java.ready(fn)` 里（`Java.classLoaders()` / `Java.choose` 同理）
+- Spawn 模式下 Java hook 必须放在 `Java.perform(fn)` 里(`Java.classLoaders()` / `Java.choose` 同理)
 - `Java.setStealth()` 必须在 `Java.use().impl` 之前调用；不调则默认 WxShadow（无痕），要 mprotect 直写就显式 `Java.setStealth(0)`
 - **native hook / Java hook 默认都是无痕（WxShadow）**：内核不支持时 hook 直接失败（native 抛异常、Java 跳过安装），不会静默降级成可检测的 mprotect 写；确认 KPM/自定义内核已就绪再跑
 - `callNative()` 仅支持整数/指针参数（最多 6 个），需要浮点/任意签名用 `NativeFunction`

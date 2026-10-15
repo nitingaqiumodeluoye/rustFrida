@@ -8,7 +8,7 @@ natural traffic.
 ## Basic Usage
 
 ```js
-Java.ready(function () {
+Java.perform(function () {
   Java.compileMethod(
     "java.util.HashMap",
     "put",
@@ -410,7 +410,7 @@ direct overload inference, `instanceof` narrowing, `as` cast, and explicit
 `orig(arg0, arg1)` while staying in generated dex code:
 
 ```js
-Java.ready(function () {
+Java.perform(function () {
   console.log("[managed-dsl] install HashMap.put smoke test");
   Java._resetArtRouteStats();
   Java.managedHookDsl({

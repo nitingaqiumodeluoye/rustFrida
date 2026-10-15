@@ -381,7 +381,7 @@ impl JSEngine {
         while self.context.execute_pending_job() {}
     }
 
-    /// Run callbacks queued by Java.ready() after the current top-level script
+    /// Run callbacks queued by Java.perform() after the current top-level script
     /// has finished, so callbacks can reference helpers declared later in the
     /// same loadjs payload.
     ///
@@ -446,9 +446,9 @@ pub fn load_script_with_filename(script: &str, filename: &str) -> Result<String,
     load_script_with_filename_inner(script, filename, true)
 }
 
-/// Execute a short internal script without implicitly flushing Java.ready().
+/// Execute a short internal script without implicitly flushing Java.perform().
 ///
-/// Java-ready bootstrap uses this so every probe performs exactly one JNI
+/// Java-perform bootstrap uses this so every probe performs exactly one JNI
 /// reprobe. The eventual callback flush is submitted as a separate worker task.
 pub fn load_script_with_filename_without_ready_flush(script: &str, filename: &str) -> Result<String, String> {
     load_script_with_filename_inner(script, filename, false)
@@ -476,7 +476,7 @@ fn load_script_with_filename_inner(script: &str, filename: &str, flush_java_read
         result
     };
 
-    // Span 2: 分片 flush Java.ready 回调 —— 每分片独立拿锁，分片间放锁，
+    // Span 2: 分片 flush Java.perform 回调 —— 每分片独立拿锁,分片间放锁,
     // 让 app 线程排队的 hook 事件有机会插队（缩短临界区）。
     if flush_java_ready {
         flush_java_ready_chunked()?;
@@ -495,7 +495,7 @@ fn load_script_with_filename_inner(script: &str, filename: &str, flush_java_read
     Ok(result)
 }
 
-/// 分片 flush Java.ready 回调。
+/// 分片 flush Java.perform 回调。
 ///
 /// 每个 chunk = 一次拿锁只跑【一个】 ready 回调 + 它的 pending jobs，分片间真正释放
 /// JS_ENGINE 锁。原先一次性跑完所有回调（含用户脚本里的 Java.perform 主体，

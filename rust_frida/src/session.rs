@@ -57,7 +57,7 @@ pub(crate) struct Session {
     pub(crate) loader_cleanup: Mutex<LoaderCleanupInfo>,
     /// The ART-managed worker can accept JavaScript tasks.
     pub(crate) java_worker_ready: AtomicBool,
-    /// Java.ready bootstrap has observed an application ClassLoader.
+    /// Java.perform bootstrap has observed an application ClassLoader.
     pub(crate) java_classloader_ready: AtomicBool,
     pub(crate) connected: AtomicBool,
     pub(crate) disconnected: AtomicBool,

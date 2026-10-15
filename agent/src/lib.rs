@@ -405,7 +405,7 @@ fn start_java_worker_and_respond() {
                     }
                     quickjs_loader::JavaReadyBootstrapStatus::Timeout => {
                         log_msg(
-                            "[java worker] Java.ready bootstrap timeout after 30000ms; background probe remains active\n"
+                            "[java worker] Java.perform bootstrap timeout after 30000ms; background probe remains active\n"
                                 .to_string(),
                         );
                         send_eval_ok("java-worker-started:java-ready-pending");

@@ -426,18 +426,18 @@ fn run_java_ready_probe() {
                 Ok(_) => {
                     JAVA_READY_STATUS.store(JAVA_READY_STATUS_READY, Ordering::Release);
                     JAVA_READY_MONITOR_ACTIVE.store(false, Ordering::Release);
-                    log_msg(format!("[java worker] Java.ready ready after {} probe(s)\n", attempt));
+                    log_msg(format!("[java worker] Java.perform ready after {} probe(s)\n", attempt));
                 }
-                Err(err) => log_msg(format!("[java worker] Java.ready flush failed: {}\n", err)),
+                Err(err) => log_msg(format!("[java worker] Java.perform flush failed: {}\n", err)),
             }
         }
         Ok(result) if result == "pending" => {}
         Ok(result) => log_msg(format!(
-            "[java worker] Java.ready probe returned unexpected status '{}': attempt={}\n",
+            "[java worker] Java.perform probe returned unexpected status '{}': attempt={}\n",
             result, attempt
         )),
         Err(err) => log_msg(format!(
-            "[java worker] Java.ready probe failed: attempt={} error={}\n",
+            "[java worker] Java.perform probe failed: attempt={} error={}\n",
             attempt, err
         )),
     }

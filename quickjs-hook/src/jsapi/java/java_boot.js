@@ -1561,7 +1561,7 @@
                 }
                 // 静态字段检查（per-class 缓存，仅首次走 C 调用）。raw clone
                 // pre-resume 阶段不能为了字段消歧等待 Java executor，否则
-                // Java.ready 的 framework gate 可能在装好前就被 resume 越过。
+                // Java.perform 的 framework gate 可能在装好前就被 resume 越过。
                 if (!_isRawCloneJsThread()) {
                     if (staticFieldWrappers[prop]) return staticFieldWrappers[prop];
                     var meta = _resolveFieldMeta(cls, prop, 0);
@@ -1606,14 +1606,22 @@
     };
 
     // ========================================================================
-    // Java.ready(fn) — 延迟到 app dex 加载后执行
+    // Java.perform(fn) — Frida 兼容入口,延迟到 app dex 加载后执行
     //
-    // spawn 模式下脚本在 setArgV0 阶段加载，此时 app ClassLoader 还未创建，
-    // FindClass 只能找到 framework 类。Java.ready() 通过 hook 框架类
+    // spawn 模式下脚本在 setArgV0 阶段加载,此时 app ClassLoader 还未创建,
+    // FindClass 只能找到 framework 类。Java.perform() 通过 hook 框架类
     // Instrumentation.newApplication (ClassLoader 作为第一个参数传入) 来检测
-    // dex 加载完成，在 Application.attachBaseContext 之前触发用户回调。
+    // dex 加载完成,在 Application.attachBaseContext 之前触发用户回调。
     //
-    // 非 spawn 模式（attach 已运行的进程）时 ClassLoader 已就绪，立即执行。
+    // 非 spawn 模式(attach 已运行的进程)时 ClassLoader 已就绪,立即执行。
+    //
+    // 注意:与 Frida 的 Java.perform 只对齐了「名字 + 常见用法」。语义上有两点
+    // 差异,不要当成 drop-in 兼容:
+    //   1) 就绪门槛是 app ClassLoader(RF 没有 _isAppProcess 判断,
+    //      非 app 进程在 loader 未就绪时也会排队);
+    //   2) 回调是分片执行的(_flushStep 每次一个,分片间释放 JS_ENGINE 锁),
+    //      不保证原子性。
+    // 历史名字 Java.ready 保留为别名,见函数末尾。
     // ========================================================================
     var _readyCallbacks = [];
     var _readyFired = false;
@@ -1635,7 +1643,7 @@
         try {
             fn();
         } catch(e) {
-            console.log("[Java.ready] callback #" + index + " error: " + e);
+            console.log("[Java.perform] callback #" + index + " error: " + e);
         }
     }
 
@@ -1660,7 +1668,7 @@
         // worker probes the app ClassLoader and flushes the same callbacks,
         // so defer the gate instead of touching Instrumentation pre-resume.
         if (_isRawCloneJsThread()) {
-            console.log("[Java.ready] spawn raw clone: defer gate to post-resume Java worker");
+            console.log("[Java.perform] spawn raw clone: defer gate to post-resume Java worker");
             return;
         }
 
@@ -1701,24 +1709,24 @@
             };
             _gateInstalled = true;
         } catch(e) {
-            console.log("[Java.ready] gate hook install failed: " + e);
+            console.log("[Java.perform] gate hook install failed: " + e);
             if (callApplicationOnCreateGate !== null) {
                 try {
                     callApplicationOnCreateGate.impl = null;
                 } catch (rollbackCallAppError) {
-                    console.log("[Java.ready] callApplicationOnCreate rollback failed: " + rollbackCallAppError);
+                    console.log("[Java.perform] callApplicationOnCreate rollback failed: " + rollbackCallAppError);
                 }
             }
             if (newApplicationGate !== null) {
                 try {
                     newApplicationGate.impl = null;
                 } catch (rollbackNewAppError) {
-                    console.log("[Java.ready] newApplication rollback failed: " + rollbackNewAppError);
+                    console.log("[Java.perform] newApplication rollback failed: " + rollbackNewAppError);
                 }
             }
             _gateInstalled = false;
             if (_isRawCloneJsThread()) {
-                console.log("[Java.ready] gate unavailable, falling back to Java worker ClassLoader probe");
+                console.log("[Java.perform] gate unavailable, falling back to Java worker ClassLoader probe");
                 return;
             }
         }
@@ -1777,9 +1785,9 @@
         return "more";
     };
 
-    Java.ready = function(fn) {
+    Java.perform = function(fn) {
         if (typeof fn !== "function") {
-            throw new Error("Java.ready() requires a function argument");
+            throw new Error("Java.perform() requires a function argument");
         }
 
         if (_readyFired || Java._isClassLoaderReady()) {
@@ -1811,6 +1819,10 @@
             Java._installGateHook();
         }
     };
+
+    // 历史名字:改名前的 Java.ready,保留为别名以免老脚本报 undefined。
+    // 新脚本请用 Java.perform(语义与 Frida 的 Java.perform 只对齐名字与常见用法)。
+    Java.ready = Java.perform;
 
     function _getClassLoaders() {
         if (_classLoaderListCache === null) {

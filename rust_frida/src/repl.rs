@@ -114,7 +114,7 @@ pub(crate) fn ensure_java_worker_ready(session: &Session) -> Result<(), String> 
             session
                 .java_classloader_ready
                 .store(false, std::sync::atomic::Ordering::Release);
-            log_warn!("Java worker 已启动，Java.ready 仍 pending；agent 将在后台继续探测 ClassLoader");
+            log_warn!("Java worker 已启动,Java.perform 仍 pending;agent 将在后台继续探测 ClassLoader");
             Ok(())
         }
         Some(Ok(status)) if status == "java-worker-started:java-engine-uninitialized" => {
