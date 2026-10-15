@@ -19,7 +19,7 @@ use crate::injection::{inject_via_bootstrapper, InjectionResult};
 use crate::kpm::madvise_dontneed;
 use crate::proc_mem::ProcMem;
 use crate::process::{any_thread_pc_in_range, parse_proc_maps, wait_until_stopped, MapEntry};
-use crate::{log_error, log_info, log_step, log_success, log_verbose, log_warn};
+use crate::{log_diag_warn, log_error, log_info, log_step, log_success, log_verbose, log_warn};
 
 /// 嵌入编译好的 zymbiote ELF
 const ZYMBIOTE_ELF: &[u8] = include_bytes!("../../zymbiote/build/zymbiote.elf");
@@ -1773,7 +1773,11 @@ fn revert_child_patch_by_ppid(pid: u32, ppid: u32) -> Result<ChildPayloadRevert,
     let page_safe = match payload_page_range(patch) {
         Ok((start, end)) => match any_thread_pc_in_range(pid, start, end) {
             Ok(true) => {
-                log_warn!(
+                // 用 log_diag_warn!：本函数被 retry_child_payload_revert_after_resume
+                // 以 12×20ms 轮询重入，每轮都会命中这里。若走普通 log_warn!，
+                // 单个子进程就能给客户端刷十几条完全相同的文本，把脚本输出冲散。
+                // 而这条对主机端用户没有可操作性（页会自动补还原，见该函数的 log_info/log_error）。
+                log_diag_warn!(
                     "子进程 {} 仍有线程在 payload 页内取指，跳过 payload 页还原/丢页（SIGCONT 后将补还原）",
                     pid
                 );

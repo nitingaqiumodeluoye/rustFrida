@@ -218,6 +218,27 @@ macro_rules! log_warn {
     }};
 }
 
+/// [!] 黄色前缀 - **内部诊断**警告（不进日志镜像）
+///
+/// 输出与 `log_warn!` 完全相同，唯一区别是不发客户端。判断标准两条全中才用它：
+///
+/// 1. 纯实现细节：页还原安全门、PC 范围探测、重试轮询内部状态之类 —— 用户既不能
+///    据此改脚本，也不能据此判断脚本有没有生效；
+/// 2. 会在循环里重复：同一子进程可刷十几条完全相同的文本，在客户端上会把脚本
+///    自己的 `console.log` 冲散。
+///
+/// 反例（**不要**降级）：`[#N] 脚本加载超时`、`[#N] 脚本执行失败`、
+/// `[#N] Agent 连接已断开` —— 这些正是用户需要立刻知道的。
+/// 全量排查仍可直接看设备端 `/data/local/tmp/rustfrida.log`。
+#[macro_export]
+macro_rules! log_diag_warn {
+    ($($arg:tt)*) => {{
+        $crate::logger::with_mirror_suppressed(|| {
+            $crate::log_warn!($($arg)*);
+        });
+    }};
+}
+
 /// [✗] 红色前缀 - 错误（输出到 stderr）
 #[macro_export]
 macro_rules! log_error {

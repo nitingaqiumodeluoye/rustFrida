@@ -24,6 +24,11 @@ pub enum Tag {
     Agent,
     /// 目标进程 stdout/stderr 捕获（agent 的 `[out] ` 前缀）。
     Out,
+    /// 服务端镜像日志（服务端自己打的 `[server] ` 前缀）。
+    ///
+    /// 与 `Agent` 区分开：`Agent` 是目标进程里脚本的 `console.log`，
+    /// 而本类容是服务端在设备侧发生的事（注入失败、脚本加载超时…）。
+    Server,
     /// 服务端结构化事件（detach / replay 等）。
     Event,
     /// 命令应答（`=> ...`）。
@@ -40,6 +45,7 @@ impl Tag {
             Tag::Client => "[client] ",
             Tag::Agent => "[agent] ",
             Tag::Out => "[out] ",
+            Tag::Server => "[server] ",
             Tag::Event => "[event] ",
             Tag::Reply => "=> ",
             Tag::Error => "[错误] ",
@@ -66,6 +72,15 @@ impl Tag {
                     egui::Color32::from_rgb(200, 170, 255)
                 } else {
                     egui::Color32::from_rgb(110, 60, 180)
+                }
+            }
+            // 服务端镜像：中性石板色。文本自带 `[!]` / `[✗]` 已说明严重程度，
+            // 这里不再用红/黄抢注意力，但要与 `Agent` 的正文色分开。
+            Tag::Server => {
+                if dark {
+                    egui::Color32::from_rgb(150, 165, 190)
+                } else {
+                    egui::Color32::from_rgb(75, 90, 115)
                 }
             }
             Tag::Reply => {

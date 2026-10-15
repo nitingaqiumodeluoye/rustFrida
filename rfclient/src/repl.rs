@@ -280,7 +280,16 @@ fn spawn_event_printer(events: Receiver<Event>) {
     let _ = thread::Builder::new().name("rf-print".into()).spawn(move || {
         for event in events {
             match event {
-                Event::Log(msg) => print_line(&format!("[agent] {}", msg)),
+                // 服务端镜像日志自带 `[server] ` 前缀（见 server.rs mirror_log_to_client），
+                // 此时不再叠 `[agent] `，否则会渲染成 `[agent] [server] ...`，
+                // 读起来像是 agent 报的，其实是服务端报的。
+                Event::Log(msg) => {
+                    if msg.starts_with("[server] ") {
+                        print_line(&msg)
+                    } else {
+                        print_line(&format!("[agent] {}", msg))
+                    }
+                }
                 Event::Hello { proto_v2 } => {
                     if proto_v2 {
                         print_line("[agent] 已连接（协议 v2：reqid 匹配 + 心跳）");

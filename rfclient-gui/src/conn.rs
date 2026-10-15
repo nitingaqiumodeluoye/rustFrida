@@ -371,6 +371,11 @@ fn spawn_event_drain(
                         // agent 侧捕获的目标进程输出带 `[out] ` 前缀，单独着色。
                         if let Some(rest) = msg.strip_prefix("[out] ") {
                             log.push(Tag::Out, rest);
+                        // 服务端镜像日志自带 `[server] ` 前缀（见 server.rs
+                        // mirror_log_to_client）。单独一个 Tag，否则会被当成 agent 输出，
+                        // 而它其实是服务端为了补充“设备端发生了什么”才发过来的。
+                        } else if let Some(rest) = msg.strip_prefix("[server] ") {
+                            log.push(Tag::Server, rest);
                         } else {
                             log.push(Tag::Agent, msg);
                         }
