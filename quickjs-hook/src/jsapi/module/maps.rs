@@ -109,6 +109,32 @@ impl ModuleMapEntry {
         addr >= self.start && addr < self.end
     }
 
+    /// 文件背书的 VMA 长度不可能超过文件本身。
+    ///
+    /// 内核允许 mmap 一段越过 EOF 的区间（真正访问到才 SIGBUS），于是「借一个
+    /// 合法文件去预留一大片地址空间」这类手法会在 /proc/self/maps 里留下巨型
+    /// file-backed 条目 —— 实测见过 app_process64（文件仅约 30KB）出现 86GB 的
+    /// r--p 条目，且是瞬态的。把它当模块会同时污染两个方向：范围聚合被撑大
+    /// （libart.so 的 end 被判到几十 GB 之外），按地址反查也会把无关地址判给
+    /// 这个模块（MIUI 的 native 函数被判成 app_process64+0x158a420144）。
+    ///
+    /// 只对能 stat 到、且确实是普通文件的路径做判定；stat 不到（`(deleted)`、
+    /// memfd、`/dev/*`、权限不足）一律视为可接受，宁可放过不可误杀。
+    fn is_plausible_file_backed(&self) -> bool {
+        // 小条目免 stat（普通模块段都在这个量级以下）
+        const MIN_SUSPICIOUS_LEN: u64 = 64 * 1024 * 1024;
+        let len = self.end.saturating_sub(self.start);
+        if len <= MIN_SUSPICIOUS_LEN {
+            return true;
+        }
+        match std::fs::metadata(&self.path) {
+            // `meta.len() == 0` 的普通文件（FUSE 路径、某些伪文件）长度不可信，
+            // 不做判定，避免把合法映射误杀。
+            Ok(meta) if meta.is_file() && meta.len() > 0 => len <= meta.len(),
+            _ => true,
+        }
+    }
+
     fn path_score(&self) -> u8 {
         if self.path.starts_with("/dev/") {
             1
@@ -119,6 +145,39 @@ impl ModuleMapEntry {
 
     fn is_executable(&self) -> bool {
         self.prot_flags & libc::PROT_EXEC != 0
+    }
+}
+
+/// 同一路径、且相互间隔不超过 `MAX_MODULE_CLUSTER_GAP` 的一串映射。
+///
+/// 一个模块可能被映射成多个相距很远的区域（预留区、别名映射、瞬态巨型条目），
+/// 只有连成一片的那一簇才代表它真正的地址范围。
+#[derive(Clone, Debug)]
+struct ModuleCluster {
+    path: String,
+    base: u64,
+    end: u64,
+    has_exec: bool,
+}
+
+impl ModuleCluster {
+    fn from_entry(entry: &ModuleMapEntry) -> Self {
+        Self {
+            path: entry.path.clone(),
+            base: entry.start,
+            end: entry.end,
+            has_exec: entry.is_executable(),
+        }
+    }
+
+    fn include(&mut self, entry: &ModuleMapEntry) {
+        if entry.start < self.base {
+            self.base = entry.start;
+        }
+        if entry.end > self.end {
+            self.end = entry.end;
+        }
+        self.has_exec |= entry.is_executable();
     }
 }
 
@@ -156,29 +215,62 @@ impl ModuleSnapshot {
         Self::from_entries(read_module_map_entries())
     }
 
-    fn summarize_matching_paths(&self, mut matches_path: impl FnMut(&str) -> bool) -> Option<PathMapSummary> {
-        let mut base = u64::MAX;
-        let mut end = 0;
-        let mut first_path = None;
+    /// 取匹配路径的「那一簇」：优先带可执行段的簇，都不带则第一个簇兜底。
+    /// 与 `find_module_path_and_base` 共用，保证「范围」与「基址」口径一致。
+    fn find_cluster(&self, mut matches_path: impl FnMut(&str) -> bool) -> Option<ModuleCluster> {
+        const MAX_MODULE_CLUSTER_GAP: u64 = 64 * 1024 * 1024;
 
-        for entry in &self.entries {
-            let path = entry.path.as_str();
-            if !matches_path(path) {
+        let mut fallback: Option<ModuleCluster> = None;
+        let mut current: Option<ModuleCluster> = None;
+
+        for entry in self
+            .entries
+            .iter()
+            .filter(|entry| matches_path(&entry.path))
+        {
+            let same_cluster = current.as_ref().map_or(false, |cluster| {
+                cluster.path == entry.path
+                    && entry.start <= cluster.end.saturating_add(MAX_MODULE_CLUSTER_GAP)
+            });
+
+            if !same_cluster {
+                if let Some(done) = current.take() {
+                    if done.has_exec {
+                        return Some(done);
+                    }
+                    if fallback.is_none() {
+                        fallback = Some(done);
+                    }
+                }
+                current = Some(ModuleCluster::from_entry(entry));
                 continue;
             }
 
-            if entry.start < base {
-                base = entry.start;
-            }
-            if entry.end > end {
-                end = entry.end;
-            }
-            if first_path.is_none() {
-                first_path = Some(path.to_string());
+            if let Some(cluster) = current.as_mut() {
+                cluster.include(entry);
             }
         }
 
-        first_path.map(|first_path| PathMapSummary { base, end, first_path })
+        if let Some(done) = current {
+            if done.has_exec {
+                return Some(done);
+            }
+            if fallback.is_none() {
+                fallback = Some(done);
+            }
+        }
+
+        fallback
+    }
+
+    /// 匹配路径的**那一簇**的范围（不是所有同名条目的并集）。
+    /// 用并集会被远处的同名条目（预留区、瞬态巨型条目）撑大范围。
+    fn summarize_matching_paths(matches_path: impl FnMut(&str) -> bool) -> Option<PathMapSummary> {
+        self.find_cluster(matches_path).map(|cluster| PathMapSummary {
+            base: cluster.base,
+            end: cluster.end,
+            first_path: cluster.path,
+        })
     }
 
     fn find_module_base(&self, module_name: &str) -> Option<u64> {
@@ -188,66 +280,8 @@ impl ModuleSnapshot {
     }
 
     fn find_module_path_and_base(&self, module_name: &str) -> Option<(String, u64)> {
-        const MAX_MODULE_CLUSTER_GAP: u64 = 64 * 1024 * 1024;
-
-        let mut fallback: Option<(String, u64)> = None;
-        let mut cluster_path: Option<String> = None;
-        let mut cluster_base = 0u64;
-        let mut cluster_end = 0u64;
-        let mut cluster_has_exec = false;
-
-        let finish_cluster = |path: &mut Option<String>,
-                              base: u64,
-                              has_exec: bool,
-                              fallback: &mut Option<(String, u64)>|
-         -> Option<(String, u64)> {
-            let Some(path_value) = path.take() else {
-                return None;
-            };
-            let candidate = (path_value, base);
-            if has_exec {
-                return Some(candidate);
-            }
-            if fallback.is_none() {
-                *fallback = Some(candidate);
-            }
-            None
-        };
-
-        for entry in self
-            .entries
-            .iter()
-            .filter(|entry| matches_module_lookup_name(&entry.path, module_name))
-        {
-            let same_cluster = cluster_path.as_ref().map_or(false, |path| {
-                path == &entry.path && entry.start <= cluster_end.saturating_add(MAX_MODULE_CLUSTER_GAP)
-            });
-
-            if !same_cluster {
-                if let Some(found) = finish_cluster(&mut cluster_path, cluster_base, cluster_has_exec, &mut fallback) {
-                    return Some(found);
-                }
-                cluster_path = Some(entry.path.clone());
-                cluster_base = entry.start;
-                cluster_end = entry.end;
-                cluster_has_exec = entry.is_executable();
-                continue;
-            }
-
-            if entry.start < cluster_base {
-                cluster_base = entry.start;
-            }
-            if entry.end > cluster_end {
-                cluster_end = entry.end;
-            }
-            cluster_has_exec |= entry.is_executable();
-        }
-
-        if let Some(found) = finish_cluster(&mut cluster_path, cluster_base, cluster_has_exec, &mut fallback) {
-            return Some(found);
-        }
-
-        fallback
+        self.find_cluster(|path| matches_module_lookup_name(path, module_name))
+            .map(|cluster| (cluster.path, cluster.base))
     }
 
     fn find_module_by_address(&self, addr: u64) -> Option<(ModuleMapEntry, ModuleInfo)> {
@@ -255,6 +289,10 @@ impl ModuleSnapshot {
             .entries
             .iter()
             .filter(|entry| entry.contains(addr))
+            // 不合理的巨型 file-backed 条目不能参与反查：它会「吞掉」本该属于
+            // 其它模块的地址，让调用方拿到 app_process64 这类完全不相干的名字
+            // 和一个天文数字偏移。
+            .filter(|entry| entry.is_plausible_file_backed())
             .min_by(|a, b| {
                 a.path_score()
                     .cmp(&b.path_score())
@@ -296,7 +334,7 @@ impl ModuleCache {
     fn lookup_hint(&self, addr: u64) -> Option<ModuleInfo> {
         self.lookup_hint
             .as_ref()
-            .filter(|hint| hint.entry.contains(addr))
+            .filter(|hint| hint.entry.contains(addr) && hint.entry.is_plausible_file_backed())
             .map(|hint| hint.module.clone())
     }
 
@@ -345,6 +383,10 @@ impl AggregatedModuleRange {
 fn parse_module_map_entries(maps: &str) -> Vec<ModuleMapEntry> {
     let entries: Vec<ModuleMapEntry> = crate::jsapi::util::proc_maps_entries(maps)
         .filter_map(ModuleMapEntry::from_proc_map_entry)
+        // 先把不合理的巨型 file-backed 条目挡在快照之外：它会同时祸害范围聚合
+        // （把所有同名模块的 end 撑到几十 GB）与按地址反查（吃掉别人的地址）。
+        // 过滤在这里而不是每个消费点，是因为消费点很多且以后还会加。
+        .filter(ModuleMapEntry::is_plausible_file_backed)
         .collect();
     filter_non_shared_object_memfd_entries(entries)
 }
@@ -646,6 +688,40 @@ a000-b000 r--p 00001000 00:00 0 /tmp/libfoo.so
                 size: 0x1800,
                 path: "/tmp/libfoo.so".to_string(),
             }]
+        );
+    }
+
+    /// 回归：spawn 窗口内会短暂出现「借一个合法文件预留巨量地址空间」留下的
+    /// 巨型 file-backed 条目（实测 app_process64 文件约 30KB、条目 86GB）。
+    /// 它必须被挡在快照之外：否则范围聚合被撑大，按地址反查还会把无关地址
+    /// 判给它（表现为 `app_process64+0x158a420144` 这种天文偏移）。
+    #[test]
+    fn implausible_file_backed_vma_is_dropped() {
+        let dir = std::env::temp_dir();
+        let real = dir.join("rustfrida-maps-plausibility-test.so");
+        std::fs::write(&real, vec![0u8; 0x1000]).expect("prepare temp file");
+        let real = real.display();
+
+        // 下面两行都指向同一个真实文件：一个正常，一个声称 64GB
+        let maps = format!(
+            "\
+1000-2000 r-xp 00000000 00:00 0 {real}
+100000000-1000000000 r--p 00000000 00:00 0 {real}
+"
+        );
+
+        let entries = parse_module_map_entries(&maps);
+        assert_eq!(entries.len(), 1, "巨型条目应被剔除: {entries:?}");
+        assert_eq!(entries[0].end, 0x2000);
+
+        // 聚合范围也不能被撑大
+        let modules = aggregate_modules(&entries);
+        assert_eq!(modules[0].size, 0x1000, "范围不应被巨型条目撑大");
+
+        // 落在被剔除条目内的地址不再被误判给这个模块
+        assert!(
+            find_module_by_address_in_entries(parse_module_map_entries(&maps), 0x80000000).is_none(),
+            "被剔除条目内的地址不应有归属"
         );
     }
 }
