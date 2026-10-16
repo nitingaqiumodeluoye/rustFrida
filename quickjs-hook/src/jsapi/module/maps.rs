@@ -265,7 +265,7 @@ impl ModuleSnapshot {
 
     /// 匹配路径的**那一簇**的范围（不是所有同名条目的并集）。
     /// 用并集会被远处的同名条目（预留区、瞬态巨型条目）撑大范围。
-    fn summarize_matching_paths(matches_path: impl FnMut(&str) -> bool) -> Option<PathMapSummary> {
+    fn summarize_matching_paths(&self, matches_path: impl FnMut(&str) -> bool) -> Option<PathMapSummary> {
         self.find_cluster(matches_path).map(|cluster| PathMapSummary {
             base: cluster.base,
             end: cluster.end,
