@@ -407,9 +407,78 @@ fn config_candidates() -> Vec<PathBuf> {
 fn module_path() -> Option<PathBuf> {
     let mut info = unsafe { std::mem::zeroed::<libc::Dl_info>() };
     let result = unsafe { libc::dladdr(rsfrida_gadget_load as *const () as *const c_void, &mut info) };
-    if result == 0 || info.dli_fname.is_null() {
-        return None;
+    if result != 0 && !info.dli_fname.is_null() {
+        let path = unsafe { CStr::from_ptr(info.dli_fname) }.to_string_lossy();
+        return Some(Path::new(path.as_ref()).to_path_buf());
     }
-    let path = unsafe { CStr::from_ptr(info.dli_fname) }.to_string_lossy();
-    Some(Path::new(path.as_ref()).to_path_buf())
+
+    // dladdr 只查 bionic 的 solist（遍历 soinfo 链表 + 先查 --dynamic-list），
+    // 而自定义链接器（xfinject / CSOLoader 等）刻意不把模块登记进 solist ——
+    // 这正是它「无痕」的前提。于是 dladdr 返回 0，本函数也拿不到路径，
+    // config_candidates() 一条候选都生成不了，Gadget 只能落到
+    // GadgetConfig::default()（on_load = Resume），表现为「配了 wait 却不等待」。
+    //
+    // 实测（同进程内）：dladdr(self) -> 0，但 /proc/self/maps 里能正常看到
+    // 本模块的映射路径。maps 不依赖 soinfo，也不依赖任何 linker 内部状态，
+    // 所以这里退回读 maps 自定位 —— 与 frida 上游为自定义链接器打的补丁同构。
+    module_path_from_maps()
+}
+
+/// 从 /proc/self/maps 中定位本模块自身的文件路径。
+///
+/// 只在 dladdr 失败时使用（见 [`module_path`]）。返回的路径可能是注入器落下的
+/// 暂存名（例如 `<app>/files/.org.chromium.<hex>.tmp`），而 config_candidates()
+/// 正是据此推导出同目录的 `<stem>.config.so` sidecar —— 注入器把 Gadget 配置
+/// 与 payload 并排放在一起，所以这条路能命中。
+fn module_path_from_maps() -> Option<PathBuf> {
+    let address = rsfrida_gadget_load as *const () as usize;
+    let contents = std::fs::read_to_string("/proc/self/maps").ok()?;
+
+    for line in contents.lines() {
+        let mut fields = line.split_whitespace();
+        // 用 let-else 而非 `?`：某一行字段不足只代表「这行跳过」，
+        // 不能让整个搜索提前返回 None。
+        let (Some(range), Some(_perms), Some(_offset), Some(_device), Some(inode)) = (
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+        ) else {
+            continue;
+        };
+        let path = fields.next();
+
+        let Some((start, end)) = range.split_once('-') else {
+            continue;
+        };
+        let (Ok(start), Ok(end)) = (
+            usize::from_str_radix(start, 16),
+            usize::from_str_radix(end, 16),
+        ) else {
+            continue;
+        };
+        if address < start || address >= end {
+            continue;
+        }
+
+        // 匿名映射（inode 0）没有文件名，不是我们要找的目标；
+        // 本模块由文件映射而来，所以这一条必然带 inode 与路径。
+        if inode == "0" {
+            continue;
+        }
+        let Some(path) = path else {
+            continue;
+        };
+
+        // 文件在映射之后被 unlink 时，内核会在路径后面追 " (deleted)"。
+        // 去掉它才能得到真实路径（此时文件已不存在，但候选推导仍需路径本身）。
+        let path = path.strip_suffix(" (deleted)").unwrap_or(path);
+        if path.is_empty() {
+            continue;
+        }
+        return Some(PathBuf::from(path));
+    }
+
+    None
 }
