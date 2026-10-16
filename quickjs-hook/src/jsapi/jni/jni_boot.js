@@ -279,7 +279,16 @@
         if (p.toString() === "0x0") {
             return null;
         }
-        return Memory.readCString(p);
+        // 指针可能落在「内存仍然映射、但对本进程已被隐藏」的区间里：注射器/KPM
+        // 会把这类区间从 /proc/self/maps 里抹掉，并让 mincore() 对其返回 -ENOMEM
+        // （与「压根没映射」同语义）。Memory.readCString 的可读性判定走的就是
+        // mincore，于是会抛 RangeError。名字/签名读不出来不该让整条读取链炸掉，
+        // 返回 null，交给调用方决定显示成什么。
+        try {
+            return Memory.readCString(p);
+        } catch (e) {
+            return null;
+        }
     }
 
     function _parseJniTypeSequence(seq, start, endChar) {
